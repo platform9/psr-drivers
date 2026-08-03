@@ -7,8 +7,17 @@ Hitachi custom driver implementing 8 missing Cinder gaps for disaster recovery r
 
 | File | Purpose |
 |------|---------|
-| `cinder/volume/drivers/pf9_hitachi/pf9_group_replication.py` | Complete driver code (all 8 gaps) [See implemented gaps](#-implemented-gaps-h1h8) |
-| `cinder/volume/drivers/pf9_hitachi/pf9_allocator.py` | Secondary LDEV allocator |
+| `cinder/volume/drivers/pf9_hitachi/pf9_hitachi_replication.py` | Platform9 Extended Replication Driver (all 8 gaps) [See implemented gaps](#-implemented-gaps-h1h8) |
+| `cinder/volume/drivers/pf9_hitachi/pf9_allocator.py` | Secondary LDEV allocator for replication pairs |
+| `cinder/volume/drivers/pf9_hitachi/hbsd_common.py` | Shared logic for FC and iSCSI drivers |
+| `cinder/volume/drivers/pf9_hitachi/hbsd_rest.py` | REST API interface abstraction |
+| `cinder/volume/drivers/pf9_hitachi/hbsd_rest_api.py` | Low-level REST API client |
+| `cinder/volume/drivers/pf9_hitachi/hbsd_fc.py` | Fibre Channel driver entry point |
+| `cinder/volume/drivers/pf9_hitachi/hbsd_iscsi.py` | iSCSI driver entry point |
+| `cinder/volume/drivers/pf9_hitachi/hbsd_rest_fc.py` | FC-specific REST operations |
+| `cinder/volume/drivers/pf9_hitachi/hbsd_rest_iscsi.py` | iSCSI-specific REST operations |
+| `cinder/volume/drivers/pf9_hitachi/hbsd_replication.py` | Upstream replication mixin |
+| `cinder/volume/drivers/pf9_hitachi/hbsd_utils.py` | Utilities and constants |
 
 ---
 ## 📋 Implemented Gaps (H1–H8)
