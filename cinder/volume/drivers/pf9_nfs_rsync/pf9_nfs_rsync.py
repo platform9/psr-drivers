@@ -156,6 +156,10 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
                    "--exclude", "incoming/",
                    export + "/", "%s:%s/%s/" % (peer, incoming, gen)])
         elapsed = int(time.time() - start)
+        # point 'current' at the new generation, then keep the newest N. Prune by
+        # generation NUMBER (sort -rn), not mtime: rsync -a copies the source
+        # mtime onto every generation, so mtime can't tell them apart. Never
+        # delete whatever 'current' points at.
         self._ssh(peer,
                   "set -e; cd '%s'; "
                   "ln -sfn '%s' current.tmp && mv -Tf current.tmp current; "
@@ -248,6 +252,8 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         subprocess.run(argv, check=True, capture_output=True, timeout=600)
 
     def _type_is_replicated(self, volume):
+        # Cinder requires a replication-capable volume to report a
+        # replication_status before it will enable replication on it.
         try:
             specs = (volume.volume_type.extra_specs or {})
         except Exception:
@@ -256,18 +262,21 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         return "true" in val
 
     def create_volume(self, volume):
+        """Create a volume; seed replication_status for replication-capable types."""
         model = super().create_volume(volume) or {}
         if self._type_is_replicated(volume):
             model["replication_status"] = "disabled"
         return model
 
     def create_group(self, context, group):
+        """Create a consistency group."""
         path = self._cg_dir(group.id)
         os.makedirs(path, exist_ok=True)
         LOG.info("PF9NFSRsync: created group dir %s", path)
         return {"status": "available"}
 
     def delete_group(self, context, group, volumes):
+        """Delete a consistency group and its member volume files."""
         for v in (volumes or []):
             try:
                 os.remove(self._vol_path(v.id))
@@ -278,6 +287,7 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         return model, [{"id": v.id, "status": "deleted"} for v in (volumes or [])]
 
     def update_group(self, context, group, add_volumes=None, remove_volumes=None):
+        """Add or remove member volumes of a consistency group."""
         for v in add_volumes or []:
             self._link_into_cg(group.id, v.id)
         for v in remove_volumes or []:
@@ -285,6 +295,7 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         return {"status": "available"}, None, None
 
     def create_group_snapshot(self, context, group_snapshot, snapshots):
+        """Take a crash-consistent snapshot of a group's member volumes."""
         snap_dir = self._cg_dir(group_snapshot.group_id) + "/.snap-" + group_snapshot.id
         os.makedirs(snap_dir, exist_ok=True)
         for s in snapshots:
@@ -292,6 +303,7 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         return {"status": "available"}, [{"id": s.id, "status": "available"} for s in snapshots]
 
     def delete_group_snapshot(self, context, group_snapshot, snapshots):
+        """Delete a group snapshot."""
         shutil.rmtree(self._cg_dir(group_snapshot.group_id) + "/.snap-" + group_snapshot.id, ignore_errors=True)
         return {"status": "deleted"}, [{"id": s.id, "status": "deleted"} for s in snapshots]
 
@@ -442,6 +454,7 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         return {"provider_location": self._nfs_share()}
 
     def manage_existing_get_size(self, volume, existing_ref):
+        """Return the size (GiB) of the volume being adopted."""
         ref_name = existing_ref.get("source-name") or existing_ref.get("source-id")
         resolved = self._resolve_svol_ref(ref_name) if ref_name else ref_name
         src = self._ref_path({"source-name": resolved})
@@ -501,6 +514,7 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
                 existing_ref=existing_ref,
                 reason="missing source-name/source-id")
         cands = [name] if name.startswith("volume-") else [name, "volume-%s" % name]
+        # replicated data lands under incoming/current, so search there first
         for base in ("incoming/current", "incoming", "volumes", ""):
             for cand in cands:
                 p = os.path.join(self._export(), base, cand)
