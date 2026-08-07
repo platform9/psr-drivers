@@ -14,7 +14,6 @@ Prototype / lab / CI only — not a supported production driver.
 |------|---------|
 | `cinder/volume/drivers/pf9_nfs_rsync/pf9_nfs_rsync.py` | The driver (group replication + manage + in-driver replication thread) |
 | `cinder/volume/drivers/pf9_nfs_rsync/__init__.py` | Package marker |
-| `pf9_nfs_rsync/cinder.conf.sample` | Backend stanza to copy into cinder.conf |
 
 Class path (note the package): `cinder.volume.drivers.pf9_nfs_rsync.pf9_nfs_rsync.PF9NFSRsyncDriver`
 
@@ -61,8 +60,9 @@ Each site runs its own cinder-volume with this driver + a local NFS export.
    mkdir -p /etc/cinder && echo '<this-host-ip>:/export/psr' > /etc/cinder/pf9_nfs_shares
    ```
 2. **Driver + config:** deploy the driver (see repo `DEPLOYMENT.md` / `deploy.sh`),
-   copy `cinder.conf.sample` into the `[psr-dr]` stanza, restart cinder-volume.
-   Confirm `Driver initialization completed successfully` in
+   configure the backend to use `PF9NFSRsyncDriver` with `nfs_shares_config`,
+   `replication_device`, and the `pf9_replication_*` options, then restart
+   cinder-volume. Confirm `Driver initialization completed successfully` in
    `/var/log/pf9/cindervolume-base.log`.
 3. **Cross-site SSH (primary → secondary):** the replication thread rsyncs over
    ssh as the cinder host user. Add the primary host's key to the secondary's
