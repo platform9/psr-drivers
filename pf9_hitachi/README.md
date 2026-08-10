@@ -37,6 +37,17 @@ Hitachi custom driver implementing 8 missing Cinder gaps for disaster recovery r
 
 ---
 
+## 🔍 Additional Features
+
+Beyond the 8 core gaps, the driver provides monitoring and management helpers:
+
+| Method | Purpose |
+|--------|---------|
+| `get_replication_lag()` | Query replication lag (consistency time) for RPO monitoring |
+| `manage_existing_get_size()` | Get size of existing LDEV for import validation |
+
+---
+
 ## 🏗️ Architecture
 
 **Mixin Pattern:** Reusable replication logic across FC and iSCSI transports.

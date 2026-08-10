@@ -17,17 +17,49 @@ from __future__ import annotations
 import json
 import logging
 import time
+from typing import Any
 
+from oslo_config import cfg
 import requests
 
-from cinder import exception, interface
+from cinder import context as cinder_context, exception, interface
+from cinder.context import RequestContext
+from cinder.objects import fields, Group, GroupSnapshot, Snapshot, Volume
+from cinder.volume import configuration
 from cinder.volume.drivers.pf9_hitachi import hbsd_fc, hbsd_iscsi
+from cinder.volume.drivers.pf9_hitachi.pf9_allocator import SecondaryLDEVAllocator
 
 LOG = logging.getLogger(__name__)
+
+GROUP_REPLICATION_OPTS = [
+    cfg.BoolOpt(
+        "hitachi_snapshot_auto_split",
+        default=True,
+        help="Whether a group snapshot's Thin Image pairs are automatically "
+        "split after creation.",
+    ),
+]
+
+CONF = cfg.CONF
+CONF.register_opts(GROUP_REPLICATION_OPTS, group=configuration.SHARED_CONF_GROUP)
 
 # Pair states that indicate active replication
 HEALTHY_PAIR_STATUS = ("PAIR", "COPY")
 SWAPPED_PAIR_STATUS = ("SSWS",)  # Secondary split, writable
+
+# Terminal job "status" values per the CM REST job object contract; a
+# "Failed" outcome is reported via "state", not "status" (status stays
+# "Completed" even when the job failed).
+JOB_TERMINAL_STATUSES = ("Completed",)
+
+
+def _resolve_verify_ssl(configured_value: bool | str | None) -> bool:
+    """Resolve a config value to a TLS-verify bool, defaulting to True when unset."""
+    if configured_value is None:
+        return True
+    if isinstance(configured_value, str):
+        return configured_value.strip().lower() not in ("false", "0", "no", "")
+    return bool(configured_value)
 
 
 class HBSDRestClientError(exception.VolumeDriverException):
@@ -56,7 +88,7 @@ class HBSDConfigurationManagerRestClient:
         storage_device_id: str = "",
         verify_ssl: bool = True,
         timeout: int = 30,
-    ):
+    ) -> None:
         """
         Initialize CM REST client.
 
@@ -80,12 +112,15 @@ class HBSDConfigurationManagerRestClient:
 
     def login(self) -> None:
         """Authenticate with Configuration Manager and obtain session token."""
-        resp = requests.post(
-            f"{self._base}/v1/objects/sessions",
-            auth=(self._username, self._password),
-            verify=self._verify_ssl,
-            timeout=self._timeout,
-        )
+        try:
+            resp = requests.post(
+                f"{self._base}/v1/objects/sessions",
+                auth=(self._username, self._password),
+                verify=self._verify_ssl,
+                timeout=self._timeout,
+            )
+        except requests.exceptions.RequestException as e:
+            raise HBSDRestClientError(msg=f"Login request failed: {e}")
         self._raise_for_status(resp)
         body = resp.json()
         self._session_id = body.get("sessionId")
@@ -105,7 +140,7 @@ class HBSDConfigurationManagerRestClient:
                 verify=self._verify_ssl,
                 timeout=self._timeout,
             )
-        except requests.HTTPError as e:
+        except requests.exceptions.RequestException as e:
             LOG.warning("Error closing CM REST session: %s", e)
         finally:
             self._session_id = None
@@ -138,31 +173,20 @@ class HBSDConfigurationManagerRestClient:
         json_body: dict | None = None,
         extra_headers: dict | None = None,
     ) -> dict | None:
-        """
-        Execute a REST request with automatic session management.
-
-        Args:
-            method: HTTP method (GET, POST, DELETE)
-            path: API path (e.g., /v1/objects/remote-mirror-copypairs)
-            json_body: Request body (for POST/DELETE)
-            extra_headers: Additional headers to add
-
-        Returns:
-            Parsed JSON response, or None if response had no content
-
-        Raises:
-            HBSDRestClientError: On HTTP error or auth failure
-        """
+        """Execute a REST request with automatic session management."""
         if self._token is None:
             self.login()
-        resp = requests.request(
-            method,
-            f"{self._base}{path}",
-            headers=self._headers(extra_headers),
-            json=json_body,
-            verify=self._verify_ssl,
-            timeout=self._timeout,
-        )
+        try:
+            resp = requests.request(
+                method,
+                f"{self._base}{path}",
+                headers=self._headers(extra_headers),
+                json=json_body,
+                verify=self._verify_ssl,
+                timeout=self._timeout,
+            )
+        except requests.exceptions.RequestException as e:
+            raise HBSDRestClientError(msg=f"Request to {path} failed: {e}")
         self._raise_for_status(resp)
 
         # Handle async jobs (202 Accepted)
@@ -179,29 +203,16 @@ class HBSDConfigurationManagerRestClient:
         return resp.json() if resp.content else None
 
     def _wait_for_job(
-        self, job_id: str, interval: int = 3, timeout: int = 86400
+        self,
+        job_id: str,
+        interval: int = 3,
+        timeout: int = 86400,
     ) -> dict:
-        """
-        Poll a job until completion.
-
-        Jobs are represented by jobId and live at /v1/objects/jobs/{jobId}.
-        Polling continues until status != "Running".
-
-        Args:
-            job_id: Job ID to poll
-            interval: Polling interval in seconds
-            timeout: Max total wait time in seconds
-
-        Returns:
-            Final job object
-
-        Raises:
-            HBSDRestClientError: If job fails or times out
-        """
+        """Poll a job (at /v1/objects/jobs/{jobId}) until it reaches a terminal status."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             job = self.request("GET", f"/v1/objects/jobs/{job_id}")
-            if job and job.get("status") != "Running":
+            if job and job.get("status") in JOB_TERMINAL_STATUSES:
                 if job.get("state") == "Failed":
                     raise HBSDRestClientError(
                         msg=f"Job {job_id} failed: {job.get('error')}"
@@ -223,9 +234,9 @@ class HBSDGroupReplicationMixin:
     driver without modification.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Initialize mixin and underlying transport driver."""
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)  # type: ignore
         self._cm_rest_client: HBSDConfigurationManagerRestClient | None = None
         self._remote_cm_rest_client: HBSDConfigurationManagerRestClient | None = None
 
@@ -239,7 +250,7 @@ class HBSDGroupReplicationMixin:
                 username=cfg.safe_get("san_login") or "system",
                 password=cfg.safe_get("san_password") or "",
                 storage_device_id=cfg.safe_get("hitachi_storage_id") or "",
-                verify_ssl=cfg.safe_get("driver_ssl_cert_verify") or False,
+                verify_ssl=_resolve_verify_ssl(cfg.safe_get("driver_ssl_cert_verify")),
             )
         return self._cm_rest_client
 
@@ -253,7 +264,7 @@ class HBSDGroupReplicationMixin:
                 username=rd.get("san_login") or "system",
                 password=rd.get("san_password") or "",
                 storage_device_id=rd.get("storage_id") or "",
-                verify_ssl=rd.get("driver_ssl_cert_verify") or False,
+                verify_ssl=_resolve_verify_ssl(rd.get("driver_ssl_cert_verify")),
             )
         return self._remote_cm_rest_client
 
@@ -286,7 +297,7 @@ class HBSDGroupReplicationMixin:
         copy_pair_name = volume_id[:31]  # Max 31 chars, case sensitive
         return (remote_storage_id, group_id[:31], local_dg, remote_dg, copy_pair_name)
 
-    def _update_volume_stats(self):
+    def _update_volume_stats(self) -> None:
         """Advertise replication and consistency group support."""
         super()._update_volume_stats()
         if self.configuration.safe_get("replication_device"):
@@ -297,7 +308,12 @@ class HBSDGroupReplicationMixin:
                 pool["replication_enabled"] = True
                 pool["replication_type"] = ["async"]
 
-    def enable_replication(self, context, group, volumes):
+    def enable_replication(
+        self,
+        context: RequestContext,
+        group: Group,
+        volumes: list[Volume],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """
         Enable UR replication for a consistency group.
 
@@ -315,6 +331,11 @@ class HBSDGroupReplicationMixin:
         """
         client = self._local_cm_client()
         rd = self._replication_device()
+        allocator = SecondaryLDEVAllocator(
+            self._remote_cm_client(),
+            rd.get("pool", "0"),
+            rd.get("ldev_range", "5000-6000"),
+        )
         vol_models = []
 
         for idx, volume in enumerate(volumes or []):
@@ -333,7 +354,7 @@ class HBSDGroupReplicationMixin:
                     "remoteDeviceGroupName": remote_dg,
                     "remoteStorageDeviceId": rd.get("storage_id", ""),
                     "pvolLdevId": self._ldev_id_for(volume),
-                    "svolLdevId": self._svol_ldev_id_for(volume, rd),
+                    "svolLdevId": allocator.allocate(volume.size),
                     "isNewGroupCreation": idx == 0,  # Only first pair creates CG
                     "doInitialCopy": True,
                     "fenceLevel": "ASYNC",
@@ -345,15 +366,39 @@ class HBSDGroupReplicationMixin:
                 client.request(
                     "POST", "/v1/objects/remote-mirror-copypairs", json_body=body
                 )
-                vol_models.append({"id": volume.id, "replication_status": "enabled"})
+                vol_models.append(
+                    {
+                        "id": volume.id,
+                        "replication_status": fields.ReplicationStatus.ENABLED,
+                    }
+                )
             except HBSDRestClientError as e:
                 LOG.error(
                     "Failed to enable replication for volume %s: %s", volume.id, e
                 )
-                vol_models.append({"id": volume.id, "replication_status": "error"})
-        return {"status": "available"}, vol_models
+                vol_models.append(
+                    {
+                        "id": volume.id,
+                        "replication_status": fields.ReplicationStatus.ERROR,
+                    }
+                )
 
-    def disable_replication(self, context, group, volumes):
+        group_status = (
+            fields.ReplicationStatus.ERROR
+            if any(
+                v["replication_status"] == fields.ReplicationStatus.ERROR
+                for v in vol_models
+            )
+            else fields.ReplicationStatus.ENABLED
+        )
+        return {"replication_status": group_status}, vol_models
+
+    def disable_replication(
+        self,
+        context: RequestContext,
+        group: Group,
+        volumes: list[Volume],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """
         Disable UR replication for a consistency group.
 
@@ -378,44 +423,88 @@ class HBSDGroupReplicationMixin:
                 )
                 LOG.info("Deleting UR pair for volume %s", volume.id)
                 client.request("DELETE", path)
-                vol_models.append({"id": volume.id, "replication_status": "disabled"})
+                vol_models.append(
+                    {
+                        "id": volume.id,
+                        "replication_status": fields.ReplicationStatus.DISABLED,
+                    }
+                )
             except HBSDRestClientError as e:
                 LOG.error(
                     "Failed to disable replication for volume %s: %s", volume.id, e
                 )
-                vol_models.append({"id": volume.id, "replication_status": "error"})
-        return {"status": "available"}, vol_models
+                vol_models.append(
+                    {
+                        "id": volume.id,
+                        "replication_status": fields.ReplicationStatus.ERROR,
+                    }
+                )
+
+        group_status = (
+            fields.ReplicationStatus.ERROR
+            if any(
+                v["replication_status"] == fields.ReplicationStatus.ERROR
+                for v in vol_models
+            )
+            else fields.ReplicationStatus.DISABLED
+        )
+        return {"replication_status": group_status}, vol_models
 
     def failover_replication(
         self,
-        context,
-        group,
-        volumes,
-        secondary_backend_id=None,
-        allow_attached_volume=False,
-    ):
+        context: RequestContext,
+        group: Group,
+        volumes: list[Volume],
+        secondary_backend_id: str | None = None,
+        allow_attached_volume: bool = False,
+    ) -> tuple[str, list[dict[str, Any]]]:
         """
-        Failover a consistency group to the secondary site.
+        Failover a consistency group, or fail it back to the primary.
 
-        Correct sequence:
-        1. Split: POST .../actions/split/invoke on LOCAL array
-           -> Primary suspended, secondary split
-        2. Takeover: POST .../actions/takeover/invoke on REMOTE array
-           -> Secondary S-VOL becomes writable
+        Cinder has no separate failback entry point: it signals "return to
+        the original primary" by calling this method with
+        secondary_backend_id="default". Branch on that before doing
+        anything else, since a forward split+takeover against a target
+        that's already primary would be wrong.
 
         Args:
             context: Cinder request context
             group: Group object
-            volumes: List of volumes to failover
-            secondary_backend_id: Target secondary backend ID
-            allow_attached_volume: If True, use force=true for emergency failover (primary unreachable)
+            volumes: List of volumes to failover/failback
+            secondary_backend_id: Target secondary backend ID, or "default" to fail back
+            allow_attached_volume: If True, the primary is unreachable (emergency failover)
 
         Returns:
-            Tuple (secondary_backend_id, volume_models) with replication_status=failed-over
+            Tuple (backend_id, volume_models) with per-volume replication_status
         """
         rd = self._replication_device()
         target_backend_id = secondary_backend_id or rd.get("backend_id", "")
 
+        if target_backend_id == "default":
+            return self._failback_to_primary(group, volumes)
+        return self._failover_to_secondary(
+            group, volumes, allow_attached_volume, target_backend_id
+        )
+
+    def _failover_to_secondary(
+        self,
+        group: Group,
+        volumes: list[Volume],
+        allow_attached_volume: bool,
+        target_backend_id: str,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """
+        Split the pair and promote the S-VOL to writable on the secondary.
+
+        Sequence:
+        1. Split: POST .../actions/split/invoke — on the LOCAL array when the
+           primary is reachable, or on the REMOTE array with
+           svolOperationMode=SSWS when it isn't (allow_attached_volume=True).
+           Retrying the split against a primary that's by definition
+           unreachable in the emergency branch would just time out.
+        2. Takeover: POST .../actions/takeover/invoke on the REMOTE array
+           -> Secondary S-VOL becomes writable
+        """
         local_client = self._local_cm_client()
         remote_client = self._remote_cm_client()
         vol_models = []
@@ -425,38 +514,6 @@ class HBSDGroupReplicationMixin:
                 storage_id, copy_group, local_dg, remote_dg, copy_pair_name = (
                     self._copy_pair_key(group.id, volume.id)
                 )
-                pair_key = ",".join(
-                    str(k)
-                    for k in (
-                        storage_id,
-                        copy_group,
-                        local_dg,
-                        remote_dg,
-                        copy_pair_name,
-                    )
-                )
-
-                # Phase 1: Split the pair on the primary (local) array
-                LOG.info(
-                    "Splitting pair %s on primary (force=%s)",
-                    copy_pair_name,
-                    allow_attached_volume,
-                )
-                split_params = {"replicationType": "UR"}
-                if allow_attached_volume:
-                    # Emergency failover: force split even if primary is unreachable
-                    split_params["force"] = True
-                    LOG.warning(
-                        "Emergency failover for pair %s: forcing split (data loss possible)",
-                        copy_pair_name,
-                    )
-                local_client.request(
-                    "POST",
-                    f"/v1/objects/remote-mirror-copypairs/{pair_key}/actions/split/invoke",
-                    json_body={"parameters": split_params},
-                )
-
-                # Phase 2: Takeover on the secondary (remote) array
                 takeover_key = ",".join(
                     str(k)
                     for k in (
@@ -467,6 +524,44 @@ class HBSDGroupReplicationMixin:
                         copy_pair_name,
                     )
                 )
+
+                if allow_attached_volume:
+                    # Primary is unreachable: issue the split from the secondary
+                    # itself, per Hitachi's documented secondary-initiated split.
+                    LOG.warning(
+                        "Emergency failover for pair %s: splitting from secondary "
+                        "(svolOperationMode=SSWS, data loss possible)",
+                        copy_pair_name,
+                    )
+                    remote_client.request(
+                        "POST",
+                        f"/v1/objects/remote-mirror-copypairs/{takeover_key}/actions/split/invoke",
+                        json_body={
+                            "parameters": {
+                                "replicationType": "UR",
+                                "svolOperationMode": "SSWS",
+                                "force": True,
+                            }
+                        },
+                    )
+                else:
+                    pair_key = ",".join(
+                        str(k)
+                        for k in (
+                            storage_id,
+                            copy_group,
+                            local_dg,
+                            remote_dg,
+                            copy_pair_name,
+                        )
+                    )
+                    LOG.info("Splitting pair %s on primary", copy_pair_name)
+                    local_client.request(
+                        "POST",
+                        f"/v1/objects/remote-mirror-copypairs/{pair_key}/actions/split/invoke",
+                        json_body={"parameters": {"replicationType": "UR"}},
+                    )
+
                 failover_timeout = int(
                     self.configuration.safe_get("hitachi_failover_timeout") or 7200
                 )
@@ -483,39 +578,35 @@ class HBSDGroupReplicationMixin:
                     },
                 )
                 vol_models.append(
-                    {"id": volume.id, "replication_status": "failed-over"}
+                    {
+                        "id": volume.id,
+                        "replication_status": fields.ReplicationStatus.FAILED_OVER,
+                    }
                 )
             except HBSDRestClientError as e:
                 LOG.error("H7: Failover failed for volume %s: %s", volume.id, e)
                 vol_models.append(
-                    {"id": volume.id, "replication_status": "failover-error"}
+                    {
+                        "id": volume.id,
+                        "replication_status": fields.ReplicationStatus.FAILOVER_ERROR,
+                    }
                 )
         return target_backend_id, vol_models
 
-    def failback_replication(self, context, group, volumes, secondary_backend_id=None):
+    def _failback_to_primary(
+        self,
+        group: Group,
+        volumes: list[Volume],
+    ) -> tuple[str, list[dict[str, Any]]]:
         """
-        Failback a consistency group to the primary site.
-
-        Reverses a previous failover by resyncing and swapping roles.
-        This allows recovery to the original primary site after failover.
+        Resync with a role swap to return a group to its original primary.
 
         Sequence:
         1. Resync: POST .../actions/resync/invoke on SECONDARY array
            with replicationType: swap to reverse direction
-        2. Wait for resync to complete: Poll pair status until PAIR
-        3. Optional swap: Can toggle roles back to original direction
-
-        Args:
-            context: Cinder request context
-            group: Group object
-            volumes: List of volumes to failback
-            secondary_backend_id: Secondary backend ID (unused for failback)
-
-        Returns:
-            Tuple (primary_backend_id, volume_models) with replication_status=enabled
+        2. Wait for resync to complete: poll pair status until PAIR
         """
-        self._replication_device()
-        primary_backend_id = self.configuration.safe_get("volume_backend_name", "")
+        primary_backend_id = self.configuration.safe_get("volume_backend_name") or ""
 
         local_client = self._local_cm_client()
         remote_client = self._remote_cm_client()
@@ -556,15 +647,30 @@ class HBSDGroupReplicationMixin:
                     expected_status="PAIR",
                     timeout=resync_timeout,
                 )
-                vol_models.append({"id": volume.id, "replication_status": "enabled"})
+                vol_models.append(
+                    {
+                        "id": volume.id,
+                        "replication_status": fields.ReplicationStatus.ENABLED,
+                    }
+                )
             except HBSDRestClientError as e:
                 LOG.error("Failback resync failed for volume %s: %s", volume.id, e)
-                vol_models.append({"id": volume.id, "replication_status": "error"})
+                vol_models.append(
+                    {
+                        "id": volume.id,
+                        "replication_status": fields.ReplicationStatus.ERROR,
+                    }
+                )
         return primary_backend_id, vol_models
 
     def _wait_for_pair_status(
-        self, client, copy_group, copy_pair_name, expected_status, timeout=3600
-    ):
+        self,
+        client: HBSDConfigurationManagerRestClient,
+        copy_group: str,
+        copy_pair_name: str,
+        expected_status: str,
+        timeout: int = 3600,
+    ) -> None:
         """
         Poll a UR pair until it reaches expected status.
 
@@ -611,7 +717,11 @@ class HBSDGroupReplicationMixin:
             f"status within {timeout}s"
         )
 
-    def list_replication_targets(self, context, group):
+    def list_replication_targets(
+        self,
+        context: RequestContext,
+        group: Group,
+    ) -> dict[str, list[dict[str, Any]]]:
         """
         List replication targets (secondary backends) for a group.
 
@@ -676,7 +786,11 @@ class HBSDGroupReplicationMixin:
                 reason=f"Failed to query replication targets: {e}"
             )
 
-    def get_replication_lag(self, context, group):
+    def get_replication_lag(
+        self,
+        context: RequestContext,
+        group: Group,
+    ) -> dict[str, Any]:
         """
         Query the replication lag (consistency time) for a group.
 
@@ -742,12 +856,21 @@ class HBSDGroupReplicationMixin:
             LOG.error("Failed to query replication lag for group %s: %s", group.id, e)
             return {"lag_seconds": None, "error": str(e)}
 
-    def update_group(self, context, group, add_volumes=None, remove_volumes=None):
+    def update_group(
+        self,
+        context: RequestContext,
+        group: Group,
+        add_volumes: list[Volume] | None = None,
+        remove_volumes: list[Volume] | None = None,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
         """
         Add or remove volumes from an existing consistency group live.
 
         Adds new copy pairs without recreating the CG (isNewGroupCreation=False),
-        and removes individual pairs without tearing down the CG.
+        and removes individual pairs without tearing down the CG. Per-volume
+        failures are recorded on that volume rather than aborting the whole
+        call, and the group's replication_status reflects the aggregate
+        outcome (any failure -> error), matching enable/disable_replication.
 
         Args:
             context: Cinder request context
@@ -756,7 +879,7 @@ class HBSDGroupReplicationMixin:
             remove_volumes: List of volumes to remove from the group
 
         Returns:
-            Tuple (group_model, updated_vol_models, updated_snapshot_models)
+            Tuple (group_model, add_volume_models, remove_volume_models)
         """
         client = self._local_cm_client()
         rd = self._replication_device()
@@ -772,6 +895,7 @@ class HBSDGroupReplicationMixin:
                     f"Use enable_replication to create the group first."
                 )
 
+        add_vol_models = []
         for volume in add_volumes or []:
             try:
                 _, _, local_dg, remote_dg, copy_pair_name = self._copy_pair_key(
@@ -796,11 +920,22 @@ class HBSDGroupReplicationMixin:
                 client.request(
                     "POST", "/v1/objects/remote-mirror-copypairs", json_body=body
                 )
+                add_vol_models.append(
+                    {
+                        "id": volume.id,
+                        "replication_status": fields.ReplicationStatus.ENABLED,
+                    }
+                )
             except HBSDRestClientError as e:
                 LOG.error("Failed to add volume %s: %s", volume.id, e)
-                raise exception.VolumeDriverException(reason=str(e))
+                add_vol_models.append(
+                    {
+                        "id": volume.id,
+                        "replication_status": fields.ReplicationStatus.ERROR,
+                    }
+                )
 
-        # Remove volumes from the CG
+        remove_vol_models = []
         for volume in remove_volumes or []:
             try:
                 key = self._copy_pair_key(group.id, volume.id)
@@ -810,13 +945,41 @@ class HBSDGroupReplicationMixin:
 
                 LOG.info("Removing volume %s from group %s", volume.id, group.id)
                 client.request("DELETE", path)
+                remove_vol_models.append(
+                    {
+                        "id": volume.id,
+                        "replication_status": fields.ReplicationStatus.DISABLED,
+                    }
+                )
             except HBSDRestClientError as e:
                 LOG.error("Failed to remove volume %s: %s", volume.id, e)
-                raise exception.VolumeDriverException(reason=str(e))
+                remove_vol_models.append(
+                    {
+                        "id": volume.id,
+                        "replication_status": fields.ReplicationStatus.ERROR,
+                    }
+                )
 
-        return {"status": "available"}, None, None
+        group_status = (
+            fields.ReplicationStatus.ERROR
+            if any(
+                v["replication_status"] == fields.ReplicationStatus.ERROR
+                for v in add_vol_models + remove_vol_models
+            )
+            else fields.ReplicationStatus.ENABLED
+        )
+        return (
+            {"replication_status": group_status},
+            add_vol_models or None,
+            remove_vol_models or None,
+        )
 
-    def create_group_snapshot(self, context, group_snapshot, snapshots):
+    def create_group_snapshot(
+        self,
+        context: RequestContext,
+        group_snapshot: GroupSnapshot,
+        snapshots: list[Snapshot],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """
         Create a crash-consistent snapshot of all S-VOLs in a group.
 
@@ -837,7 +1000,7 @@ class HBSDGroupReplicationMixin:
         snap_models = []
         rd = self._replication_device()
 
-        auto_split = self.configuration.safe_get("hitachi_snapshot_auto_split", True)
+        auto_split = self.configuration.safe_get("hitachi_snapshot_auto_split")
         group_name = group_snapshot.id[:32]
 
         try:
@@ -883,7 +1046,11 @@ class HBSDGroupReplicationMixin:
 
         return {"status": "available"}, snap_models
 
-    def manage_existing(self, volume, existing_ref):
+    def manage_existing(
+        self,
+        volume: Volume,
+        existing_ref: dict[str, Any],
+    ) -> dict[str, Any]:
         """
         Manage an existing LDEV as a Cinder volume.
 
@@ -959,7 +1126,11 @@ class HBSDGroupReplicationMixin:
                 reason=f"Failed to manage LDEV {ldev_id} on secondary array: {e}",
             )
 
-    def manage_existing_get_size(self, volume, existing_ref):
+    def manage_existing_get_size(
+        self,
+        volume: Volume,
+        existing_ref: dict[str, Any],
+    ) -> int:
         """
         Get the size of an existing LDEV to be imported.
 
@@ -970,7 +1141,7 @@ class HBSDGroupReplicationMixin:
         Returns:
             Size in GiB (minimum 1)
         """
-        client = self._local_cm_client()
+        client = self._remote_cm_client()
         ldev_id = existing_ref.get("source-name") or existing_ref.get("source-id")
 
         try:
@@ -984,7 +1155,7 @@ class HBSDGroupReplicationMixin:
                 reason=f"Could not get LDEV {ldev_id} size: {e}",
             )
 
-    def unmanage(self, volume):
+    def unmanage(self, volume: Volume) -> None:
         """
         Unmanage a volume (remove from Cinder DB only).
 
@@ -1000,7 +1171,7 @@ class HBSDGroupReplicationMixin:
         """
         LOG.info("Unmanaged volume %s (LDEV and UR pair untouched)", volume.id)
 
-    def _ldev_id_for(self, volume) -> int:
+    def _ldev_id_for(self, volume: Volume) -> int:
         """
         Extract LDEV ID from volume's provider_location.
 
@@ -1014,7 +1185,11 @@ class HBSDGroupReplicationMixin:
                 reason=f"Invalid provider_location: {volume.provider_location}"
             )
 
-    def _svol_ldev_id_for(self, volume, replication_device: dict) -> int:
+    def _svol_ldev_id_for(
+        self,
+        volume: Volume,
+        replication_device: dict[str, Any],
+    ) -> int:
         """
         Allocate or derive a secondary LDEV ID for the given volume.
 
@@ -1096,7 +1271,7 @@ class HBSDGroupReplicationFCDriver(HBSDGroupReplicationMixin, hbsd_fc.HBSDFCDriv
 
     Configuration (cinder.conf):
         [hitachi_vsp_fc]
-        volume_driver = cinder.volume.drivers.pf9_hitachi.pf9_hitachi_rsync.HBSDGroupReplicationFCDriver
+        volume_driver = cinder.volume.drivers.pf9_hitachi.pf9_hitachi_replication.HBSDGroupReplicationFCDriver
         san_ip = <primary-cm-ip>
         san_login = system
         san_password = <password>
@@ -1122,7 +1297,7 @@ class HBSDGroupReplicationISCSIDriver(
 
     Configuration (cinder.conf):
         [hitachi_vsp_iscsi]
-        volume_driver = cinder.volume.drivers.pf9_hitachi.pf9_hitachi_rsync.HBSDGroupReplicationISCSIDriver
+        volume_driver = cinder.volume.drivers.pf9_hitachi.pf9_hitachi_replication.HBSDGroupReplicationISCSIDriver
         san_ip = <primary-cm-ip>
         san_login = system
         san_password = <password>
