@@ -176,8 +176,9 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
                 with open(os.path.join(cgdir, ".last_sync.json"), "w") as f:
                     json.dump({"cg": cgn, "generation": gen_n,
                                "replicated_at": now, "elapsed": elapsed}, f)
-            except OSError:
-                pass
+            except OSError as e:
+                LOG.warning("PF9NFSRsync: could not write .last_sync.json for "
+                            "%s (RPO reporting will be stale): %s", cgn, e)
         LOG.info("PF9NFSRsync: shipped %s (consistency_time=%s, %ss)",
                  gen, now, elapsed)
 
@@ -189,7 +190,9 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
             try:
                 with open(os.path.join(cgdir, COPYGROUP_FILE)) as f:
                     cg = json.load(f)
-            except (OSError, ValueError):
+            except (OSError, ValueError) as e:
+                LOG.debug("PF9NFSRsync: skipping %s, unreadable copygroup: %s",
+                          cgdir, e)
                 continue
             if cg.get("direction") == "reversed":
                 continue
@@ -201,7 +204,9 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
     def _iter_cg_dirs(self):
         try:
             names = os.listdir(self._export())
-        except OSError:
+        except OSError as e:
+            LOG.debug("PF9NFSRsync: cannot list export %s: %s",
+                      self._export(), e)
             return
         for name in names:
             if name.startswith("cg-"):
@@ -212,14 +217,17 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         try:
             with open(path) as f:
                 g = int((f.read().strip() or "0"))
-        except (OSError, ValueError):
+        except (OSError, ValueError) as e:
+            LOG.debug("PF9NFSRsync: no prior generation counter at %s "
+                      "(starting at 0): %s", path, e)
             g = 0
         g += 1
         try:
             with open(path, "w") as f:
                 f.write(str(g))
-        except OSError:
-            pass
+        except OSError as e:
+            LOG.warning("PF9NFSRsync: could not persist generation counter "
+                        "to %s: %s", path, e)
         return g
 
     def _peer_marker_path(self, incoming: str) -> str:
@@ -257,7 +265,9 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         # replication_status before it will enable replication on it.
         try:
             specs = (volume.volume_type.extra_specs or {})
-        except AttributeError:
+        except AttributeError as e:
+            LOG.debug("PF9NFSRsync: volume %s has no volume_type extra_specs: %s",
+                      getattr(volume, "id", "?"), e)
             return False
         val = str(specs.get("replication_enabled", "")).lower()
         return "true" in val
@@ -281,8 +291,9 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         for v in (volumes or []):
             try:
                 os.remove(self._vol_path(v.id))
-            except FileNotFoundError:
-                pass
+            except FileNotFoundError as e:
+                LOG.debug("PF9NFSRsync: volume file for %s already gone: %s",
+                          v.id, e)
         shutil.rmtree(self._cg_dir(group.id), ignore_errors=True)
         model = {"status": "deleted"}
         return model, [{"id": v.id, "status": "deleted"} for v in (volumes or [])]
@@ -443,13 +454,15 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
                 shutil.copy2(src, dst)
                 try:
                     os.remove(src)
-                except OSError:
-                    pass
+                except OSError as e:
+                    LOG.warning("PF9NFSRsync: adopted %s via copy but could not "
+                                "remove source %s: %s", dst, src, e)
         try:
             with open(os.path.join(self._meta_dir(), PROMOTED_FILE), "w") as f:
                 f.write(str(int(time.time())))
-        except OSError:
-            pass
+        except OSError as e:
+            LOG.warning("PF9NFSRsync: could not write promoted marker "
+                        "(split-brain guard weakened): %s", e)
         LOG.info("PF9NFSRsync: managed svol %s (resolved %s) as volume %s "
                  "(site promoted)", ref_name, resolved, volume.id)
         return {"provider_location": self._nfs_share()}
@@ -539,7 +552,9 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         try:
             with open(path) as f:
                 st = json.load(f)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as e:
+            LOG.debug("PF9NFSRsync: no prior LUN allocation at %s "
+                      "(seeding from base): %s", path, e)
             st = {"next_pvol": PVOL_BASE, "next_svol": SVOL_BASE}
         pvol, svol = st["next_pvol"], st["next_svol"]
         st["next_pvol"], st["next_svol"] = pvol + 1, svol + 1
@@ -555,7 +570,9 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         try:
             with open(self._copygroup_path(group_id)) as f:
                 return json.load(f)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as e:
+            LOG.debug("PF9NFSRsync: no copygroup for %s yet "
+                      "(returning empty): %s", group_id, e)
             return {"copyGroup": group_id, "generation": 0,
                     "consistencyTime": 0, "direction": "P_to_S", "pairs": []}
 
@@ -572,7 +589,8 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
             d = os.path.join(export, base)
             try:
                 entries = os.listdir(d)
-            except OSError:
+            except OSError as e:
+                LOG.debug("PF9NFSRsync: svol scan skipping %s: %s", d, e)
                 continue
             for name in entries:
                 if not name.startswith("cg-"):
@@ -580,7 +598,9 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
                 try:
                     with open(os.path.join(d, name, COPYGROUP_FILE)) as f:
                         cg = json.load(f)
-                except (OSError, ValueError):
+                except (OSError, ValueError) as e:
+                    LOG.debug("PF9NFSRsync: svol scan skipping %s, unreadable "
+                              "copygroup: %s", name, e)
                     continue
                 for p in cg.get("pairs", []):
                     if p.get("svolId") == ref:
@@ -596,8 +616,9 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
     def _unlink_from_cg(self, group_id: str, vol_id: str) -> None:
         try:
             os.remove(os.path.join(self._cg_dir(group_id), vol_id))
-        except FileNotFoundError:
-            pass
+        except FileNotFoundError as e:
+            LOG.debug("PF9NFSRsync: cg %s member marker for %s already gone: %s",
+                      group_id, vol_id, e)
 
     def _copy(self, src: str, dst: str) -> None:
         if os.path.exists(src):
