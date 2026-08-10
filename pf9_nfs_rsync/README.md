@@ -21,8 +21,7 @@ Class path (note the package): `cinder.volume.drivers.pf9_nfs_rsync.pf9_nfs_rsyn
 ## What it implements
 
 Subclasses the upstream `NfsDriver` and adds the standard Cinder replication +
-manage contract — the same methods a real array driver provides, and the ones
-Hitachi's driver leaves as gaps in replication-active mode:
+manage contract — the same methods a real array driver provides:
 
 | Method | Role |
 |--------|------|
@@ -32,8 +31,8 @@ Hitachi's driver leaves as gaps in replication-active mode:
 | `manage_existing` | adopt a promoted secondary volume **by its svol id** (`source-name`); resolves svol → file → registers as a local volume; also drops a `promoted` marker |
 | `manage_existing_get_size`, `unmanage`, `create_group*`, `update_group`, `delete_group`, `list_replication_targets` | rest of the contract |
 
-**In-driver replication (no external script).** A daemon thread started in
-`do_setup()` does what the old `pf9_rsync_loop.sh` did — each interval, if a CG is
+**In-driver replication.** A daemon thread started in `do_setup()` runs the
+replication loop — each interval, if a CG is
 `PAIR`/`COPY`, it ships the export to the secondary as a fresh generation, atomically
 flips `incoming/current` to it, prunes old generations, and stamps per-CG lag
 (`.last_sync.json`, which PSR reads for RPO). State-gated: `SSWS`/`SMPL`/reversed

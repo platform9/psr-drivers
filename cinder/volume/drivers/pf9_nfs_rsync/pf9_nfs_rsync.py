@@ -67,6 +67,8 @@ PROMOTED_FILE = "promoted"
 PVOL_BASE = 1001
 SVOL_BASE = 2001
 
+SSH_OPTS = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10"]
+
 
 @interface.volumedriver
 class PF9NFSRsyncDriver(nfs.NfsDriver):
@@ -119,8 +121,7 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
                  self.configuration.safe_get("pf9_replication_keep_gens"))
 
     def _replication_worker(self):
-        interval = int(self.configuration.safe_get(
-            "pf9_replication_interval") or 30)
+        interval = self.configuration.safe_get("pf9_replication_interval")
         while not self._repl_stop.is_set():
             try:
                 self._replicate_once()
@@ -129,6 +130,8 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
                             e.returncode,
                             (e.stderr or b"").decode(errors="replace")[:300])
             except Exception as e:
+                # Deliberately broad: this is the background thread's top-level
+                # guard. A bug in one cycle must be logged, not kill the loop.
                 LOG.warning("PF9NFSRsync: replication cycle error: %s", e)
             self._repl_stop.wait(interval)
 
@@ -142,14 +145,13 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         if self._peer_promoted(peer, incoming):
             LOG.info("PF9NFSRsync: peer %s is promoted; replication paused.", peer)
             return
-        keep = int(self.configuration.safe_get(
-            "pf9_replication_keep_gens") or 3)
+        keep = self.configuration.safe_get("pf9_replication_keep_gens")
 
         gen_n = self._next_generation()
         gen = "gen-%d" % gen_n
         start = time.time()
 
-        self._ssh(peer, "mkdir -p '%s' && chmod 0777 '%s'" % (incoming, incoming))
+        self._run(SSH_OPTS + [peer, "mkdir -p '%s' && chmod 0777 '%s'" % (incoming, incoming)])
         self._run(["rsync", "-az", "--delete",
                    "--exclude", PSR_META_DIR + "/",
                    "--exclude", "lost+found/",
@@ -160,13 +162,13 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         # generation NUMBER (sort -rn), not mtime: rsync -a copies the source
         # mtime onto every generation, so mtime can't tell them apart. Never
         # delete whatever 'current' points at.
-        self._ssh(peer,
+        self._run(SSH_OPTS + [peer,
                   "set -e; cd '%s'; "
                   "ln -sfn '%s' current.tmp && mv -Tf current.tmp current; "
                   "cur=$(readlink current 2>/dev/null); "
                   "ls -1d gen-* 2>/dev/null | sed 's/^gen-//' | sort -rn "
                   "| tail -n +%d | sed 's/^/gen-/' | grep -vx \"$cur\" "
-                  "| xargs -r rm -rf" % (incoming, gen, keep + 1))
+                  "| xargs -r rm -rf" % (incoming, gen, keep + 1)])
         now = int(time.time())
         for cgdir in self._iter_cg_dirs():
             cgn = os.path.basename(cgdir)[len("cg-"):]
@@ -225,14 +227,16 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         return os.path.join(peer_export, PSR_META_DIR, PROMOTED_FILE)
 
     def _peer_promoted(self, peer: str, incoming: str) -> bool:
+        # `test -f` exits 1 (not an error) when the marker is absent, so this
+        # call must not raise on a non-zero exit -> check=False.
         marker = self._peer_marker_path(incoming)
         try:
-            r = subprocess.run(
-                ["ssh", "-o", "StrictHostKeyChecking=no",
-                 "-o", "ConnectTimeout=10", peer, "test -f '%s'" % marker],
-                capture_output=True, timeout=30)
+            r = self._run(SSH_OPTS + [peer, "test -f '%s'" % marker],
+                          check=False, timeout=30)
             return r.returncode == 0
-        except Exception:
+        except (subprocess.SubprocessError, OSError) as e:
+            LOG.warning("PF9NFSRsync: could not check promoted marker on %s: %s",
+                        peer, e)
             return False
 
     def _clear_peer_promoted(self, peer: str, incoming: str) -> None:
@@ -240,23 +244,20 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         (used on failback). No-op if the peer is unreachable."""
         marker = self._peer_marker_path(incoming)
         try:
-            self._ssh(peer, "rm -f '%s'" % marker)
-        except Exception as e:
+            self._run(SSH_OPTS + [peer, "rm -f '%s'" % marker])
+        except (subprocess.SubprocessError, OSError) as e:
             LOG.warning("PF9NFSRsync: could not clear peer promoted marker: %s", e)
 
-    def _ssh(self, peer: str, remote_cmd: str) -> None:
-        self._run(["ssh", "-o", "StrictHostKeyChecking=no",
-                   "-o", "ConnectTimeout=10", peer, remote_cmd])
-
-    def _run(self, argv) -> None:
-        subprocess.run(argv, check=True, capture_output=True, timeout=600)
+    def _run(self, argv, check=True, timeout=600):
+        return subprocess.run(argv, check=check, capture_output=True,
+                              timeout=timeout)
 
     def _type_is_replicated(self, volume):
         # Cinder requires a replication-capable volume to report a
         # replication_status before it will enable replication on it.
         try:
             specs = (volume.volume_type.extra_specs or {})
-        except Exception:
+        except AttributeError:
             return False
         val = str(specs.get("replication_enabled", "")).lower()
         return "true" in val
