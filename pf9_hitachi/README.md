@@ -3,6 +3,7 @@
 Hitachi custom driver implementing 8 missing Cinder gaps for disaster recovery replication.
 
 ---
+
 ## 📦 What's Included
 
 | File | Purpose |
@@ -20,6 +21,7 @@ Hitachi custom driver implementing 8 missing Cinder gaps for disaster recovery r
 | `cinder/volume/drivers/pf9_hitachi/hbsd_utils.py` | Utilities and constants |
 
 ---
+
 ## 📋 Implemented Gaps (H1–H8)
 
 | Gap | Method | Purpose |
@@ -34,6 +36,7 @@ Hitachi custom driver implementing 8 missing Cinder gaps for disaster recovery r
 | H8 | `list_replication_targets()` | Return secondary backend_id |
 
 ---
+
 ## 🏗️ Architecture
 
 **Mixin Pattern:** Reusable replication logic across FC and iSCSI transports.
@@ -51,6 +54,45 @@ HBSDGroupReplicationMixin (replication methods)
 - Easier to maintain and test
 
 ---
+
+## How to track OpenStack Cinder Hitachi driver
+
+**Process for syncing upstream Hitachi driver improvements:**
+
+1. **Clone the OpenStack Cinder repository locally**
+   ```bash
+   git clone git@github.com/openstack/cinder.git
+   ```
+
+2. **Compare branches for Hitachi driver changes**
+   - Check the released branch (e.g., `stable/2026.1`) for current production version
+   - Check the main branch for latest development changes
+   - Compare Hitachi driver files between branches:
+     ```bash
+     git diff stable/2026.1..main -- cinder/volume/drivers/hitachi/
+     ```
+
+3. **Identify new commits in main branch**
+   - List commits affecting Hitachi driver:
+     ```bash
+     git log stable/2026.1..main --oneline -- cinder/volume/drivers/hitachi/
+     ```
+   - Review commit messages to determine importance and relevance
+
+4. **Copy files from main branch if needed**
+   - If important changes are found in main but missing in released:
+     ```bash
+     git show main:cinder/volume/drivers/hitachi/<filename> > <destination>
+     ```
+   - Test integration and verify compatibility with Platform9 extensions
+
+5. **Update this driver**
+   - Merge upstream improvements into corresponding `pf9_hitachi/` files
+   - Ensure replication gaps (H1-H8) remain unaffected
+   - Re-test all 8 gap implementations after upstream sync
+
+---
+
 ## 📚 Next Steps
 
 1. **Read:** [DEPLOYMENT.md](/psr-drivers/DEPLOYMENT.md) (installation details)
