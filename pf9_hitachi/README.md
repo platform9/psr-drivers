@@ -2,14 +2,17 @@
 
 Hitachi custom driver implementing 8 missing Cinder gaps for disaster recovery replication.
 
+> **Status:** being rebuilt against the stock `hbsd_*` drivers. Phase 1 (foundation)
+> is in the working tree; H1-H8 land in Phases 2-4. See
+> [psr_drivers_implementation.md](../../psr_drivers_implementation.md).
+
 ---
 
 ## 📦 What's Included
 
 | File | Purpose |
 |------|---------|
-| `cinder/volume/drivers/pf9_hitachi/pf9_hitachi_replication.py` | Platform9 Extended Replication Driver (all 8 gaps) [See implemented gaps](#-implemented-gaps-h1h8) |
-| `cinder/volume/drivers/pf9_hitachi/pf9_allocator.py` | Secondary LDEV allocator for replication pairs |
+| `cinder/volume/drivers/pf9_hitachi/hbsd_replication.py` | Replication logic, including the group-replication contract (all 8 gaps) [See implemented gaps](#-implemented-gaps-h1h8) |
 | `cinder/volume/drivers/pf9_hitachi/hbsd_common.py` | Shared logic for FC and iSCSI drivers |
 | `cinder/volume/drivers/pf9_hitachi/hbsd_rest.py` | REST API interface abstraction |
 | `cinder/volume/drivers/pf9_hitachi/hbsd_rest_api.py` | Low-level REST API client |
@@ -17,7 +20,6 @@ Hitachi custom driver implementing 8 missing Cinder gaps for disaster recovery r
 | `cinder/volume/drivers/pf9_hitachi/hbsd_iscsi.py` | iSCSI driver entry point |
 | `cinder/volume/drivers/pf9_hitachi/hbsd_rest_fc.py` | FC-specific REST operations |
 | `cinder/volume/drivers/pf9_hitachi/hbsd_rest_iscsi.py` | iSCSI-specific REST operations |
-| `cinder/volume/drivers/pf9_hitachi/hbsd_replication.py` | Upstream replication mixin |
 | `cinder/volume/drivers/pf9_hitachi/hbsd_utils.py` | Utilities and constants |
 
 ---
@@ -50,19 +52,26 @@ Beyond the 8 core gaps, the driver provides monitoring and management helpers:
 
 ## 🏗️ Architecture
 
-**Mixin Pattern:** Reusable replication logic across FC and iSCSI transports.
+**Folded into the stock drivers.** Group replication is a capability of the
+existing `HBSDFCDriver` and `HBSDISCSIDriver` rather than a separate driver
+class per transport. There is no mixin and no `pf9_*.py` module.
 
 ```
-HBSDGroupReplicationMixin (replication methods)
-├── HBSDGroupReplicationFCDriver (+ FC transport)
-└── HBSDGroupReplicationISCSIDriver (+ iSCSI transport)
+HBSDFCDriver / HBSDISCSIDriver   (unchanged entry points)
+└── self.common = HBSDREPLICATION   (built when replication_device is set)
+    ├── H5-H8  group-replication contract (enable/disable/failover/list)
+    └── H1-H4  lifecycle methods, branching on the group type
 ```
+
+An operator enables the feature by pointing `volume_driver` at the stock
+`HBSDFCDriver` or `HBSDISCSIDriver`, configuring `replication_device`, and
+creating a group type with `consistent_group_replication_enabled='<is> True'`.
+Volumes and groups without that type take the unmodified upstream code path.
 
 **Benefits:**
-- Zero code duplication
-- Supports both FC and iSCSI
-- Upstream-compatible pattern
-- Easier to maintain and test
+- No new driver classes, so no new third-party CI is required upstream
+- Non-replicated volumes keep upstream's validated behaviour
+- All PF9 additions are bracketed by `# PF9 Start` / `# PF9 End` markers
 
 ---
 

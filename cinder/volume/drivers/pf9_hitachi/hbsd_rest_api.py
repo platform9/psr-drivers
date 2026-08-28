@@ -1112,6 +1112,17 @@ class RestApiClient():
         } + '/invoke'
         self._invoke(url, body=body, job_nowait=True)
 
+    @utils.synchronized_on_copy_group()
+    def takeover_remote_copy_grp(self, remote_client, copy_group_name):
+        body = {"parameters": {"mode": "forceSplit"}}
+        url = '%(url)s/remote-mirror-copygroups/%(id)s/actions/%(action)s' % {
+            'url': self.object_url,
+            'id': self._remote_copygroup_id(
+                None, copy_group_name, is_secondary=True),
+            'action': 'takeover',
+        } + '/invoke'
+        self._invoke(url, body=body, job_nowait=True)
+
     def _remote_copygroup_id(self, remote_client, copy_group_name,
                              is_secondary=False):
         storage_id = (remote_client.storage_id if remote_client

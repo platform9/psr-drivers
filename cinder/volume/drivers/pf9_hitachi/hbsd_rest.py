@@ -1414,7 +1414,7 @@ class HBSDREST(common.HBSDCommon):
                         self.output_log(MSG.DELETE_LDEV_FAILED, ldev=new_ldev)
         return None, volumes_model_update
 
-    def update_group(self, group, add_volumes=None):
+    def update_group(self, group, add_volumes=None, remove_volumes=None):
         if add_volumes and volume_utils.is_group_a_cg_snapshot_type(group):
             for volume in add_volumes:
                 ldev = self.get_ldev(volume)
@@ -1478,9 +1478,11 @@ class HBSDREST(common.HBSDCommon):
                 self.output_log(MSG.DELETE_PAIR_FAILED, pvol=pair['pvol'],
                                 svol=pair['svol'])
 
-    def _create_ctg_snap_pair(self, pairs):
-        snapshotgroup_name = self._create_ctg_snapshot_group_name(
-            pairs[0]['pvol'])
+    def _create_ctg_snap_pair(self, pairs, snapshotgroup_name=None):
+        # Callers that own the group's identity pass their own name.
+        if snapshotgroup_name is None:
+            snapshotgroup_name = self._create_ctg_snapshot_group_name(
+                pairs[0]['pvol'])
         try:
             for pair in pairs:
                 try:

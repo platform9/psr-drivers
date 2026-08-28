@@ -31,7 +31,7 @@ from cinder import exception
 from cinder import utils as cinder_utils
 from cinder.volume import volume_types
 
-VERSION = '2.7.2'
+VERSION = '2.8.0'
 CI_WIKI_NAME = 'Hitachi_CI'
 PARAM_PREFIX = 'hitachi'
 VENDOR_NAME = 'Hitachi'
@@ -107,6 +107,34 @@ class HBSDMsg(enum.Enum):
         'msg_id': 6,
         'loglevel': base_logging.INFO,
         'msg': 'Created %(object)s. (%(details)s)',
+        'suffix': INFO_SUFFIX,
+    }
+    GROUP_REPLICATION_PAIR_CREATED = {
+        'msg_id': 7,
+        'loglevel': base_logging.INFO,
+        'msg': 'Created a group replication pair. (copy group: '
+               '%(copy_group)s, P-VOL: %(pvol)s, S-VOL: %(svol)s)',
+        'suffix': INFO_SUFFIX,
+    }
+    GROUP_REPLICATION_PAIR_DELETED = {
+        'msg_id': 8,
+        'loglevel': base_logging.INFO,
+        'msg': 'Deleted a group replication pair. (copy group: '
+               '%(copy_group)s, P-VOL: %(pvol)s, S-VOL: %(svol)s)',
+        'suffix': INFO_SUFFIX,
+    }
+    GROUP_REPLICATION_TAKEOVER_STARTED = {
+        'msg_id': 9,
+        'loglevel': base_logging.INFO,
+        'msg': 'Started a group takeover for remote replication. '
+               '(copy group: %(copy_group)s)',
+        'suffix': INFO_SUFFIX,
+    }
+    GROUP_REPLICATION_VOLUME_UNMANAGED = {
+        'msg_id': 10,
+        'loglevel': base_logging.INFO,
+        'msg': 'Unmanaged a group replication volume. (volume: '
+               '%(volume)s, LDEV: %(ldev)s)',
         'suffix': INFO_SUFFIX,
     }
     NO_LUN = {
@@ -345,6 +373,21 @@ class HBSDMsg(enum.Enum):
         'msg': 'Skip deleting the LDEV and its LUNs and pairs because the '
                'LDEV is used by another object. (%(obj)s: %(obj_id)s, LDEV: '
                '%(ldev)s, LDEV label: %(ldev_label)s)',
+        'suffix': WARNING_SUFFIX,
+    }
+    GROUP_REPLICATION_UNSUPPORTED_OPERATION = {
+        'msg_id': 349,
+        'loglevel': base_logging.WARNING,
+        'msg': '%(operation)s is not supported for a group replication '
+               'backend. (%(details)s)',
+        'suffix': WARNING_SUFFIX,
+    }
+    GROUP_REPLICATION_NICKNAME_CLEANUP_FAILED = {
+        'msg_id': 350,
+        'loglevel': base_logging.WARNING,
+        'msg': 'Failed to clean up the LDEV nickname for an unmanaged '
+               'group replication volume. (volume: %(volume)s, LDEV: '
+               '%(ldev)s)',
         'suffix': WARNING_SUFFIX,
     }
     STORAGE_COMMAND_FAILED = {
@@ -818,6 +861,62 @@ class HBSDMsg(enum.Enum):
         'msg_id': 773,
         'loglevel': base_logging.ERROR,
         'msg': 'Failed to ss2vclone. p-vol=%(pvol)s,s-vol=%(svol)s',
+        'suffix': ERROR_SUFFIX,
+    }
+    GROUP_REPLICATION_PAIR_CREATE_FAILED = {
+        'msg_id': 774,
+        'loglevel': base_logging.ERROR,
+        'msg': 'Failed to create a group replication pair. (volume: '
+               '%(volume)s, copy group: %(copy_group)s)',
+        'suffix': ERROR_SUFFIX,
+    }
+    GROUP_REPLICATION_PAIR_DELETE_FAILED = {
+        'msg_id': 775,
+        'loglevel': base_logging.ERROR,
+        'msg': 'Failed to delete a group replication pair. (volume: '
+               '%(volume)s, copy group: %(copy_group)s)',
+        'suffix': ERROR_SUFFIX,
+    }
+    GROUP_REPLICATION_FAILOVER_FAILED = {
+        'msg_id': 776,
+        'loglevel': base_logging.ERROR,
+        'msg': 'Failed to fail over the group replication. (group: '
+               '%(group)s, copy group: %(copy_group)s)',
+        'suffix': ERROR_SUFFIX,
+    }
+    GROUP_REPLICATION_FAILBACK_FAILED = {
+        'msg_id': 777,
+        'loglevel': base_logging.ERROR,
+        'msg': 'Failed to fail back the group replication. (group: '
+               '%(group)s, copy group: %(copy_group)s)',
+        'suffix': ERROR_SUFFIX,
+    }
+    GROUP_REPLICATION_TARGETS_QUERY_FAILED = {
+        'msg_id': 778,
+        'loglevel': base_logging.ERROR,
+        'msg': 'Failed to get the list of group replication targets. '
+               '(group: %(group)s)',
+        'suffix': ERROR_SUFFIX,
+    }
+    GROUP_REPLICATION_MANAGE_FAILED = {
+        'msg_id': 779,
+        'loglevel': base_logging.ERROR,
+        'msg': 'Failed to manage a group replication volume. (volume: '
+               '%(volume)s, %(reason)s)',
+        'suffix': ERROR_SUFFIX,
+    }
+    GROUP_REPLICATION_SNAPSHOT_FAILED = {
+        'msg_id': 780,
+        'loglevel': base_logging.ERROR,
+        'msg': 'Failed to create a group replication snapshot. '
+               '(group_snapshot: %(group_snapshot)s)',
+        'suffix': ERROR_SUFFIX,
+    }
+    GROUP_REPLICATION_SNAPSHOT_DELETE_FAILED = {
+        'msg_id': 781,
+        'loglevel': base_logging.ERROR,
+        'msg': 'Failed to delete a group replication snapshot. '
+               '(group_snapshot: %(group_snapshot)s)',
         'suffix': ERROR_SUFFIX,
     }
 
