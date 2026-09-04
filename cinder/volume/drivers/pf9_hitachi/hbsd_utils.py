@@ -15,6 +15,8 @@
 #
 """Utility module for Hitachi HBSD Driver."""
 
+from __future__ import annotations
+
 import enum
 import functools
 import logging as base_logging
@@ -917,6 +919,30 @@ class HBSDMsg(enum.Enum):
         'loglevel': base_logging.ERROR,
         'msg': 'Failed to delete a group replication snapshot. '
                '(group_snapshot: %(group_snapshot)s)',
+        'suffix': ERROR_SUFFIX,
+    }
+    GROUP_REPLICATION_RESYNC_FAILED = {
+        'msg_id': 782,
+        'loglevel': base_logging.ERROR,
+        'msg': 'Failed to restart the group replication. (volume: '
+               '%(volume)s, copy group: %(copy_group)s)',
+        'suffix': ERROR_SUFFIX,
+    }
+    GROUP_REPLICATION_BINDING_CONFLICT = {
+        'msg_id': 783,
+        'loglevel': base_logging.ERROR,
+        'msg': 'The volumes of a group name different copy groups, so the '
+               'group cannot be bound to one. (group: %(group)s, copy '
+               'groups: %(copy_groups)s)',
+        'suffix': ERROR_SUFFIX,
+    }
+    GROUP_REPLICATION_ADOPT_FAILED = {
+        'msg_id': 784,
+        'loglevel': base_logging.ERROR,
+        'msg': 'The storage system does not report this volume as a '
+               'secondary volume of the copy group, so its replication '
+               'cannot be adopted. (volume: %(volume)s, copy group: '
+               '%(copy_group)s)',
         'suffix': ERROR_SUFFIX,
     }
 

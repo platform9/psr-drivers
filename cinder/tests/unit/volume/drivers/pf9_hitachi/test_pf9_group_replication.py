@@ -1038,6 +1038,20 @@ class PF9GroupReplicationFCTest(test.TestCase):
     def _repl_group(self, group_id=None):
         return self._group(self._GROUP_SPEC, group_id)
 
+    def _graceful_repl_group(self, group_id=None):
+        specs = dict(self._GROUP_SPEC)
+        specs[hbsd_replication._GROUP_REPL_MODE_SPEC] = (
+            hbsd_replication._MODE_GRACEFUL)
+        return self._group(specs, group_id)
+
+    def _paired_members(self, count, first=0):
+        """Members whose provider_location claims both LDEVs."""
+        volumes = self._members(count, first=first)
+        for i, vol in enumerate(volumes):
+            vol.provider_location = json.dumps(
+                {'pldev': 10 + first + i, 'sldev': 100 + first + i})
+        return volumes
+
     def _members(self, count, first=0):
         """Volumes already carrying a P-VOL provider_location."""
         volumes = []
@@ -1050,13 +1064,26 @@ class PF9GroupReplicationFCTest(test.TestCase):
             volumes.append(vol)
         return volumes
 
-    def _stub_common(self, copy_grps=None, svol_start=100):
+    _PAIRED_SVOL_INFO = {
+        'status': 'NML',
+        'emulationType': 'OPEN-V-CVS',
+        # HORC is what a live remote-copy pair leaves on the S-VOL, and it
+        # is exactly what the general manageability check refuses.
+        'attributes': ['CVS', 'HDP', 'HORC'],
+        'numOfPorts': 0,
+    }
+
+    def _stub_common(self, copy_grps=None, svol_start=100, copy_pairs=None):
         """Stub the two clients so only driver decisions are exercised."""
         common = self.driver.common
         common.rep_primary.client.get_remote_copy_grps = mock.Mock(
             return_value=copy_grps if copy_grps is not None else [])
+        common.rep_primary.client.get_remote_copy_grp = mock.Mock(
+            return_value={'copyPairs': copy_pairs or []})
         common.rep_primary.client.add_remote_copypair = mock.Mock()
         common.rep_primary.client.delete_remote_copypair = mock.Mock()
+        common.rep_primary.client.split_remote_copy_grp = mock.Mock()
+        common.rep_primary.client.resync_remote_copy_grp = mock.Mock()
         common.rep_secondary.client.takeover_remote_copy_grp = mock.Mock()
         common.rep_secondary.client.resync_remote_copy_grp = mock.Mock()
         common.rep_secondary.create_ldev = mock.Mock(
@@ -1604,7 +1631,8 @@ class PF9GroupReplicationFCTest(test.TestCase):
         """H1: the promoted S-VOL is adopted on the secondary."""
         common = self._stub_common()
         secondary = common.rep_secondary
-        secondary.check_ldev_manageability = mock.Mock()
+        secondary.get_ldev_info = mock.Mock(
+            return_value=dict(self._PAIRED_SVOL_INFO))
         secondary.modify_ldev_name = mock.Mock()
         secondary.get_qos_specs_from_ldev = mock.Mock(return_value=None)
         secondary.change_qos_specs = mock.Mock()
@@ -1616,7 +1644,6 @@ class PF9GroupReplicationFCTest(test.TestCase):
 
         self.assertEqual({'sldev': 77},
                          json.loads(ret['provider_location']))
-        secondary.check_ldev_manageability.assert_called_once()
         secondary.modify_ldev_name.assert_called_once_with(
             77, volume['id'].replace('-', ''))
         # §3.4: adoption must not export the volume.
@@ -1715,3 +1742,558 @@ class PF9GroupReplicationFCTest(test.TestCase):
             exception.VolumeDriverException,
             self.driver.delete_group_snapshot,
             self.ctxt, self._group_snapshot(self._repl_group()), [])
+
+    # ---- Graceful vs emergency split -------------------------------------
+
+    def test_failover_replication_defaults_to_emergency(self):
+        """No mode asked for keeps the pre-existing force split."""
+        common = self._stub_common()
+        self._stub_wait(common)
+
+        self.driver.failover_replication(
+            self.ctxt, self._repl_group(), self._paired_members(2),
+            secondary_backend_id='backend2')
+
+        self.assertEqual(
+            1,
+            common.rep_secondary.client.takeover_remote_copy_grp.call_count)
+        self.assertEqual(
+            0, common.rep_primary.client.split_remote_copy_grp.call_count)
+
+    def test_failover_replication_graceful_via_backend_id_suffix(self):
+        """The only per-request channel Cinder leaves open."""
+        common = self._stub_common()
+        self._stub_wait(common)
+        group = self._repl_group()
+
+        self.driver.failover_replication(
+            self.ctxt, group, self._paired_members(2),
+            secondary_backend_id='backend2:graceful')
+
+        split = common.rep_primary.client.split_remote_copy_grp
+        self.assertEqual(1, split.call_count)
+        self.assertEqual(
+            common._create_group_copy_group_name(group.id),
+            split.call_args.args[1])
+        # A graceful split must never force.
+        self.assertEqual(
+            0,
+            common.rep_secondary.client.takeover_remote_copy_grp.call_count)
+        # PSUS/SSUS is where a pairsplit lands; SSWS would never arrive.
+        self.assertEqual(
+            hbsd_replication._WAIT_PSUS,
+            common._wait_pair_status_change.call_args.args[4])
+
+    def test_failover_replication_graceful_via_group_type(self):
+        common = self._stub_common()
+        self._stub_wait(common)
+
+        self.driver.failover_replication(
+            self.ctxt, self._graceful_repl_group(), self._paired_members(1),
+            secondary_backend_id='backend2')
+
+        self.assertEqual(
+            1, common.rep_primary.client.split_remote_copy_grp.call_count)
+
+    def test_failover_replication_request_overrides_group_type(self):
+        """An emergency is declared per request, not per group type."""
+        common = self._stub_common()
+        self._stub_wait(common)
+
+        self.driver.failover_replication(
+            self.ctxt, self._graceful_repl_group(), self._paired_members(1),
+            secondary_backend_id='backend2:emergency')
+
+        self.assertEqual(
+            1,
+            common.rep_secondary.client.takeover_remote_copy_grp.call_count)
+        self.assertEqual(
+            0, common.rep_primary.client.split_remote_copy_grp.call_count)
+
+    def test_failback_sentinel_is_not_read_as_a_mode(self):
+        """'default' has no colon, so failback must be untouched."""
+        common = self._stub_common()
+        self._stub_wait(common)
+
+        self.driver.failover_replication(
+            self.ctxt, self._repl_group(), self._paired_members(1),
+            secondary_backend_id='default')
+
+        resync = common.rep_secondary.client.resync_remote_copy_grp
+        self.assertEqual(1, resync.call_count)
+        self.assertTrue(resync.call_args.kwargs['swap'])
+
+    def test_unknown_backend_id_suffix_is_left_alone(self):
+        """Only a suffix naming a mode may be consumed."""
+        self.assertEqual(
+            ('host:1234', None),
+            hbsd_replication._parse_failover_target('host:1234'))
+        self.assertEqual(
+            ('backend2', 'graceful'),
+            hbsd_replication._parse_failover_target('backend2:GRACEFUL'))
+
+    # ---- Non-swap resync through enable_replication ----------------------
+
+    def test_enable_replication_resyncs_suspended_pairs(self):
+        """A suspended pair is restarted, never rebuilt."""
+        group = self._repl_group()
+        cg = self.driver.common._create_group_copy_group_name(group.id)
+        common = self._stub_common(
+            copy_grps=[{'copyGroupName': cg}],
+            copy_pairs=[{'pvolLdevId': 10, 'svolLdevId': 100}])
+        self._stub_wait(common)
+
+        model_update, vol_updates = self.driver.enable_replication(
+            self.ctxt, group, self._paired_members(1))
+
+        resync = common.rep_primary.client.resync_remote_copy_grp
+        self.assertEqual(1, resync.call_count)
+        # Non-swap: re-enabling restores the direction, it does not flip it.
+        self.assertFalse(resync.call_args.kwargs.get('swap', False))
+        # The old path allocated a second S-VOL and then failed to pair it.
+        self.assertEqual(
+            0, common.rep_primary.client.add_remote_copypair.call_count)
+        self.assertEqual(0, common.rep_secondary.create_ldev.call_count)
+        self.assertEqual(
+            fields.ReplicationStatus.ENABLED,
+            model_update['replication_status'])
+        self.assertEqual(
+            [fields.ReplicationStatus.ENABLED],
+            [u['replication_status'] for u in vol_updates])
+
+    def test_enable_replication_adds_when_pair_absent_from_group(self):
+        """A member the copy group does not hold is added, not resynced."""
+        group = self._repl_group()
+        cg = self.driver.common._create_group_copy_group_name(group.id)
+        common = self._stub_common(
+            copy_grps=[{'copyGroupName': cg}], copy_pairs=[])
+
+        self.driver.enable_replication(
+            self.ctxt, group, self._paired_members(1))
+
+        self.assertEqual(
+            1, common.rep_primary.client.add_remote_copypair.call_count)
+        self.assertEqual(
+            0, common.rep_primary.client.resync_remote_copy_grp.call_count)
+
+    def test_enable_replication_skips_the_query_for_unpaired_members(self):
+        """The copy-group detail call costs a remote-mirror session."""
+        group = self._repl_group()
+        cg = self.driver.common._create_group_copy_group_name(group.id)
+        common = self._stub_common(copy_grps=[{'copyGroupName': cg}])
+
+        self.driver.enable_replication(self.ctxt, group, self._members(2))
+
+        self.assertEqual(
+            0, common.rep_primary.client.get_remote_copy_grp.call_count)
+
+    # ---- Test recovery: cloning the secondary-side snapshots -------------
+
+    def test_create_group_from_src_clones_on_the_secondary(self):
+        """H4's snapshots have to be usable, not just creatable."""
+        common = self._stub_common()
+        volumes = self._members(2)
+        snapshots = self._snapshots(volumes)
+        for i, snap in enumerate(snapshots):
+            snap.provider_location = json.dumps({'sldev': 500 + i})
+        common.rep_secondary.create_volume_from_snapshot = mock.Mock(
+            side_effect=[{'provider_location': '700'},
+                         {'provider_location': '701'}])
+        common.rep_primary.create_group_from_src = mock.Mock(
+            side_effect=AssertionError('primary path must not run'))
+
+        model_update, vol_updates = self.driver.create_group_from_src(
+            self.ctxt, self._repl_group(), volumes, snapshots=snapshots)
+
+        self.assertIsNone(model_update)
+        self.assertEqual(
+            2, common.rep_secondary.create_volume_from_snapshot.call_count)
+        # sldev-only, so every later operation resolves to the secondary.
+        self.assertEqual(
+            [{'sldev': 700}, {'sldev': 701}],
+            [json.loads(u['provider_location']) for u in vol_updates])
+        for update in vol_updates:
+            self.assertEqual(fields.ReplicationStatus.DISABLED,
+                             update['replication_status'])
+
+    def test_create_group_from_src_rolls_back_its_own_clones(self):
+        common = self._stub_common()
+        volumes = self._members(2)
+        snapshots = self._snapshots(volumes)
+        for i, snap in enumerate(snapshots):
+            snap.provider_location = json.dumps({'sldev': 500 + i})
+        common.rep_secondary.create_volume_from_snapshot = mock.Mock(
+            side_effect=[{'provider_location': '700'},
+                         exception.VolumeDriverException(data='boom')])
+
+        self.assertRaises(
+            exception.VolumeDriverException,
+            self.driver.create_group_from_src,
+            self.ctxt, self._repl_group(), volumes, snapshots=snapshots)
+
+        common.rep_secondary.delete_ldev.assert_called_once_with(700)
+
+    def test_delete_volume_of_a_secondary_clone_uses_the_secondary(self):
+        """Without this the clones could be made but never removed."""
+        common = self._stub_common()
+        common.rep_secondary.delete_volume = mock.Mock()
+        common.rep_primary.delete_volume = mock.Mock(
+            side_effect=AssertionError('primary path must not run'))
+        clone = self._plain_volume()
+        clone.provider_location = json.dumps({'sldev': 700})
+
+        self.driver.delete_volume(clone)
+
+        common.rep_secondary.delete_volume.assert_called_once_with(clone)
+
+    # ---- Group deletion tears the pair down first ------------------------
+
+    def test_delete_group_removes_the_pair_before_the_ldevs(self):
+        """An LDEV deleted while paired orphans the S-VOL and the pair."""
+        group = self._repl_group()
+        common = self._stub_common()
+        order = []
+        common.rep_primary.client.delete_remote_copypair = mock.Mock(
+            side_effect=lambda *a, **k: order.append('pair'))
+        common.rep_primary.delete_volume = mock.Mock(
+            side_effect=lambda *a, **k: order.append('pvol'))
+        common.rep_secondary.delete_volume = mock.Mock(
+            side_effect=lambda *a, **k: order.append('svol'))
+
+        model_update, vol_updates = self.driver.delete_group(
+            self.ctxt, group, self._paired_members(2))
+
+        self.assertEqual('pair', order[0])
+        self.assertEqual(
+            2, common.rep_primary.client.delete_remote_copypair.call_count)
+        self.assertEqual(2, common.rep_primary.delete_volume.call_count)
+        self.assertEqual(2, common.rep_secondary.delete_volume.call_count)
+        # manager.py reads update['status'] on every entry.
+        self.assertEqual(['deleted', 'deleted'],
+                         [u['status'] for u in vol_updates])
+        self.assertNotEqual('error', model_update['status'])
+
+    def test_delete_group_reports_the_member_that_would_not_go(self):
+        group = self._repl_group()
+        common = self._stub_common()
+        common.rep_primary.delete_volume = mock.Mock(
+            side_effect=exception.VolumeDriverException(data='boom'))
+        common.rep_secondary.delete_volume = mock.Mock()
+
+        model_update, vol_updates = self.driver.delete_group(
+            self.ctxt, group, self._paired_members(1))
+
+        self.assertEqual('error', vol_updates[0]['status'])
+        self.assertEqual('error', model_update['status'])
+
+    def test_mode_suffix_on_the_failback_sentinel_is_rejected(self):
+        """The manager would otherwise record this group as failed over."""
+        common = self._stub_common()
+        self._stub_wait(common)
+
+        self.assertRaises(
+            exception.InvalidReplicationTarget,
+            self.driver.failover_replication,
+            self.ctxt, self._repl_group(), self._paired_members(1),
+            secondary_backend_id='default:graceful')
+        self.assertEqual(
+            0, common.rep_secondary.client.resync_remote_copy_grp.call_count)
+
+    # ---- Pair-state telemetry in the pool capabilities -------------------
+
+    def test_pair_status_enumerates_and_remembers_copy_groups(self):
+        common = self._stub_common(
+            copy_grps=[{'copyGroupName': 'HBSD-cg1'}],
+            copy_pairs=[{'pvolLdevId': 10, 'svolLdevId': 100,
+                         'pvolStatus': 'PAIR', 'svolStatus': 'PAIR'}])
+
+        caps = common._pair_status_capabilities()
+
+        self.assertTrue(caps[hbsd_replication._PAIR_STATUS_ENUMERATED_KEY])
+        self.assertTrue(caps[hbsd_replication._PAIR_STATUS_PEER_KEY])
+        pairs = json.loads(caps[hbsd_replication._PAIR_STATUS_KEY])
+        self.assertIn('HBSD-cg1', pairs)
+        self.assertEqual(1, pairs['HBSD-cg1']['pair_count'])
+        # No group-level pairStatus on this reply, so member states are
+        # reported verbatim instead of an invented aggregate.
+        self.assertEqual(['PAIR'], pairs['HBSD-cg1']['pvol_statuses'])
+        self.assertIn('HBSD-cg1', common._known_copy_groups)
+
+    def test_pair_status_after_failover_reads_the_secondary(self):
+        """The primary's client was never set up on that path."""
+        common = self._stub_common()
+        common._known_copy_groups.add('HBSD-cg1')
+        common._active_backend_id = 'backend2'
+        self.addCleanup(setattr, common, '_active_backend_id', '')
+        common.rep_secondary.client.get_remote_copy_grp = mock.Mock(
+            return_value={'pairStatus': 'SSWS', 'copyPairs': [{}],
+                          'journalUsageRate': 12})
+        common.rep_primary.client.get_remote_copy_grps = mock.Mock(
+            side_effect=AssertionError('listing needs the dead primary'))
+
+        caps = common._pair_status_capabilities()
+
+        self.assertFalse(caps[hbsd_replication._PAIR_STATUS_ENUMERATED_KEY])
+        pairs = json.loads(caps[hbsd_replication._PAIR_STATUS_KEY])
+        self.assertEqual('SSWS', pairs['HBSD-cg1']['pair_status'])
+        self.assertEqual(12, pairs['HBSD-cg1']['journal_usage_rate'])
+        # Secondary side, no session on the peer.
+        call = common.rep_secondary.client.get_remote_copy_grp.call_args
+        self.assertIsNone(call.args[0])
+        self.assertTrue(call.kwargs['is_secondary'])
+
+    def test_pair_status_flags_that_it_could_not_enumerate(self):
+        """An empty map must not read as 'nothing is replicated'."""
+        common = self._stub_common()
+        common.rep_primary.client.get_remote_copy_grps = mock.Mock(
+            side_effect=exception.VolumeDriverException(data='boom'))
+
+        caps = common._pair_status_capabilities()
+
+        self.assertFalse(caps[hbsd_replication._PAIR_STATUS_ENUMERATED_KEY])
+        self.assertNotIn(hbsd_replication._PAIR_STATUS_KEY, caps)
+
+    def test_pair_status_survives_one_unreadable_copy_group(self):
+        common = self._stub_common(
+            copy_grps=[{'copyGroupName': 'HBSD-ok'},
+                       {'copyGroupName': 'HBSD-bad'}])
+        common.rep_primary.client.get_remote_copy_grp = mock.Mock(
+            side_effect=[{'copyPairs': []},
+                         exception.VolumeDriverException(data='boom')])
+
+        caps = common._pair_status_capabilities()
+
+        pairs = json.loads(caps[hbsd_replication._PAIR_STATUS_KEY])
+        self.assertEqual(['HBSD-ok'], list(pairs))
+
+    def test_pair_status_reports_nothing_without_a_secondary(self):
+        common = self.driver.common
+        self.addCleanup(setattr, common, 'rep_secondary',
+                        common.rep_secondary)
+        common.rep_secondary = None
+
+        caps = common._pair_status_capabilities()
+
+        self.assertFalse(caps[hbsd_replication._PAIR_STATUS_PEER_KEY])
+        self.assertNotIn(hbsd_replication._PAIR_STATUS_KEY, caps)
+
+    def test_failover_remembers_the_copy_group_before_it_goes(self):
+        common = self._stub_common()
+        self._stub_wait(common)
+        group = self._repl_group()
+
+        self.driver.failover_replication(
+            self.ctxt, group, self._paired_members(1),
+            secondary_backend_id='backend2')
+
+        self.assertIn(common._create_group_copy_group_name(group.id),
+                      common._known_copy_groups)
+
+    # ---- Binding: which array copy group a Cinder group means ------------
+
+    def _as_target_role(self, common):
+        """Make this backend a recovery site for the rest of the test."""
+        original = common.conf.hitachi_replication_role
+        common.conf.hitachi_replication_role = hbsd_replication._ROLE_TARGET
+        self.addCleanup(
+            setattr, common.conf, 'hitachi_replication_role', original)
+
+    def _bound_members(self, count, copy_group, first=0):
+        """Adopted S-VOLs carrying a copy-group binding."""
+        volumes = []
+        for i in range(count):
+            vol = self._plain_volume()
+            vol.id = '00000000-0000-0000-0000-{0:012d}'.format(600 + first + i)
+            vol.provider_location = json.dumps({'sldev': 100 + first + i})
+            vol.metadata = {hbsd_replication._MD_COPY_GROUP: copy_group}
+            volumes.append(vol)
+        return volumes
+
+    def test_copy_group_name_derived_when_nothing_binds(self):
+        common = self.driver.common
+        group = self._repl_group()
+        self.assertEqual(
+            common._create_group_copy_group_name(group.id),
+            common._resolve_copy_group_name(group, self._members(2)))
+
+    def test_copy_group_name_from_member_metadata(self):
+        """A group created at a recovery site derives the wrong name."""
+        common = self.driver.common
+        group = self._repl_group()
+        self.assertEqual(
+            'HBSD-bound',
+            common._resolve_copy_group_name(
+                group, self._bound_members(2, 'HBSD-bound')))
+
+    def test_copy_group_name_from_group_name_marker(self):
+        common = self.driver.common
+        group = self._repl_group()
+        group.name = hbsd_replication._GROUP_NAME_BINDING_PREFIX + 'HBSD-x'
+        self.assertEqual(
+            'HBSD-x', common._resolve_copy_group_name(group, self._members(1)))
+
+    def test_member_metadata_beats_the_group_name(self):
+        common = self.driver.common
+        group = self._repl_group()
+        group.name = hbsd_replication._GROUP_NAME_BINDING_PREFIX + 'HBSD-name'
+        self.assertEqual(
+            'HBSD-meta',
+            common._resolve_copy_group_name(
+                group, self._bound_members(1, 'HBSD-meta')))
+
+    def test_copy_group_binding_conflict_is_refused(self):
+        """Operating on one copy group while reporting another is worse."""
+        common = self.driver.common
+        volumes = (self._bound_members(1, 'HBSD-a') +
+                   self._bound_members(1, 'HBSD-b', first=10))
+        self.assertRaises(
+            exception.VolumeDriverException,
+            common._resolve_copy_group_name, self._repl_group(), volumes)
+
+    # ---- Adopting an S-VOL whose pair is still there ---------------------
+
+    def test_adopt_accepts_the_replication_attribute(self):
+        """The general check refuses HORC; adopting one is the point."""
+        common = self._stub_common()
+        common.rep_secondary.get_ldev_info = mock.Mock(
+            return_value=dict(self._PAIRED_SVOL_INFO))
+
+        common._check_adopted_svol_manageability(77, {'source-id': '77'})
+
+        # And prove the general gate would have refused the same LDEV.
+        self.assertRaises(
+            exception.ManageExistingInvalidReference,
+            hbsd_rest._check_ldev_manageability,
+            common.rep_secondary, dict(self._PAIRED_SVOL_INFO), 77,
+            {'source-id': '77'})
+
+    def test_adopt_still_refuses_a_mapped_svol(self):
+        """Cinder owns the export, so LUN paths come after the adopt."""
+        common = self._stub_common()
+        info = dict(self._PAIRED_SVOL_INFO, numOfPorts=1)
+        common.rep_secondary.get_ldev_info = mock.Mock(return_value=info)
+
+        self.assertRaises(
+            exception.ManageExistingInvalidReference,
+            common._check_adopted_svol_manageability, 77,
+            {'source-id': '77'})
+
+    def test_manage_existing_routes_on_the_binding_without_a_group(self):
+        """POST /manageable_volumes has no group field."""
+        common = self._stub_common()
+        common.rep_secondary.get_ldev_info = mock.Mock(
+            return_value=dict(self._PAIRED_SVOL_INFO))
+        common.rep_secondary.modify_ldev_name = mock.Mock()
+        common.rep_secondary.get_qos_specs_from_ldev = mock.Mock(
+            return_value=None)
+        common.rep_primary.manage_existing = mock.Mock(
+            side_effect=AssertionError('upstream path must not run'))
+        volume = self._plain_volume()
+        volume.metadata = {hbsd_replication._MD_COPY_GROUP: 'HBSD-bound'}
+        self.assertIsNone(volume.group_id)
+
+        ret = self.driver.manage_existing(volume, {'source-id': '77'})
+
+        self.assertEqual({'sldev': 77},
+                         json.loads(ret['provider_location']))
+
+    # ---- Adopt branch of enable_replication ------------------------------
+
+    def test_enable_replication_adopts_already_paired_svols(self):
+        """Reach ENABLED without touching the storage system."""
+        common = self._stub_common()
+        volumes = self._bound_members(2, 'HBSD-bound')
+        common.rep_secondary.client.get_remote_copy_grp = mock.Mock(
+            return_value={'copyPairs': [{'svolLdevId': 100},
+                                        {'svolLdevId': 101}]})
+
+        model_update, vol_updates = self.driver.enable_replication(
+            self.ctxt, self._repl_group(), volumes)
+
+        self.assertEqual(fields.ReplicationStatus.ENABLED,
+                         model_update['replication_status'])
+        self.assertEqual(
+            [fields.ReplicationStatus.ENABLED] * 2,
+            [u['replication_status'] for u in vol_updates])
+        # Nothing may be created, paired or resynced.
+        self.assertEqual(
+            0, common.rep_primary.client.add_remote_copypair.call_count)
+        self.assertEqual(0, common.rep_secondary.create_ldev.call_count)
+        self.assertEqual(
+            0, common.rep_primary.client.resync_remote_copy_grp.call_count)
+        # Read from the S-VOL side with no session on the peer.
+        call = common.rep_secondary.client.get_remote_copy_grp.call_args
+        self.assertIsNone(call.args[0])
+        self.assertEqual('HBSD-bound', call.args[1])
+        self.assertTrue(call.kwargs['is_secondary'])
+
+    def test_enable_replication_adopt_rejects_an_unpaired_member(self):
+        common = self._stub_common()
+        volumes = self._bound_members(2, 'HBSD-bound')
+        common.rep_secondary.client.get_remote_copy_grp = mock.Mock(
+            return_value={'copyPairs': [{'svolLdevId': 100}]})
+
+        model_update, vol_updates = self.driver.enable_replication(
+            self.ctxt, self._repl_group(), volumes)
+
+        self.assertEqual(
+            [fields.ReplicationStatus.ENABLED,
+             fields.ReplicationStatus.ERROR],
+            [u['replication_status'] for u in vol_updates])
+        self.assertEqual(fields.ReplicationStatus.ERROR,
+                         model_update['replication_status'])
+
+    def test_enable_replication_adopt_needs_only_the_svol_side(self):
+        """At a recovery site the peer may be gone entirely."""
+        common = self._stub_common()
+        self._as_target_role(common)
+        volumes = self._bound_members(1, 'HBSD-bound')
+        common.rep_primary.client.get_remote_copy_grp = mock.Mock(
+            return_value={'copyPairs': [{'svolLdevId': 100}]})
+        self.addCleanup(setattr, common, 'rep_secondary',
+                        common.rep_secondary)
+        common.rep_secondary = None
+
+        model_update, _vols = self.driver.enable_replication(
+            self.ctxt, self._repl_group(), volumes)
+
+        self.assertEqual(fields.ReplicationStatus.ENABLED,
+                         model_update['replication_status'])
+
+    # ---- Takeover orientation --------------------------------------------
+
+    def test_takeover_goes_to_the_peer_at_a_source_backend(self):
+        common = self._stub_common()
+        self._stub_wait(common)
+
+        self.driver.failover_replication(
+            self.ctxt, self._repl_group(), self._paired_members(1),
+            secondary_backend_id='backend2')
+
+        self.assertEqual(
+            1,
+            common.rep_secondary.client.takeover_remote_copy_grp.call_count)
+        # And it is confirmed on the same side.
+        self.assertIs(
+            common.rep_secondary,
+            common._wait_pair_status_change.call_args.kwargs['instance'])
+
+    def test_takeover_goes_local_at_a_target_backend(self):
+        """rep_secondary there is the dead array."""
+        common = self._stub_common()
+        self._stub_wait(common)
+        self._as_target_role(common)
+        common.rep_primary.client.takeover_remote_copy_grp = mock.Mock()
+
+        self.driver.failover_replication(
+            self.ctxt, self._repl_group(), self._paired_members(1),
+            secondary_backend_id='backend2')
+
+        self.assertEqual(
+            1, common.rep_primary.client.takeover_remote_copy_grp.call_count)
+        self.assertEqual(
+            0,
+            common.rep_secondary.client.takeover_remote_copy_grp.call_count)
+        self.assertIs(
+            common.rep_primary,
+            common._wait_pair_status_change.call_args.kwargs['instance'])

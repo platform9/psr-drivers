@@ -988,11 +988,20 @@ class RestApiClient():
         with RemoteSession(remote_client) as session:
             return self._get_objects(url, params=params, remote_auth=session)
 
-    def get_remote_copy_grp(self, remote_client, copy_group_name, **kwargs):
+    def get_remote_copy_grp(self, remote_client, copy_group_name,
+                            is_secondary=False, **kwargs):
         url = '%(url)s/remote-mirror-copygroups/%(id)s' % {
             'url': self.object_url,
-            'id': self._remote_copygroup_id(remote_client, copy_group_name),
+            'id': self._remote_copygroup_id(remote_client, copy_group_name,
+                                            is_secondary),
         }
+        if remote_client is None:
+            # Secondary-side read. The object id becomes
+            # "NotSpecified,<cg>,<cg>S,NotSpecified" and no session on the
+            # peer is opened -- the same shape takeover_remote_copy_grp
+            # relies on, which is what lets it work with the primary gone.
+            # get_remote_copypair already branches this way.
+            return self._get_object(url, **kwargs)
         with RemoteSession(remote_client) as session:
             return self._get_object(url, remote_auth=session, **kwargs)
 

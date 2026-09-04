@@ -14,16 +14,18 @@
 #
 """Import smoke tests for every class an operator can name in cinder.conf.
 
-test_pf9_group_replication.py imports hbsd_fc, hbsd_common and hbsd_replication
-directly, so it exercises the group-replication logic without ever loading
-pf9_hitachi_replication.py -- the module whose dotted path appears in
-DEPLOYMENT.md and in the operator's volume_driver line. That module shipped with
-a doubled "cinder.cinder" package path and a missing hbsd_iscsi import, and both
-faults were invisible to the suite because nothing imported it.
+test_pf9_group_replication.py imports hbsd_fc, hbsd_common and
+hbsd_replication directly, so it exercises the group-replication logic
+without ever loading pf9_hitachi_replication.py -- the module whose dotted
+path appears in DEPLOYMENT.md and in the operator's volume_driver line. That
+module shipped with a doubled "cinder.cinder" package path and a missing
+hbsd_iscsi import, and both faults were invisible to the suite because
+nothing imported it.
 
-Cinder resolves volume_driver by importlib at manager startup, so an ImportError
-here is a backend that never comes up. These tests assert only that each
-advertised entry point loads and subclasses the transport driver it claims.
+Cinder resolves volume_driver by importlib at manager startup, so an
+ImportError here is a backend that never comes up. These tests assert only
+that each advertised entry point loads and subclasses the transport driver
+it claims.
 """
 
 import importlib

@@ -15,6 +15,8 @@
 #
 """REST interface module for Hitachi HBSD Driver."""
 
+from __future__ import annotations
+
 from collections import defaultdict
 import concurrent.futures
 import json
