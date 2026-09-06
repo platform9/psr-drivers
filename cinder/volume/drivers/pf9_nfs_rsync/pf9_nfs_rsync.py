@@ -69,6 +69,36 @@ PROMOTED_FILE = "promoted"
 PVOL_BASE = 1001
 SVOL_BASE = 2001
 
+# Volume-metadata keys carrying the pair's two LUN ids to PSR.
+#
+# WHY METADATA. The driver already allocates both ids in enable_replication, but
+# writes them only to its own copygroup JSON — the volume model returns just
+# replication_status, so nothing reaches Cinder. Neither provider_location nor
+# replication_driver_data helps either: those are internal DB columns the volume
+# REST API does not return. `metadata` is the one per-volume, driver-writable
+# field exposed on an ordinary volume list.
+#
+# WHY PSR NEEDS THEM. At failover the recovery site adopts the replica with
+# manage_existing(source-name=<S-VOL id>). That id must be known BEFORE the
+# primary site is lost, so PSR reads it here, records it on the DiscoveredVolume
+# and syncs it to the peer ahead of any disaster.
+PSR_PVOL_META_KEY = "psr_pvol_id"  # this site's P-VOL id
+PSR_SVOL_META_KEY = "psr_svol_id"  # the peer's S-VOL id
+
+
+def _psr_pair_metadata(volume, pvol_id, svol_id) -> dict:
+    """Return volume metadata carrying the pair's LUN ids.
+
+    MERGES onto the volume's existing metadata rather than replacing it:
+    Volume.save() applies the metadata update with delete=True, so returning
+    only these two keys would silently drop every user-set metadata item on the
+    volume.
+    """
+    meta = dict(getattr(volume, "metadata", None) or {})
+    meta[PSR_PVOL_META_KEY] = str(pvol_id)
+    meta[PSR_SVOL_META_KEY] = str(svol_id)
+    return meta
+
 SSH_OPTS = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10"]
 
 
@@ -361,18 +391,31 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         """
         cg = self._read_copygroup(group.id)
         by_uuid = {p["cinderUuid"]: p for p in cg["pairs"]}
+        # Keep each volume's pair so the ids can be stamped onto the volume
+        # below. Re-enabling an already-paired group re-stamps rather than
+        # re-allocating, so the operation stays idempotent.
+        pair_by_uuid = {}
         for v in (volumes or []):
             p = by_uuid.get(v.id)
             if p is None:
                 pvol, svol = self._alloc_pair_ids()
-                cg["pairs"].append({"pvolId": pvol, "svolId": svol,
-                                    "cinderUuid": v.id, "state": PAIR_PAIR})
+                p = {"pvolId": pvol, "svolId": svol,
+                     "cinderUuid": v.id, "state": PAIR_PAIR}
+                cg["pairs"].append(p)
             else:
                 p["state"] = PAIR_PAIR
+            pair_by_uuid[v.id] = p
         cg["direction"] = "P_to_S"
         self._write_copygroup(group.id, cg)
         model = {"replication_status": "enabled"}
-        vol_models = [{"id": v.id, "replication_status": "enabled"} for v in (volumes or [])]
+        vol_models = []
+        for v in (volumes or []):
+            update = {"id": v.id, "replication_status": "enabled"}
+            pair = pair_by_uuid.get(v.id)
+            if pair:
+                update["metadata"] = _psr_pair_metadata(
+                    v, pair["pvolId"], pair["svolId"])
+            vol_models.append(update)
         return model, vol_models
 
     def disable_replication(self, context, group, volumes) -> tuple:
