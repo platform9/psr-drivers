@@ -68,14 +68,14 @@ _ROLE_TARGET = 'target'
 # scalars -- the pair map is a JSON string -- because the scheduler holds
 # capabilities as a read-only Mapping and a scalar is the only shape
 # guaranteed to survive that and the API hop unaltered.
-_PAIR_STATUS_KEY = 'pf9_group_replication_pairs'
-_PAIR_STATUS_UPDATED_KEY = 'pf9_group_replication_pairs_updated_at'
-_PAIR_STATUS_PEER_KEY = 'pf9_group_replication_peer_initialized'
+_PAIR_STATUS_KEY = 'group_replication_pairs'
+_PAIR_STATUS_UPDATED_KEY = 'group_replication_pairs_updated_at'
+_PAIR_STATUS_PEER_KEY = 'group_replication_peer_initialized'
 # False when the copy groups could not be listed from the storage system
 # and the report was built from names this process had already seen. It
 # tells a client whether an empty map means "nothing is replicated" or
 # "we could not ask".
-_PAIR_STATUS_ENUMERATED_KEY = 'pf9_group_replication_pairs_enumerated'
+_PAIR_STATUS_ENUMERATED_KEY = 'group_replication_pairs_enumerated'
 
 # Upper bound on copy groups inspected per statistics cycle. Each one costs
 # a Configuration Manager request, and the cycle repeats every
@@ -675,8 +675,17 @@ class HBSDREPLICATION(rest.HBSDREST):
         # but each remembered name can still be read from the secondary.
         self._known_copy_groups = set()
         self._active_backend_id = active_backend_id
-        self.instances = self.rep_primary, self.rep_secondary
         self._LDEV_NAME = self.driver_info['driver_prefix'] + '-LDEV-%d-%d'
+
+    @property
+    def instances(self):
+        """The two sites, read at call time rather than at __init__.
+
+        do_setup() clears rep_secondary when the peer never answered, so a
+        tuple captured in __init__ would keep handing out an instance with
+        no session on it.
+        """
+        return self.rep_primary, self.rep_secondary
 
     def update_mirror_conf(self, conf, opts):
         for opt in opts:
@@ -1163,11 +1172,18 @@ class HBSDREPLICATION(rest.HBSDREST):
     def _create_group_copy_group_name(self, group_id):
         # One copy group per Cinder group, namespaced by the driver
         # prefix so it never collides with the per-LDEV names built by
-        # _create_rep_copy_group_name above. 'HBSD-' plus 25 hex digits
-        # is 30 characters, leaving room for the 'P'/'S' device group
-        # suffixes appended by the callers.
-        return (self.driver_info['target_prefix'] +
-                group_id.replace('-', '')[:25])
+        # _create_rep_copy_group_name above. 'HBSD-' plus 24 hex digits
+        # is 29 characters, the same _MAX_COPY_GROUP_NAME every other
+        # derivation in the driver is cut to.
+        name = (self.driver_info['target_prefix'] +
+                group_id.replace('-', '')[:24])
+        if len(name) > rest._MAX_COPY_GROUP_NAME:
+            # A longer prefix would put the name over the limit silently,
+            # and every enable_replication would then fail at the array.
+            msg = utils.output_log(
+                MSG.INVALID_PARAMETER, param='copy group name: %s' % name)
+            self.raise_error(msg)
+        return name
 
     def _create_group_snapshot_group_name(self, group_snapshot_id):
         # One Thin Image group per Cinder group snapshot. The 'HBSD-'
@@ -1195,9 +1211,18 @@ class HBSDREPLICATION(rest.HBSDREST):
         }
         instance.client.modify_journal(journal_id, body)
 
+    def _journal_instances(self):
+        """The sites a journal can actually be created on or removed from.
+
+        A site with no session is not one of them: iterating it would only
+        raise on the first client call.
+        """
+        return [instance for instance in self.instances if instance]
+
     def _delete_journals(self, journal_ids):
         """Delete journal volumes."""
-        for instance, journal_id in zip(self.instances, journal_ids):
+        for instance, journal_id in zip(self._journal_instances(),
+                                        journal_ids):
             try:
                 ldev = instance.client.get_journal(journal_id, no_log=True)[
                     'firstLdevId']
@@ -1219,8 +1244,9 @@ class HBSDREPLICATION(rest.HBSDREST):
         """Create a journal volume."""
         journal_ids = []
         journal_ldevs = []
+        instances = self._journal_instances()
         try:
-            for instance in self.instances:
+            for instance in instances:
                 pool_id = (self.rep_primary.get_pool_id_of_volume(volume)
                            if instance == self.rep_primary
                            else self.rep_secondary.storage_info['pool_id'][0])
@@ -1262,7 +1288,7 @@ class HBSDREPLICATION(rest.HBSDREST):
             with excutils.save_and_reraise_exception():
                 self._delete_journals(journal_ids)
                 if len(journal_ldevs) > len(journal_ids):
-                    self.instances[len(journal_ldevs) - 1].delete_ldev(
+                    instances[len(journal_ldevs) - 1].delete_ldev(
                         journal_ldevs[-1])
         return journal_ids
 
@@ -2318,10 +2344,11 @@ class HBSDREPLICATION(rest.HBSDREST):
             return fields.ReplicationStatus.ERROR
         return success_status
 
-    def _group_repl_create_pair(self, copy_group_name, pvol, svol,
+    def _group_repl_create_pair(self, volume, copy_group_name, pvol, svol,
                                 is_data_reduction_force_copy,
                                 is_new_copy_grp):
         parent = self
+        created_journal_ids = []
 
         @utils.synchronized_on_copy_group()
         def inner(self, remote_client, copy_group_name):
@@ -2343,10 +2370,62 @@ class HBSDREPLICATION(rest.HBSDREST):
                 'muNumber':
                     parent.rep_secondary.conf.hitachi_replication_mun,
             }
+            if is_new_copy_grp:
+                # An asynchronous UR pair has nowhere to stage writes
+                # without them, so the pair that creates the copy group
+                # creates its journals too, exactly as _create_rep_pair
+                # does for the per-LDEV copy groups.
+                journal_ids = parent.create_journals(volume, copy_group_name)
+                created_journal_ids.extend(journal_ids)
+                body['pvolJournalId'], body['svolJournalId'] = journal_ids
             self.add_remote_copypair(remote_client, body)
 
-        inner(self.rep_primary.client, self.rep_secondary.client,
-              copy_group_name)
+        try:
+            inner(self.rep_primary.client, self.rep_secondary.client,
+                  copy_group_name)
+        except exception.VolumeDriverException:
+            with excutils.save_and_reraise_exception():
+                if created_journal_ids:
+                    self._delete_journals(created_journal_ids)
+
+    def _group_repl_journal_ids(self, copy_group_name):
+        """The copy group's journal ids, read while its pairs still exist.
+
+        Once the last pair goes the array removes the copy group, and with
+        it the only record of which journals the group was using.
+        """
+        try:
+            grp = self.rep_primary.client.get_remote_copy_grp(
+                self.rep_secondary.client, copy_group_name)
+        except exception.VolumeDriverException:
+            return None
+        pairs = grp.get('copyPairs') or []
+        if not pairs:
+            return None
+        journal_ids = (pairs[0].get('pvolJournalId'),
+                       pairs[0].get('svolJournalId'))
+        if any(journal_id is None for journal_id in journal_ids):
+            return None
+        return journal_ids
+
+    def _group_repl_delete_journals(self, copy_group_name, journal_ids):
+        """Drop the group's journals once its last pair has gone.
+
+        The group path creates the copy group, so it owns the journals for
+        their whole life -- unlike _create_rep_pair, whose per-LDEV copy
+        groups _delete_rep_pair tears down. A copy group that still answers
+        still has pairs in it, so its journals stay.
+        """
+        if not journal_ids:
+            return
+        try:
+            rtn = self.rep_primary.client.get_remote_copy_grp(
+                self.rep_secondary.client, copy_group_name,
+                ignore_message_id=[_MSGID_INSTANCE_CANNOT_OPERATED])
+        except exception.VolumeDriverException:
+            return
+        if rtn.get('messageId') == _MSGID_INSTANCE_CANNOT_OPERATED:
+            self._delete_journals(journal_ids)
 
     def _group_repl_copy_grp_exists(self, copy_group_name):
         """Check the copy group with the list call, not the get (B3)."""
@@ -2381,7 +2460,7 @@ class HBSDREPLICATION(rest.HBSDREST):
                 qos_specs=utils.get_qos_specs_from_volume(volume))
             try:
                 self._group_repl_create_pair(
-                    copy_group_name, pvol, svol,
+                    volume, copy_group_name, pvol, svol,
                     capacity_saving == 'deduplication_compression',
                     is_new_copy_grp)
             except exception.VolumeDriverException:
@@ -2647,6 +2726,7 @@ class HBSDREPLICATION(rest.HBSDREST):
         self._require_rep_secondary()
         copy_group_name = self._resolve_copy_group_name(
             group, volumes)
+        journal_ids = self._group_repl_journal_ids(copy_group_name)
         model_update = {'status': group.status}
         volumes_model_update = []
         for volume in volumes:
@@ -2655,6 +2735,7 @@ class HBSDREPLICATION(rest.HBSDREST):
             if volume_update['status'] != 'deleted':
                 model_update['status'] = 'error'
             volumes_model_update.append(volume_update)
+        self._group_repl_delete_journals(copy_group_name, journal_ids)
         return model_update, volumes_model_update
 
     def _group_repl_delete_group_volume(self, group, volume,
@@ -2876,9 +2957,22 @@ class HBSDREPLICATION(rest.HBSDREST):
         self._require_rep_secondary()
         copy_group_name = self._resolve_copy_group_name(
             group, (add_volumes or []) + (remove_volumes or []))
-        is_new_copy_grp = not self._group_repl_copy_grp_exists(copy_group_name)
+        copy_grp_exists = self._group_repl_copy_grp_exists(copy_group_name)
+        # A member whose pair is merely suspended is restarted, not added:
+        # adding it would allocate a second S-VOL and then fail to pair it.
+        suspended = (
+            self._group_repl_suspended_members(
+                copy_group_name, add_volumes or [])
+            if copy_grp_exists else [])
+        suspended_ids = {volume.id for volume in suspended}
         add_volumes_update = []
+        if suspended:
+            add_volumes_update.extend(
+                self._group_repl_resync_members(copy_group_name, suspended))
+        is_new_copy_grp = not copy_grp_exists
         for volume in add_volumes or []:
+            if volume.id in suspended_ids:
+                continue
             volume_model_update = self._group_repl_add_volume(
                 volume, copy_group_name, is_new_copy_grp,
                 'add a volume to a group replication group')
@@ -2946,10 +3040,12 @@ class HBSDREPLICATION(rest.HBSDREST):
         self._require_rep_secondary()
         copy_group_name = self._resolve_copy_group_name(
             group, volumes)
+        journal_ids = self._group_repl_journal_ids(copy_group_name)
         volumes_model_update = [
             self._group_repl_delete_volume(
                 volume, copy_group_name, 'disable group replication')
             for volume in volumes]
+        self._group_repl_delete_journals(copy_group_name, journal_ids)
         model_update = {
             'replication_status': self._group_repl_aggregate_status(
                 volumes_model_update, fields.ReplicationStatus.DISABLED)}
@@ -2958,7 +3054,9 @@ class HBSDREPLICATION(rest.HBSDREST):
     def failover_replication(self, context, group, volumes,
                              secondary_backend_id=None):
         self._require_rep_primary()
-        self._require_rep_secondary()
+        # Not rep_secondary: at a target-role backend the S-VOLs are local
+        # and the peer is the array the takeover exists to work without.
+        self._require_svol_instance()
         copy_group_name = self._resolve_copy_group_name(
             group, volumes)
         secondary_backend_id, requested_mode = _parse_failover_target(
@@ -3010,7 +3108,7 @@ class HBSDREPLICATION(rest.HBSDREST):
         except exception.VolumeDriverException:
             msgid = (MSG.GROUP_REPLICATION_FAILBACK_FAILED if is_failback
                      else MSG.GROUP_REPLICATION_FAILOVER_FAILED)
-            msg = self.rep_secondary.output_log(
+            msg = self._svol_instance().output_log(
                 msgid, group=group.id, copy_group=copy_group_name)
             raise exception.UnableToFailOver(reason=msg)
         utils.output_log(
@@ -3086,12 +3184,15 @@ class HBSDREPLICATION(rest.HBSDREST):
 
     def _get_ldevs(self, volume, is_failback=False):
         pldev = self.rep_primary.get_ldev(volume)
-        sldev = (self.rep_secondary.get_ldev(volume) if
+        # Read straight out of the provider_location rather than through
+        # rep_secondary.get_ldev: the id is the same at either site, and
+        # rep_secondary is None once the peer has gone.
+        sldev = (_svol_of(volume) if
                  _get_ldev_site(volume) in (_SECONDARY, _PRIMARY_SECONDARY)
                  else None)
         if pldev is None or sldev is None:
             instance = (self.rep_primary if pldev is None else
-                        self.rep_secondary)
+                        self._svol_instance())
             instance.output_log(
                 MSG.NOT_LDEV_NUMBER_WARNING,
                 operation='fail back a volume' if is_failback else

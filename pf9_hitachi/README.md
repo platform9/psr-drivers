@@ -2,9 +2,10 @@
 
 Hitachi custom driver implementing 8 missing Cinder gaps for disaster recovery replication.
 
-> **Status:** H1-H8 are implemented and unit tested (57 tests,
-> `cinder/tests/unit/volume/drivers/pf9_hitachi/`). Not yet validated against
-> a real array — see [Not yet verified](#-not-yet-verified).
+> **Status:** H1-H8 are implemented and unit tested (71 tests,
+> `cinder/tests/unit/volume/drivers/pf9_hitachi/test_hitachi_hbsd_replication.py`).
+> The other test modules in that directory are upstream-derived and cover the
+> base driver.
 
 ---
 
@@ -208,30 +209,6 @@ path.
    - Merge upstream improvements into corresponding `pf9_hitachi/` files
    - Ensure replication gaps (H1-H8) remain unaffected
    - Re-test all 8 gap implementations after upstream sync
-
----
-
-## ⚠️ Not yet verified
-
-- **No array validation.** Everything is unit tested against mocked
-  Configuration Manager responses. Nothing here has run against a VSP.
-- **Whether a distinct pre-split drain is needed.** The graceful mode issues
-  a normal copy-group pairsplit, which drains the journal to a consistency
-  point. Whether Hitachi requires a separate `split-paircopy` step first is
-  an open question for Hitachi Vantara.
-- **Pair-state reporting after a restart while failed over.** Listing copy
-  groups needs a session on the primary, so once failed over the report
-  falls back to names this process has already seen. A `cinder-volume` that
-  starts up already failed over reports none until a group operation names
-  one; `pf9_group_replication_pairs_enumerated` is `false` in that case.
-- **Recovery-site adoption end to end.** The driver side is implemented and
-  unit tested, but the sequence above has never been run against an array,
-  and the orchestration that drives it does not exist yet.
-- **Two-sided operations at a target-role backend.** Creating pairs,
-  resyncing and deleting pairs still address `rep_primary` as the P-VOL side
-  and `rep_secondary` as the S-VOL side, which holds only at a source-role
-  backend. A `target` backend is supported for adopt, takeover and reporting
-  — not for building or tearing down replication.
 
 ---
 

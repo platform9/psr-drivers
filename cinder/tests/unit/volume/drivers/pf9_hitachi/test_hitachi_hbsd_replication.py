@@ -47,6 +47,8 @@ from cinder.volume import volume_utils
 # Configuration parameter values
 GROUP_ID = '11111111-1111-1111-1111-111111111111'
 GROUP_SNAPSHOT_ID = '22222222-2222-2222-2222-222222222222'
+# The pair of journal ids create_journals returns, primary side first.
+JOURNAL_IDS = (11, 12)
 
 CONFIG_MAP = {
     'serial': '886000123456',
@@ -1093,6 +1095,8 @@ class PF9GroupReplicationFCTest(test.TestCase):
             return_value={})
         common.rep_primary.get_volume_extra_specs = mock.Mock(
             return_value={})
+        common.create_journals = mock.Mock(return_value=JOURNAL_IDS)
+        common._delete_journals = mock.Mock()
         # QoS lookups would otherwise hit the volume-type tables.
         self.mock_object(hbsd_utils, 'get_qos_specs_from_volume',
                          return_value=None)
@@ -1131,10 +1135,14 @@ class PF9GroupReplicationFCTest(test.TestCase):
                 self.configuration.hitachi_replication_mun, body['muNumber'])
             self.assertEqual(10 + i, body['pvolLdevId'])
             self.assertEqual(100 + i, body['svolLdevId'])
-            # A1: journal IDs are deliberately absent from group pairs.
-            self.assertNotIn('journalId', body)
-            self.assertNotIn('masterJournalId', body)
-            self.assertNotIn('restoreJournalId', body)
+        # A1: the pair that creates the copy group carries its journals,
+        # and the ones that join an existing group do not.
+        self.assertEqual(JOURNAL_IDS[0], bodies[0]['pvolJournalId'])
+        self.assertEqual(JOURNAL_IDS[1], bodies[0]['svolJournalId'])
+        self.assertEqual(1, common.create_journals.call_count)
+        for body in bodies[1:]:
+            self.assertNotIn('pvolJournalId', body)
+            self.assertNotIn('svolJournalId', body)
         # A2: S-VOLs come from create_ldev, never from an allocator scan.
         self.assertEqual(3, common.rep_secondary.create_ldev.call_count)
         self.assertEqual(
@@ -1627,6 +1635,30 @@ class PF9GroupReplicationFCTest(test.TestCase):
         self.assertEqual(fields.ReplicationStatus.ERROR,
                          add_up[0]['replication_status'])
 
+    def test_group_repl_update_group_resyncs_an_existing_pair(self):
+        """An add whose pair is only suspended is restarted, not rebuilt."""
+        group = self._repl_group()
+        cg = self.driver.common._create_group_copy_group_name(group.id)
+        common = self._stub_common(copy_grps=[{'copyGroupName': cg}],
+                                   copy_pairs=[{'pvolLdevId': 10}])
+        self._stub_wait(common)
+
+        model_update, add_up, _rm = self.driver.update_group(
+            self.ctxt, group, add_volumes=self._paired_members(1),
+            remove_volumes=[])
+
+        # A second S-VOL for a pair that already exists is the bug this
+        # closes: the allocation succeeded and the pair creation then did
+        # not.
+        self.assertEqual(0, common.rep_secondary.create_ldev.call_count)
+        self.assertEqual(
+            1, common.rep_primary.client.resync_remote_copy_grp.call_count)
+        self.assertEqual(
+            0, common.rep_primary.client.add_remote_copypair.call_count)
+        self.assertEqual(fields.GroupStatus.AVAILABLE, model_update['status'])
+        self.assertEqual([fields.ReplicationStatus.ENABLED],
+                         [u['replication_status'] for u in add_up])
+
     def test_group_repl_manage_existing_adopts_svol(self):
         """H1: the promoted S-VOL is adopted on the secondary."""
         common = self._stub_common()
@@ -1986,6 +2018,36 @@ class PF9GroupReplicationFCTest(test.TestCase):
         self.assertEqual('error', vol_updates[0]['status'])
         self.assertEqual('error', model_update['status'])
 
+    def test_delete_group_removes_the_copy_group_journals(self):
+        """The group path created them, so nothing else will remove them."""
+        gone = {'messageId':
+                hbsd_replication._MSGID_INSTANCE_CANNOT_OPERATED}
+        common = self._stub_common()
+        common.rep_primary.client.get_remote_copy_grp = mock.Mock(
+            side_effect=[{'copyPairs': [{'pvolJournalId': JOURNAL_IDS[0],
+                                         'svolJournalId': JOURNAL_IDS[1]}]},
+                         gone])
+        common.rep_primary.delete_volume = mock.Mock()
+        common.rep_secondary.delete_volume = mock.Mock()
+
+        self.driver.delete_group(
+            self.ctxt, self._repl_group(), self._paired_members(1))
+
+        common._delete_journals.assert_called_once_with(JOURNAL_IDS)
+
+    def test_delete_group_keeps_journals_while_pairs_remain(self):
+        """The array removes the copy group with its last pair, not before."""
+        common = self._stub_common(
+            copy_pairs=[{'pvolJournalId': JOURNAL_IDS[0],
+                         'svolJournalId': JOURNAL_IDS[1]}])
+        common.rep_primary.delete_volume = mock.Mock()
+        common.rep_secondary.delete_volume = mock.Mock()
+
+        self.driver.delete_group(
+            self.ctxt, self._repl_group(), self._paired_members(1))
+
+        common._delete_journals.assert_not_called()
+
     def test_mode_suffix_on_the_failback_sentinel_is_rejected(self):
         """The manager would otherwise record this group as failed over."""
         common = self._stub_common()
@@ -2115,6 +2177,13 @@ class PF9GroupReplicationFCTest(test.TestCase):
         self.assertEqual(
             common._create_group_copy_group_name(group.id),
             common._resolve_copy_group_name(group, self._members(2)))
+
+    def test_derived_copy_group_name_fits_the_copy_group_limit(self):
+        """A longer name is refused, so enable_replication would fail."""
+        name = self.driver.common._create_group_copy_group_name(GROUP_ID)
+
+        self.assertEqual(hbsd_rest._MAX_COPY_GROUP_NAME, len(name))
+        self.assertTrue(name.startswith(hbsd_utils.TARGET_PREFIX))
 
     def test_copy_group_name_from_member_metadata(self):
         """A group created at a recovery site derives the wrong name."""
@@ -2279,11 +2348,14 @@ class PF9GroupReplicationFCTest(test.TestCase):
             common._wait_pair_status_change.call_args.kwargs['instance'])
 
     def test_takeover_goes_local_at_a_target_backend(self):
-        """rep_secondary there is the dead array."""
+        """rep_secondary there is the dead array: gone, not merely idle."""
         common = self._stub_common()
         self._stub_wait(common)
         self._as_target_role(common)
         common.rep_primary.client.takeover_remote_copy_grp = mock.Mock()
+        self.addCleanup(setattr, common, 'rep_secondary',
+                        common.rep_secondary)
+        common.rep_secondary = None
 
         self.driver.failover_replication(
             self.ctxt, self._repl_group(), self._paired_members(1),
@@ -2291,9 +2363,6 @@ class PF9GroupReplicationFCTest(test.TestCase):
 
         self.assertEqual(
             1, common.rep_primary.client.takeover_remote_copy_grp.call_count)
-        self.assertEqual(
-            0,
-            common.rep_secondary.client.takeover_remote_copy_grp.call_count)
         self.assertIs(
             common.rep_primary,
             common._wait_pair_status_change.call_args.kwargs['instance'])
