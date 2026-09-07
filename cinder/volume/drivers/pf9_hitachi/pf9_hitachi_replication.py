@@ -43,38 +43,6 @@ GROUP_REPLICATION_OPTS = [
 CONF = cfg.CONF
 CONF.register_opts(GROUP_REPLICATION_OPTS, group=configuration.SHARED_CONF_GROUP)
 
-# Volume-metadata keys carrying the pair's two LDEV ids to PSR.
-#
-# WHY METADATA. The driver already knows both ids at pair-creation time, but has
-# nowhere durable to leave them that PSR can read:
-#   * provider_location / replication_driver_data are internal Cinder DB columns
-#     the volume REST API does not return;
-#   * the svolLdevId here is allocated inline into the create-pair request body
-#     and then discarded — nothing persists it at all.
-# `metadata` is the one per-volume, driver-writable field exposed on an ordinary
-# volume list, so it is the only channel available.
-#
-# WHY PSR NEEDS THEM. At failover the recovery site adopts the replica with
-# manage_existing(source-id=<S-VOL LDEV>). That id must be known BEFORE the
-# primary array becomes unreachable, so PSR reads it here, records it on the
-# DiscoveredVolume, and syncs it to the peer ahead of any disaster.
-PSR_PVOL_META_KEY = "psr_pvol_id"  # this site's P-VOL LDEV
-PSR_SVOL_META_KEY = "psr_svol_id"  # the peer array's S-VOL LDEV
-
-
-def _psr_pair_metadata(volume: Volume, pvol_ldev: Any, svol_ldev: Any) -> dict[str, str]:
-    """Return volume metadata carrying the pair's LDEV ids.
-
-    MERGES onto the volume's existing metadata rather than replacing it:
-    Volume.save() applies a metadata update with delete=True, so returning only
-    our two keys would silently drop every user-set metadata item on the volume.
-    """
-    meta = dict(getattr(volume, "metadata", None) or {})
-    meta[PSR_PVOL_META_KEY] = str(pvol_ldev)
-    meta[PSR_SVOL_META_KEY] = str(svol_ldev)
-    return meta
-
-
 # Pair states that indicate active replication
 HEALTHY_PAIR_STATUS = ("PAIR", "COPY")
 SWAPPED_PAIR_STATUS = ("SSWS",)  # Secondary split, writable
@@ -377,13 +345,6 @@ class HBSDGroupReplicationMixin:
                     group.id, volume.id
                 )
 
-                # Capture both LDEV ids in locals before building the body: the
-                # S-VOL id is allocated here and persisted NOWHERE else, so it
-                # has to be stamped onto the volume or it is lost the moment this
-                # request returns.
-                pvol_ldev_id = self._ldev_id_for(volume)
-                svol_ldev_id = allocator.allocate(volume.size)
-
                 # Build the create-pair request body
                 body = {
                     "replicationType": "UR",
@@ -392,8 +353,8 @@ class HBSDGroupReplicationMixin:
                     "localDeviceGroupName": local_dg,
                     "remoteDeviceGroupName": remote_dg,
                     "remoteStorageDeviceId": rd.get("storage_id", ""),
-                    "pvolLdevId": pvol_ldev_id,
-                    "svolLdevId": svol_ldev_id,
+                    "pvolLdevId": self._ldev_id_for(volume),
+                    "svolLdevId": allocator.allocate(volume.size),
                     "isNewGroupCreation": idx == 0,  # Only first pair creates CG
                     "doInitialCopy": True,
                     "fenceLevel": "ASYNC",
@@ -409,13 +370,6 @@ class HBSDGroupReplicationMixin:
                     {
                         "id": volume.id,
                         "replication_status": fields.ReplicationStatus.ENABLED,
-                        # Hand both LDEV ids to PSR. Set only on the success path:
-                        # a failed pair has no usable S-VOL, and publishing an id
-                        # for a pair that was never created would make a volume
-                        # look recoverable when it is not.
-                        "metadata": _psr_pair_metadata(
-                            volume, pvol_ldev_id, svol_ldev_id
-                        ),
                     }
                 )
             except HBSDRestClientError as e:
