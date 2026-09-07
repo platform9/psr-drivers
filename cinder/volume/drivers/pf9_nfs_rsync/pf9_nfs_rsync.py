@@ -69,35 +69,55 @@ PROMOTED_FILE = "promoted"
 PVOL_BASE = 1001
 SVOL_BASE = 2001
 
-# Volume-metadata keys carrying the pair's two LUN ids to PSR.
+# Volume-metadata keys carrying the pair's identifiers to PSR.
 #
-# WHY METADATA. The driver already allocates both ids in enable_replication, but
-# writes them only to its own copygroup JSON — the volume model returns just
-# replication_status, so nothing reaches Cinder. Neither provider_location nor
-# replication_driver_data helps either: those are internal DB columns the volume
-# REST API does not return. `metadata` is the one per-volume, driver-writable
-# field exposed on an ordinary volume list.
+# WHY METADATA. The driver allocates both ids in enable_replication but writes
+# them only to its own copygroup JSON, which Cinder never reads — the volume
+# model returns replication_status alone, so nothing reaches Cinder. Neither
+# provider_location nor replication_driver_data helps: those are internal DB
+# columns the volume REST API does not return. `metadata` is the one per-volume,
+# driver-writable field exposed on an ordinary volume list.
 #
 # WHY PSR NEEDS THEM. At failover the recovery site adopts the replica with
 # manage_existing(source-name=<S-VOL id>). That id must be known BEFORE the
 # primary site is lost, so PSR reads it here, records it on the DiscoveredVolume
 # and syncs it to the peer ahead of any disaster.
-PSR_PVOL_META_KEY = "psr_pvol_id"  # this site's P-VOL id
-PSR_SVOL_META_KEY = "psr_svol_id"  # the peer's S-VOL id
+#
+# These names match the pf9_hitachi driver's _MD_* keys deliberately, so both
+# backends look identical to PSR and its discovery needs no per-vendor branch.
+PSR_PVOL_META_KEY = "psr_pvol_id"        # this site's P-VOL id
+PSR_SVOL_META_KEY = "psr_svol_id"        # the peer's S-VOL id
+PSR_COPY_GROUP_META_KEY = "psr_copy_group"  # the copy group the pair belongs to
 
 
-def _psr_pair_metadata(volume, pvol_id, svol_id) -> dict:
-    """Return volume metadata carrying the pair's LUN ids.
+def _psr_metadata_model_update(volume, **kwargs) -> dict:
+    """Return a {'metadata': ...} model update fragment, or {}.
 
-    MERGES onto the volume's existing metadata rather than replacing it:
-    Volume.save() applies the metadata update with delete=True, so returning
-    only these two keys would silently drop every user-set metadata item on the
-    volume.
+    Cinder REPLACES a volume's metadata with what a driver returns rather than
+    merging into it, so the whole map has to be sent every time — hence the
+    merge onto the volume's current metadata below.
+
+    Which is also why this emits nothing at all when that current metadata
+    cannot be read: reading it can go to the database if the attribute was
+    never loaded, and sending only our own keys would silently drop whatever
+    the volume's owner had set. Nothing here is worth failing a replication
+    operation over.
+
+    A None value removes that key — how disable_replication retires the ids.
     """
-    meta = dict(getattr(volume, "metadata", None) or {})
-    meta[PSR_PVOL_META_KEY] = str(pvol_id)
-    meta[PSR_SVOL_META_KEY] = str(svol_id)
-    return meta
+    try:
+        merged = dict(volume.metadata or {})
+    except Exception:
+        LOG.debug("PF9NFSRsync: not annotating volume %s: its current metadata "
+                  "could not be read, and a partial map would discard the "
+                  "metadata already on it.", volume.id, exc_info=True)
+        return {}
+    for key, value in kwargs.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = str(value)
+    return {"metadata": merged}
 
 SSH_OPTS = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10"]
 
@@ -408,13 +428,21 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         cg["direction"] = "P_to_S"
         self._write_copygroup(group.id, cg)
         model = {"replication_status": "enabled"}
+        copy_group = cg.get("copyGroup") or group.id
         vol_models = []
         for v in (volumes or []):
             update = {"id": v.id, "replication_status": "enabled"}
             pair = pair_by_uuid.get(v.id)
             if pair:
-                update["metadata"] = _psr_pair_metadata(
-                    v, pair["pvolId"], pair["svolId"])
+                # Hand the pair's identifiers to PSR. Only on the success path:
+                # the copygroup write above has already committed, so a pair
+                # advertised here really exists. Publishing ids for a pair that
+                # was never created would make a volume look recoverable when it
+                # is not — which surfaces at failover, the worst possible time.
+                update.update(_psr_metadata_model_update(
+                    v, **{PSR_PVOL_META_KEY: pair["pvolId"],
+                          PSR_SVOL_META_KEY: pair["svolId"],
+                          PSR_COPY_GROUP_META_KEY: copy_group}))
             vol_models.append(update)
         return model, vol_models
 
@@ -425,7 +453,20 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
             p["state"] = PAIR_SMPL
         cg["direction"] = "none"
         self._write_copygroup(group.id, cg)
-        return {"replication_status": "disabled"}, [{"id": v.id, "replication_status": "disabled"} for v in (volumes or [])]
+        vol_models = []
+        for v in (volumes or []):
+            update = {"id": v.id, "replication_status": "disabled"}
+            # Retire the ids along with the pair. A volume that has stopped
+            # replicating still carrying a psr_svol_id would advertise a replica
+            # that no longer exists, and PSR would attempt to adopt it at
+            # failover — a stale id is worse than an absent one, because absent
+            # is reported as "cannot be recovered" while stale fails mid-import.
+            update.update(_psr_metadata_model_update(
+                v, **{PSR_PVOL_META_KEY: None,
+                      PSR_SVOL_META_KEY: None,
+                      PSR_COPY_GROUP_META_KEY: None}))
+            vol_models.append(update)
+        return {"replication_status": "disabled"}, vol_models
 
     def failover_replication(self, context, group, volumes, secondary_backend_id=None) -> tuple:
         """Fail a group over, or fail it back.
@@ -439,6 +480,11 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         "resume the primary"): re-establish primary -> secondary. Pair state ->
         PAIR, replication_status 'enabled'. This is the only transition Cinder
         allows out of the failed-over state.
+
+        Neither direction touches the psr_* metadata, deliberately: the pair
+        still exists through a failover, only its direction changed, and the
+        same two LUN ids are what a subsequent failback needs. They are retired
+        in disable_replication, where the pair is actually torn down.
         """
         cg = self._read_copygroup(group.id)
         if secondary_backend_id == "default":
