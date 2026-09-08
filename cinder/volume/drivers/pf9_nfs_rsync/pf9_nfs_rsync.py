@@ -69,28 +69,38 @@ PROMOTED_FILE = "promoted"
 PVOL_BASE = 1001
 SVOL_BASE = 2001
 
-# Volume-metadata keys carrying the pair's identifiers to PSR.
+# Volume-metadata keys carrying the replication pair's identifiers.
 #
-# WHY METADATA. The driver allocates both ids in enable_replication but writes
-# them only to its own copygroup JSON, which Cinder never reads — the volume
-# model returns replication_status alone, so nothing reaches Cinder. Neither
-# provider_location nor replication_driver_data helps: those are internal DB
-# columns the volume REST API does not return. `metadata` is the one per-volume,
-# driver-writable field exposed on an ordinary volume list.
+# WHY THESE NAMES. Deliberately generic and vendor-neutral: a DR orchestrator
+# needs the peer's LUN id, and that is true of any orchestrator against any
+# array. An earlier revision used psr_* names; those were dropped because a
+# vendor asked to add a Platform9-specific key to their upstream driver has an
+# obvious reason to refuse, whereas "record the replication pair's LUN ids in
+# volume metadata" is a request any replication driver can reasonably adopt.
 #
-# WHY PSR NEEDS THEM. At failover the recovery site adopts the replica with
-# manage_existing(source-name=<S-VOL id>). That id must be known BEFORE the
-# primary site is lost, so PSR reads it here, records it on the DiscoveredVolume
-# and syncs it to the peer ahead of any disaster.
+# WHY METADATA AND NOT THE REPLICATION SPEC FIELDS. `replication_driver_data`
+# and `replication_extended_status` look like the natural home — the spec
+# reserves them — but they are single VARCHAR(255) columns on the volumes table
+# that the volume REST API does not return (see cinder/api/v3/views/volumes.py:
+# the detail view carries `metadata` and `replication_status`, not these). The
+# spec itself calls them "available for drivers to use internally". A reader
+# outside cinder-volume therefore cannot see them without database or
+# admin-extension access. `metadata` is the one per-volume, driver-writable
+# field that comes back on an ordinary volume list, so it is the only channel
+# that actually reaches a consumer.
 #
-# These names match the pf9_hitachi driver's _MD_* keys deliberately, so both
-# backends look identical to PSR and its discovery needs no per-vendor branch.
-PSR_PVOL_META_KEY = "psr_pvol_id"        # this site's P-VOL id
-PSR_SVOL_META_KEY = "psr_svol_id"        # the peer's S-VOL id
-PSR_COPY_GROUP_META_KEY = "psr_copy_group"  # the copy group the pair belongs to
+# WHY A CONSUMER NEEDS THEM. At failover the recovery site adopts the replica
+# with manage_existing(source-name=<S-VOL id>). That id must be known BEFORE the
+# primary site is lost — afterwards the array that knew the pairing is gone.
+#
+# These names are shared with the pf9_hitachi driver so both backends look
+# identical to a consumer and no per-vendor branch is needed.
+REPL_PVOL_META_KEY = "replication_pvol_id"      # this site's P-VOL id
+REPL_SVOL_META_KEY = "replication_svol_id"      # the peer's S-VOL id
+REPL_COPY_GROUP_META_KEY = "replication_copy_group"  # the pair's copy group
 
 
-def _psr_metadata_model_update(volume, **kwargs) -> dict:
+def _replication_metadata_model_update(volume, **kwargs) -> dict:
     """Return a {'metadata': ...} model update fragment, or {}.
 
     Cinder REPLACES a volume's metadata with what a driver returns rather than
@@ -439,10 +449,10 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
                 # advertised here really exists. Publishing ids for a pair that
                 # was never created would make a volume look recoverable when it
                 # is not — which surfaces at failover, the worst possible time.
-                update.update(_psr_metadata_model_update(
-                    v, **{PSR_PVOL_META_KEY: pair["pvolId"],
-                          PSR_SVOL_META_KEY: pair["svolId"],
-                          PSR_COPY_GROUP_META_KEY: copy_group}))
+                update.update(_replication_metadata_model_update(
+                    v, **{REPL_PVOL_META_KEY: pair["pvolId"],
+                          REPL_SVOL_META_KEY: pair["svolId"],
+                          REPL_COPY_GROUP_META_KEY: copy_group}))
             vol_models.append(update)
         return model, vol_models
 
@@ -457,14 +467,15 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         for v in (volumes or []):
             update = {"id": v.id, "replication_status": "disabled"}
             # Retire the ids along with the pair. A volume that has stopped
-            # replicating still carrying a psr_svol_id would advertise a replica
-            # that no longer exists, and PSR would attempt to adopt it at
-            # failover — a stale id is worse than an absent one, because absent
-            # is reported as "cannot be recovered" while stale fails mid-import.
-            update.update(_psr_metadata_model_update(
-                v, **{PSR_PVOL_META_KEY: None,
-                      PSR_SVOL_META_KEY: None,
-                      PSR_COPY_GROUP_META_KEY: None}))
+            # replicating but still carries replication_svol_id advertises a
+            # replica that no longer exists, and an orchestrator would try to
+            # adopt it at failover — a stale id is worse than an absent one,
+            # because absent is reported as "cannot be recovered" up front while
+            # stale fails mid-import.
+            update.update(_replication_metadata_model_update(
+                v, **{REPL_PVOL_META_KEY: None,
+                      REPL_SVOL_META_KEY: None,
+                      REPL_COPY_GROUP_META_KEY: None}))
             vol_models.append(update)
         return {"replication_status": "disabled"}, vol_models
 
