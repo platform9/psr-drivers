@@ -46,9 +46,9 @@ _ASYNC_STRING = 'async'
 # is the only channel that carries the array-side identifiers out to a
 # client. Without it an orchestrator has to open its own Configuration
 # Manager session purely to learn which LDEVs back a volume.
-_MD_PVOL = 'psr_pvol_id'
-_MD_SVOL = 'psr_svol_id'
-_MD_COPY_GROUP = 'psr_copy_group'
+_MD_PVOL = 'hbsd_pvol_id'
+_MD_SVOL = 'hbsd_svol_id'
+_MD_COPY_GROUP = 'hbsd_copy_group'
 
 # Optional operator override for the same binding, on the Cinder group's
 # name. Weaker than the metadata above -- a group can be renamed through
@@ -1234,7 +1234,9 @@ class HBSDREPLICATION(rest.HBSDREST):
                     {'storage': instance.storage_id[-6:],
                      'journal': journal_id, 'ldev': ldev})
             except exception.VolumeDriverException:
-                LOG.debug(
+                # Leaks a journal and a journal LDEV on the array, so this
+                # has to be visible without debug logging enabled.
+                LOG.warning(
                     'A journal and/or its LDEV were not deleted. '
                     '(storage: %(storage)s, journal: %(journal)s)',
                     {'storage': instance.storage_id[-6:],
@@ -1507,7 +1509,12 @@ class HBSDREPLICATION(rest.HBSDREST):
             return {
                 'provider_location': provider_location
             }
-        if volume.is_replicated():
+        if (volume.is_replicated() and
+                not _volume_in_group_replication(volume)):
+            # A member of a group-replication group is created unpaired:
+            # _group_repl_add_volume takes the plain LDEV as the P-VOL and
+            # builds the pair itself. _check_rep_ldev still rejects a
+            # replicated volume in any other kind of group.
             _check_rep_ldev(self, volume, 'create a volume')
             rep_type = _get_rep_type(self, extra_specs)
             pldev, sldev = self._create_rep_ldev_and_pair(
@@ -1819,7 +1826,8 @@ class HBSDREPLICATION(rest.HBSDREST):
             return self._create_rep_volume_from_src(
                 volume, extra_specs, src, src_type, operation,
                 self.driver_info['mirror_attr'])
-        if volume.is_replicated():
+        if (volume.is_replicated() and
+                not _volume_in_group_replication(volume)):
             return self._create_rep_volume_from_src(
                 volume, extra_specs, src, src_type, operation,
                 _get_rep_type(self, extra_specs))

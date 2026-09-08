@@ -76,7 +76,7 @@ default) the pool capabilities carry per-copy-group pair state and
 consistency time under ``pf9_group_replication_pairs``, readable through
 ``GET /v3/scheduler-stats/get_pools?detail=True``. Cinder exposes neither
 replication lag nor a vendor pair state through any other API. Volumes are
-also stamped with ``psr_pvol_id``, ``psr_svol_id`` and ``psr_copy_group``
+also stamped with ``hbsd_pvol_id``, ``hbsd_svol_id`` and ``hbsd_copy_group``
 metadata, because ``provider_location`` appears in no Cinder API view.
 """
 

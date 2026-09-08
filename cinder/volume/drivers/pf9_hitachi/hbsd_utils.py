@@ -866,14 +866,14 @@ class HBSDMsg(enum.Enum):
         'suffix': ERROR_SUFFIX,
     }
     GROUP_REPLICATION_PAIR_CREATE_FAILED = {
-        'msg_id': 774,
+        'msg_id': 785,
         'loglevel': base_logging.ERROR,
         'msg': 'Failed to create a group replication pair. (volume: '
                '%(volume)s, copy group: %(copy_group)s)',
         'suffix': ERROR_SUFFIX,
     }
     GROUP_REPLICATION_PAIR_DELETE_FAILED = {
-        'msg_id': 775,
+        'msg_id': 786,
         'loglevel': base_logging.ERROR,
         'msg': 'Failed to delete a group replication pair. (volume: '
                '%(volume)s, copy group: %(copy_group)s)',
