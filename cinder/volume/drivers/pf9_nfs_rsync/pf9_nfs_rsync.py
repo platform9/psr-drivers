@@ -69,6 +69,66 @@ PROMOTED_FILE = "promoted"
 PVOL_BASE = 1001
 SVOL_BASE = 2001
 
+# Volume-metadata keys carrying the replication pair's identifiers.
+#
+# WHY THESE NAMES. Deliberately generic and vendor-neutral: a DR orchestrator
+# needs the peer's LUN id, and that is true of any orchestrator against any
+# array. An earlier revision used psr_* names; those were dropped because a
+# vendor asked to add a Platform9-specific key to their upstream driver has an
+# obvious reason to refuse, whereas "record the replication pair's LUN ids in
+# volume metadata" is a request any replication driver can reasonably adopt.
+#
+# WHY METADATA AND NOT THE REPLICATION SPEC FIELDS. `replication_driver_data`
+# and `replication_extended_status` look like the natural home — the spec
+# reserves them — but they are single VARCHAR(255) columns on the volumes table
+# that the volume REST API does not return (see cinder/api/v3/views/volumes.py:
+# the detail view carries `metadata` and `replication_status`, not these). The
+# spec itself calls them "available for drivers to use internally". A reader
+# outside cinder-volume therefore cannot see them without database or
+# admin-extension access. `metadata` is the one per-volume, driver-writable
+# field that comes back on an ordinary volume list, so it is the only channel
+# that actually reaches a consumer.
+#
+# WHY A CONSUMER NEEDS THEM. At failover the recovery site adopts the replica
+# with manage_existing(source-name=<S-VOL id>). That id must be known BEFORE the
+# primary site is lost — afterwards the array that knew the pairing is gone.
+#
+# These names are shared with the pf9_hitachi driver so both backends look
+# identical to a consumer and no per-vendor branch is needed.
+REPL_PVOL_META_KEY = "replication_pvol_id"      # this site's P-VOL id
+REPL_SVOL_META_KEY = "replication_svol_id"      # the peer's S-VOL id
+REPL_COPY_GROUP_META_KEY = "replication_copy_group"  # the pair's copy group
+
+
+def _replication_metadata_model_update(volume, **kwargs) -> dict:
+    """Return a {'metadata': ...} model update fragment, or {}.
+
+    Cinder REPLACES a volume's metadata with what a driver returns rather than
+    merging into it, so the whole map has to be sent every time — hence the
+    merge onto the volume's current metadata below.
+
+    Which is also why this emits nothing at all when that current metadata
+    cannot be read: reading it can go to the database if the attribute was
+    never loaded, and sending only our own keys would silently drop whatever
+    the volume's owner had set. Nothing here is worth failing a replication
+    operation over.
+
+    A None value removes that key — how disable_replication retires the ids.
+    """
+    try:
+        merged = dict(volume.metadata or {})
+    except Exception:
+        LOG.debug("PF9NFSRsync: not annotating volume %s: its current metadata "
+                  "could not be read, and a partial map would discard the "
+                  "metadata already on it.", volume.id, exc_info=True)
+        return {}
+    for key, value in kwargs.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = str(value)
+    return {"metadata": merged}
+
 SSH_OPTS = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10"]
 
 
@@ -361,18 +421,39 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         """
         cg = self._read_copygroup(group.id)
         by_uuid = {p["cinderUuid"]: p for p in cg["pairs"]}
+        # Keep each volume's pair so the ids can be stamped onto the volume
+        # below. Re-enabling an already-paired group re-stamps rather than
+        # re-allocating, so the operation stays idempotent.
+        pair_by_uuid = {}
         for v in (volumes or []):
             p = by_uuid.get(v.id)
             if p is None:
                 pvol, svol = self._alloc_pair_ids()
-                cg["pairs"].append({"pvolId": pvol, "svolId": svol,
-                                    "cinderUuid": v.id, "state": PAIR_PAIR})
+                p = {"pvolId": pvol, "svolId": svol,
+                     "cinderUuid": v.id, "state": PAIR_PAIR}
+                cg["pairs"].append(p)
             else:
                 p["state"] = PAIR_PAIR
+            pair_by_uuid[v.id] = p
         cg["direction"] = "P_to_S"
         self._write_copygroup(group.id, cg)
         model = {"replication_status": "enabled"}
-        vol_models = [{"id": v.id, "replication_status": "enabled"} for v in (volumes or [])]
+        copy_group = cg.get("copyGroup") or group.id
+        vol_models = []
+        for v in (volumes or []):
+            update = {"id": v.id, "replication_status": "enabled"}
+            pair = pair_by_uuid.get(v.id)
+            if pair:
+                # Hand the pair's identifiers to PSR. Only on the success path:
+                # the copygroup write above has already committed, so a pair
+                # advertised here really exists. Publishing ids for a pair that
+                # was never created would make a volume look recoverable when it
+                # is not — which surfaces at failover, the worst possible time.
+                update.update(_replication_metadata_model_update(
+                    v, **{REPL_PVOL_META_KEY: pair["pvolId"],
+                          REPL_SVOL_META_KEY: pair["svolId"],
+                          REPL_COPY_GROUP_META_KEY: copy_group}))
+            vol_models.append(update)
         return model, vol_models
 
     def disable_replication(self, context, group, volumes) -> tuple:
@@ -382,7 +463,21 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
             p["state"] = PAIR_SMPL
         cg["direction"] = "none"
         self._write_copygroup(group.id, cg)
-        return {"replication_status": "disabled"}, [{"id": v.id, "replication_status": "disabled"} for v in (volumes or [])]
+        vol_models = []
+        for v in (volumes or []):
+            update = {"id": v.id, "replication_status": "disabled"}
+            # Retire the ids along with the pair. A volume that has stopped
+            # replicating but still carries replication_svol_id advertises a
+            # replica that no longer exists, and an orchestrator would try to
+            # adopt it at failover — a stale id is worse than an absent one,
+            # because absent is reported as "cannot be recovered" up front while
+            # stale fails mid-import.
+            update.update(_replication_metadata_model_update(
+                v, **{REPL_PVOL_META_KEY: None,
+                      REPL_SVOL_META_KEY: None,
+                      REPL_COPY_GROUP_META_KEY: None}))
+            vol_models.append(update)
+        return {"replication_status": "disabled"}, vol_models
 
     def failover_replication(self, context, group, volumes, secondary_backend_id=None) -> tuple:
         """Fail a group over, or fail it back.
@@ -396,6 +491,11 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         "resume the primary"): re-establish primary -> secondary. Pair state ->
         PAIR, replication_status 'enabled'. This is the only transition Cinder
         allows out of the failed-over state.
+
+        Neither direction touches the psr_* metadata, deliberately: the pair
+        still exists through a failover, only its direction changed, and the
+        same two LUN ids are what a subsequent failback needs. They are retired
+        in disable_replication, where the pair is actually torn down.
         """
         cg = self._read_copygroup(group.id)
         if secondary_backend_id == "default":
