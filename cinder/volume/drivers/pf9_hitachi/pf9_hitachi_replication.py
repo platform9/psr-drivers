@@ -72,10 +72,23 @@ A group type may set ``hbsd:group_replication_failover_mode = graceful`` to
 change the default for every request against that group.
 
 **Reporting.** With ``hitachi_replication_report_pair_status`` enabled (the
-default) the pool capabilities carry per-copy-group pair state and
-consistency time under ``pf9_group_replication_pairs``, readable through
+default) the pool capabilities carry per-copy-group state under
+``group_replication_pairs``, readable through
 ``GET /v3/scheduler-stats/get_pools?detail=True``. Cinder exposes neither
-replication lag nor a vendor pair state through any other API. Volumes are
+replication lag nor a vendor pair state through any other API.
+
+Each entry reports what the storage system actually returned: ``pair_count``
+and either ``pair_status`` or, where the microcode has no group-level status,
+``pvol_statuses`` / ``svol_statuses``. ``consistency_time`` and
+``journal_usage_rate`` appear only if the copy group carries them; where it
+does not -- VSP One B26 and VSP 5000 series carry neither -- the journal
+behind the copy group is read instead and reported as ``journal_id``,
+``journal_status``, ``journal_usage_rate``, ``journal_q_count``,
+``journal_q_marker``, ``journal_active_paths`` and ``journal_side``.
+``journal_q_count`` is the write backlog still held by the journal, so
+``PJNN``/``SJNN`` with a q-count of 0 means the two sides are current. No lag
+in seconds is reported, because no microcode here supplies one and a derived
+value would be indistinguishable from a real one. Volumes are
 also stamped with ``hbsd_pvol_id``, ``hbsd_svol_id`` and ``hbsd_copy_group``
 metadata, because ``provider_location`` appears in no Cinder API view.
 """

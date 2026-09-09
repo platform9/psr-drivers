@@ -899,7 +899,62 @@ class HBSDREPLICATION(rest.HBSDREST):
                         utils.PRIMARY_STR)
         return data
 
-    def _copy_grp_pair_state(self, copy_group_name):
+    def _journals_by_id(self, instance):
+        """Every journal on one site, keyed by journal id.
+
+        Read once per statistics cycle and shared by every copy group: the
+        copy groups in a backend usually share a journal, and one listing
+        costs the same as one journal.
+        """
+        try:
+            journals = instance.client.get_journals() or []
+        except Exception:
+            LOG.debug('Could not list journals for the pool capabilities.',
+                      exc_info=True)
+            return {}
+        return {journal['journalId']: journal for journal in journals
+                if journal.get('journalId') is not None}
+
+    def _journal_state(self, copy_pairs, journals, is_secondary):
+        """The journal metrics for one copy group, as the array reports them.
+
+        A remote-mirror copy group does not carry consistencyTime or
+        journalUsageRate on every microcode -- on VSP One B26 / VSP 5000 it
+        carries neither -- so the only place the inputs to an RPO check
+        exist is the journal itself. qCount is the number of Q-markers
+        still held by the master journal, i.e. the write backlog that has
+        not reached the other site; PJNN/SJNN with qCount 0 means the two
+        sides are current.
+
+        Reported from whichever side was queried: the master journal at the
+        primary, the restore journal at a recovery site. Nothing is
+        derived -- a lag in seconds would have to be invented, and would be
+        indistinguishable from a real one.
+        """
+        jkey = 'svolJournalId' if is_secondary else 'pvolJournalId'
+        ids = {pair[jkey] for pair in copy_pairs
+               if pair.get(jkey) is not None}
+        if len(ids) != 1:
+            # No journal, or a copy group spanning several: an aggregate
+            # over journals is not something the storage system defines.
+            return {}
+        journal = journals.get(ids.pop())
+        if not journal:
+            return {}
+        state = {
+            'journal_id': journal.get('journalId'),
+            'journal_status': journal.get('journalStatus'),
+            'journal_usage_rate': journal.get('usageRate'),
+            'journal_q_count': journal.get('qCount'),
+            'journal_q_marker': journal.get('qMarker'),
+            'journal_active_paths': journal.get('numOfActivePaths'),
+            'journal_side': utils.SECONDARY_STR if is_secondary
+            else utils.PRIMARY_STR,
+        }
+        return {key: value for key, value in state.items()
+                if value is not None}
+
+    def _copy_grp_pair_state(self, copy_group_name, journals=None):
         """Read one copy group's state as the storage system reports it.
 
         Issued from whichever side is actually up: from the primary with a
@@ -907,7 +962,8 @@ class HBSDREPLICATION(rest.HBSDREST):
         with no session at all once failed over, where the primary's client
         was never initialized.
         """
-        if self._active_backend_id or self._is_target_role():
+        is_secondary = bool(self._active_backend_id or self._is_target_role())
+        if is_secondary:
             grp = self._svol_instance().client.get_remote_copy_grp(
                 None, copy_group_name, is_secondary=True)
         else:
@@ -934,6 +990,12 @@ class HBSDREPLICATION(rest.HBSDREST):
             state['svol_statuses'] = sorted(
                 {pair['svolStatus'] for pair in copy_pairs
                  if pair.get('svolStatus')})
+        if state.get('journal_usage_rate') is None:
+            # Same reason the member states are reported above: the copy
+            # group carried no journal metrics, so read them where they
+            # actually live.
+            state.update(self._journal_state(
+                copy_pairs, journals or {}, is_secondary))
         return {key: value for key, value in state.items()
                 if value is not None}
 
@@ -994,10 +1056,14 @@ class HBSDREPLICATION(rest.HBSDREST):
             copy_group_names = copy_group_names[
                 :_PAIR_STATUS_MAX_COPY_GROUPS]
         pairs = {}
+        journals = self._journals_by_id(
+            self._svol_instance() if
+            (self._active_backend_id or self._is_target_role())
+            else self.rep_primary)
         for copy_group_name in copy_group_names:
             try:
                 pairs[copy_group_name] = self._copy_grp_pair_state(
-                    copy_group_name)
+                    copy_group_name, journals)
             except Exception:
                 LOG.debug(
                     'Could not read copy group %s for the pool '
@@ -3172,9 +3238,26 @@ class HBSDREPLICATION(rest.HBSDREST):
 
     def list_replication_targets(self, context, group):
         self._require_rep_primary()
-        self._require_rep_secondary()
         copy_group_name = self._resolve_copy_group_name(
             group, None)
+        # Listing copy groups needs a session on the peer, which a failed
+        # over or target-role backend cannot open -- and this is exactly
+        # where a client asks what it can fail over to. Read the one copy
+        # group from the side holding the S-VOLs instead, the same way
+        # _copy_grp_pair_state does.
+        if self._active_backend_id or self._is_target_role():
+            self._require_svol_instance()
+            try:
+                self._svol_instance().client.get_remote_copy_grp(
+                    None, copy_group_name, is_secondary=True)
+            except exception.VolumeDriverException:
+                exists = False
+            else:
+                exists = True
+            return {'replication_targets': (
+                [{'backend_id': self.rep_secondary_backend_id}] if exists
+                else [])}
+        self._require_rep_secondary()
         try:
             remote_copy_grps = self.rep_primary.client.get_remote_copy_grps(
                 self.rep_secondary.client) or []
