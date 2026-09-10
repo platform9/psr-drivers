@@ -1111,6 +1111,20 @@ class PF9GroupReplicationFCTest(test.TestCase):
         return [c.args[1] for c in
                 common.rep_primary.client.add_remote_copypair.call_args_list]
 
+    def test_group_copy_group_name_leaves_room_for_journal_label(self):
+        # The journal LDEV label is '<copy group name>-JNL' and CM caps a
+        # label at 32, so a name cut only to _MAX_COPY_GROUP_NAME (29)
+        # overran it by one and failed every group create (KART40046-E).
+        common = self._stub_common()
+        cg = common._create_group_copy_group_name(
+            'e0a116c8-4016-4aa2-a7b0-cafa00000000')
+        self.assertLessEqual(len(cg), hbsd_rest._MAX_COPY_GROUP_NAME)
+        self.assertLessEqual(
+            len(hbsd_replication._JOURNAL_VOLUME_LABEL % cg),
+            hbsd_rest.MAX_LDEV_LABEL)
+        # Device group names suffix the same base by one character.
+        self.assertLessEqual(len(cg + 'P'), hbsd_rest._MAX_COPY_GROUP_NAME)
+
     # ---- H5 / H6: pair body, B1, A1, A2 ----------------------------------
 
     def test_enable_replication_pair_body(self):

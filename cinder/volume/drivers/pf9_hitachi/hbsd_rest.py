@@ -97,6 +97,9 @@ EX_INVARG = 'EX_INVARG'
 _INVALID_RANGE = [EX_ENLDEV, EX_INVARG]
 
 _MAX_COPY_GROUP_NAME = 29
+# CM's limit on an LDEV 'label'. Tighter than it looks: labels are derived from
+# a copy group name by suffixing, so the suffix eats into the name's budget.
+MAX_LDEV_LABEL = 32
 _MAX_CTG_COUNT_EXCEEDED_ADD_SNAPSHOT = ('2E10', '2302')
 _MAX_PAIR_COUNT_IN_CTG_EXCEEDED_ADD_SNAPSHOT = ('2E13', '9900')
 

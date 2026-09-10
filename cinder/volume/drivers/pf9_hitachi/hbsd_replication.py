@@ -126,6 +126,13 @@ _REP_FAILBACK = manager.VolumeManager.FAILBACK_SENTINEL
 
 _JOURNAL_VOLUME_LABEL = '%s-JNL'
 
+# The longest copy group name whose journal label still fits MAX_LDEV_LABEL.
+# create_journals() labels every journal LDEV '<copy group name>-JNL', so the
+# name is bounded by the LABEL limit, not just _MAX_COPY_GROUP_NAME.
+_MAX_GROUP_COPY_GROUP_NAME = min(
+    rest._MAX_COPY_GROUP_NAME,
+    rest.MAX_LDEV_LABEL - len(_JOURNAL_VOLUME_LABEL % ''))
+
 _MIRROR_IDENTIFIER = 'G'
 _ASYNC_IDENTIFIER = 'U'
 
@@ -1238,12 +1245,14 @@ class HBSDREPLICATION(rest.HBSDREST):
     def _create_group_copy_group_name(self, group_id):
         # One copy group per Cinder group, namespaced by the driver
         # prefix so it never collides with the per-LDEV names built by
-        # _create_rep_copy_group_name above. 'HBSD-' plus 24 hex digits
-        # is 29 characters, the same _MAX_COPY_GROUP_NAME every other
-        # derivation in the driver is cut to.
-        name = (self.driver_info['target_prefix'] +
-                group_id.replace('-', '')[:24])
-        if len(name) > rest._MAX_COPY_GROUP_NAME:
+        # _create_rep_copy_group_name above. Cut to
+        # _MAX_GROUP_COPY_GROUP_NAME rather than _MAX_COPY_GROUP_NAME:
+        # create_journals() suffixes this name with '-JNL' to label the
+        # journal LDEV, and a 29-character name overruns that field by one.
+        prefix = self.driver_info['target_prefix']
+        name = prefix + group_id.replace(
+            '-', '')[:_MAX_GROUP_COPY_GROUP_NAME - len(prefix)]
+        if len(name) > _MAX_GROUP_COPY_GROUP_NAME:
             # A longer prefix would put the name over the limit silently,
             # and every enable_replication would then fail at the array.
             msg = utils.output_log(
@@ -1322,9 +1331,12 @@ class HBSDREPLICATION(rest.HBSDREST):
                 ldev = instance.create_ldev(
                     self.conf.hitachi_replication_journal_size, {},
                     pool_id, ldev_range)
+                # Track before labelling, not after: the rollback below frees
+                # only what is in journal_ldevs, so a modify_ldev failure used
+                # to leak the LDEV it had just created.
+                journal_ldevs.append(ldev)
                 instance.client.modify_ldev(
                     ldev, {'label': _JOURNAL_VOLUME_LABEL % copy_group_name})
-                journal_ldevs.append(ldev)
                 while True:
                     journal_list = instance.client.get_journals()
                     journal_id = _get_unused_minimum_value(
