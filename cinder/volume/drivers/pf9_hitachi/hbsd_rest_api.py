@@ -27,6 +27,14 @@ from oslo_service import loopingcall
 from oslo_utils import timeutils
 import requests
 from requests.adapters import HTTPAdapter
+# PF9 Start
+import urllib3
+
+# The driver defaults to verify=False (hitachi_verify_ssl_cert), so every REST
+# call emits an InsecureRequestWarning. At one warning per request it buries
+# the driver's own logs; the insecure default is logged once by Cinder itself.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# PF9 End
 
 from cinder import exception
 from cinder.i18n import _

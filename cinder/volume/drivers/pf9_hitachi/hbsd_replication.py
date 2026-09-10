@@ -2544,7 +2544,9 @@ class HBSDREPLICATION(rest.HBSDREST):
         except exception.VolumeDriverException:
             return
         if rtn.get('messageId') == _MSGID_INSTANCE_CANNOT_OPERATED:
-            self._delete_journals(journal_ids)
+            with _log_step('delete journals', copy_group=copy_group_name,
+                           journals=journal_ids):
+                self._delete_journals(journal_ids)
 
     def _group_repl_copy_grp_exists(self, copy_group_name):
         """Check the copy group with the list call, not the get (B3)."""
@@ -2622,8 +2624,10 @@ class HBSDREPLICATION(rest.HBSDREST):
                     MSG.LDEV_NUMBER_NOT_FOUND, operation=operation,
                     obj='volume', obj_id=volume.id)
                 self.raise_error(msg)
-            self.rep_primary.client.delete_remote_copypair(
-                self.rep_secondary.client, copy_group_name, pvol, svol)
+            with _log_step('delete replication pair',
+                           copy_group=copy_group_name, pvol=pvol, svol=svol):
+                self.rep_primary.client.delete_remote_copypair(
+                    self.rep_secondary.client, copy_group_name, pvol, svol)
             utils.output_log(
                 MSG.GROUP_REPLICATION_PAIR_DELETED,
                 copy_group=copy_group_name, pvol=pvol, svol=svol)
@@ -2741,8 +2745,10 @@ class HBSDREPLICATION(rest.HBSDREST):
         try:
             # resync is a copy-group operation, so it is issued once and
             # confirmed per pair below.
-            self.rep_primary.client.resync_remote_copy_grp(
-                self.rep_secondary.client, copy_group_name, rep_type)
+            with _log_step('resync copy group', copy_group=copy_group_name,
+                           volumes=len(volumes)):
+                self.rep_primary.client.resync_remote_copy_grp(
+                    self.rep_secondary.client, copy_group_name, rep_type)
         except exception.VolumeDriverException:
             for volume in volumes:
                 self.rep_primary.output_log(
@@ -2859,8 +2865,7 @@ class HBSDREPLICATION(rest.HBSDREST):
             if volume_update['status'] != 'deleted':
                 model_update['status'] = 'error'
             volumes_model_update.append(volume_update)
-        with _log_step('delete journals', copy_group=copy_group_name):
-            self._group_repl_delete_journals(copy_group_name, journal_ids)
+        self._group_repl_delete_journals(copy_group_name, journal_ids)
         return model_update, volumes_model_update
 
     def _group_repl_delete_group_volume(self, group, volume,
@@ -2874,8 +2879,12 @@ class HBSDREPLICATION(rest.HBSDREST):
         svol = self.rep_secondary.get_ldev(volume)
         try:
             if pvol is not None and svol is not None:
-                self.rep_primary.client.delete_remote_copypair(
-                    self.rep_secondary.client, copy_group_name, pvol, svol)
+                with _log_step('delete replication pair',
+                               copy_group=copy_group_name,
+                               pvol=pvol, svol=svol):
+                    self.rep_primary.client.delete_remote_copypair(
+                        self.rep_secondary.client, copy_group_name,
+                        pvol, svol)
                 utils.output_log(
                     MSG.GROUP_REPLICATION_PAIR_DELETED,
                     copy_group=copy_group_name, pvol=pvol, svol=svol)
@@ -2936,7 +2945,10 @@ class HBSDREPLICATION(rest.HBSDREST):
             # Upstream already builds the CTG bodies with autoSplit off and
             # issues exactly one split_snapshotgroup for the whole group;
             # it only needs the group's name from us.
-            secondary._create_ctg_snap_pair(pairs, snapshot_group_name)
+            with _log_step('create group snapshot',
+                           snapshot_group=snapshot_group_name,
+                           snapshots=len(pairs)):
+                secondary._create_ctg_snap_pair(pairs, snapshot_group_name)
         except Exception:
             utils.output_log(
                 MSG.GROUP_REPLICATION_SNAPSHOT_FAILED,
@@ -2965,8 +2977,11 @@ class HBSDREPLICATION(rest.HBSDREST):
         """Delete the Thin Image pairs and S-VOLs left on the secondary."""
         self._require_rep_secondary()
         try:
-            return self.rep_secondary._delete_group(
-                group_snapshot, snapshots, True)
+            with _log_step('delete group snapshot',
+                           group_snapshot=group_snapshot.id,
+                           snapshots=len(snapshots)):
+                return self.rep_secondary._delete_group(
+                    group_snapshot, snapshots, True)
         except Exception:
             with excutils.save_and_reraise_exception():
                 utils.output_log(
@@ -3177,6 +3192,10 @@ class HBSDREPLICATION(rest.HBSDREST):
         copy_group_name = self._resolve_copy_group_name(
             group, volumes)
         journal_ids = self._group_repl_journal_ids(copy_group_name)
+        LOG.info('Group replication: disabling on group %(group)s. (copy '
+                 'group: %(cg)s, volumes: %(n)d, journals: %(j)s)',
+                 {'group': group.id, 'cg': copy_group_name,
+                  'n': len(volumes), 'j': journal_ids})
         volumes_model_update = [
             self._group_repl_delete_volume(
                 volume, copy_group_name, 'disable group replication')
@@ -3198,6 +3217,12 @@ class HBSDREPLICATION(rest.HBSDREST):
         secondary_backend_id, requested_mode = _parse_failover_target(
             secondary_backend_id)
         is_failback = secondary_backend_id == _REP_FAILBACK
+        LOG.info('Group replication: %(dir)s on group %(group)s. (copy '
+                 'group: %(cg)s, volumes: %(n)d, target: %(t)s, mode: %(m)s)',
+                 {'dir': 'failback' if is_failback else 'failover',
+                  'group': group.id, 'cg': copy_group_name,
+                  'n': len(volumes), 't': secondary_backend_id,
+                  'm': requested_mode or '-'})
         if is_failback and requested_mode:
             # A split mode means nothing on failback, and accepting it
             # would be worse than useless: the volume manager compares the
