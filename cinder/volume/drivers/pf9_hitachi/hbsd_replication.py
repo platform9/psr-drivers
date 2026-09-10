@@ -16,6 +16,7 @@
 """replication module for Hitachi HBSD Driver."""
 
 from collections import defaultdict
+import contextlib
 import json
 import time
 
@@ -378,6 +379,33 @@ CONF.register_opts(REST_MIRROR_SSL_OPTS)
 LOG = logging.getLogger(__name__)
 
 MSG = utils.HBSDMsg
+
+
+@contextlib.contextmanager
+def _log_step(step, **details):
+    """Bracket a blocking group-replication step with start/end INFO lines.
+
+    These paths issue CM jobs whose response timeout is 30 minutes, so a wedged
+    array looks exactly like a busy one: no output at all between the request
+    and the eventual failure. The elapsed time on the closing line is the part
+    that tells them apart.
+    """
+    detail = ', '.join('%s: %s' % kv for kv in sorted(details.items()))
+    LOG.info('Group replication: %(step)s started. (%(detail)s)',
+             {'step': step, 'detail': detail})
+    watch = timeutils.StopWatch()
+    watch.start()
+    try:
+        yield
+    except Exception:
+        LOG.info(
+            'Group replication: %(step)s failed after %(sec).1fs. '
+            '(%(detail)s)',
+            {'step': step, 'sec': watch.elapsed(), 'detail': detail})
+        raise
+    LOG.info(
+        'Group replication: %(step)s finished in %(sec).1fs. (%(detail)s)',
+        {'step': step, 'sec': watch.elapsed(), 'detail': detail})
 
 
 def _has_group_repl_spec(group_type_id):
@@ -2461,10 +2489,15 @@ class HBSDREPLICATION(rest.HBSDREST):
                 # without them, so the pair that creates the copy group
                 # creates its journals too, exactly as _create_rep_pair
                 # does for the per-LDEV copy groups.
-                journal_ids = parent.create_journals(volume, copy_group_name)
+                with _log_step('create journals',
+                               copy_group=copy_group_name):
+                    journal_ids = parent.create_journals(
+                        volume, copy_group_name)
                 created_journal_ids.extend(journal_ids)
                 body['pvolJournalId'], body['svolJournalId'] = journal_ids
-            self.add_remote_copypair(remote_client, body)
+            with _log_step('create replication pair',
+                           copy_group=copy_group_name, pvol=pvol, svol=svol):
+                self.add_remote_copypair(remote_client, body)
 
         try:
             inner(self.rep_primary.client, self.rep_secondary.client,
@@ -2539,11 +2572,12 @@ class HBSDREPLICATION(rest.HBSDREST):
             if self.driver_info.get('driver_dir_name'):
                 capacity_saving = extra_specs.get(
                     self.driver_info['driver_dir_name'] + ':capacity_saving')
-            svol = self.rep_secondary.create_ldev(
-                volume.size, extra_specs,
-                self.rep_secondary.storage_info['pool_id'][0],
-                self.rep_secondary.storage_info['ldev_range'],
-                qos_specs=utils.get_qos_specs_from_volume(volume))
+            with _log_step('create secondary volume', volume=volume.id):
+                svol = self.rep_secondary.create_ldev(
+                    volume.size, extra_specs,
+                    self.rep_secondary.storage_info['pool_id'][0],
+                    self.rep_secondary.storage_info['ldev_range'],
+                    qos_specs=utils.get_qos_specs_from_volume(volume))
             try:
                 self._group_repl_create_pair(
                     volume, copy_group_name, pvol, svol,
@@ -2813,6 +2847,10 @@ class HBSDREPLICATION(rest.HBSDREST):
         copy_group_name = self._resolve_copy_group_name(
             group, volumes)
         journal_ids = self._group_repl_journal_ids(copy_group_name)
+        LOG.info('Group replication: deleting group %(group)s. (copy group: '
+                 '%(cg)s, volumes: %(n)d, journals: %(j)s)',
+                 {'group': group.id, 'cg': copy_group_name,
+                  'n': len(volumes), 'j': journal_ids})
         model_update = {'status': group.status}
         volumes_model_update = []
         for volume in volumes:
@@ -2821,7 +2859,8 @@ class HBSDREPLICATION(rest.HBSDREST):
             if volume_update['status'] != 'deleted':
                 model_update['status'] = 'error'
             volumes_model_update.append(volume_update)
-        self._group_repl_delete_journals(copy_group_name, journal_ids)
+        with _log_step('delete journals', copy_group=copy_group_name):
+            self._group_repl_delete_journals(copy_group_name, journal_ids)
         return model_update, volumes_model_update
 
     def _group_repl_delete_group_volume(self, group, volume,
@@ -3044,6 +3083,13 @@ class HBSDREPLICATION(rest.HBSDREST):
         copy_group_name = self._resolve_copy_group_name(
             group, (add_volumes or []) + (remove_volumes or []))
         copy_grp_exists = self._group_repl_copy_grp_exists(copy_group_name)
+        LOG.info('Group replication: updating group %(group)s. (copy group: '
+                 '%(cg)s, add: %(add)d, remove: %(rm)d, copy group exists: '
+                 '%(exists)s)',
+                 {'group': group.id, 'cg': copy_group_name,
+                  'add': len(add_volumes or []),
+                  'rm': len(remove_volumes or []),
+                  'exists': copy_grp_exists})
         # A member whose pair is merely suspended is restarted, not added:
         # adding it would allocate a second S-VOL and then fail to pair it.
         suspended = (
@@ -3097,6 +3143,10 @@ class HBSDREPLICATION(rest.HBSDREST):
         self._require_rep_primary()
         self._require_rep_secondary()
         copy_grp_exists = self._group_repl_copy_grp_exists(copy_group_name)
+        LOG.info('Group replication: enabling on group %(group)s. (copy '
+                 'group: %(cg)s, volumes: %(n)d, copy group exists: %(e)s)',
+                 {'group': group.id, 'cg': copy_group_name,
+                  'n': len(volumes), 'e': copy_grp_exists})
         suspended = (
             self._group_repl_suspended_members(copy_group_name, volumes)
             if copy_grp_exists else [])
