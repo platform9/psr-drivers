@@ -127,12 +127,18 @@ _REP_FAILBACK = manager.VolumeManager.FAILBACK_SENTINEL
 
 _JOURNAL_VOLUME_LABEL = '%s-JNL'
 
-# The longest copy group name whose journal label still fits MAX_LDEV_LABEL.
-# create_journals() labels every journal LDEV '<copy group name>-JNL', so the
-# name is bounded by the LABEL limit, not just _MAX_COPY_GROUP_NAME.
+# Empirical cap on the copy group name the group path builds. Two limits are
+# derived -- _MAX_COPY_GROUP_NAME, and MAX_LDEV_LABEL less the '-JNL' suffix
+# create_journals() appends to label the journal LDEV. The third is measured:
+# the pair body also derives '<name>P'/'<name>S' device group names, and a
+# 29-character device group fails to start a HORCM instance on VSP 5600 while
+# the 24-character one _create_rep_copy_group_name builds pairs fine. Pinned to
+# that known-good length until the real device-group cap is confirmed.
+_MAX_GROUP_COPY_GROUP_NAME_MEASURED = 23
 _MAX_GROUP_COPY_GROUP_NAME = min(
     rest._MAX_COPY_GROUP_NAME,
-    rest.MAX_LDEV_LABEL - len(_JOURNAL_VOLUME_LABEL % ''))
+    rest.MAX_LDEV_LABEL - len(_JOURNAL_VOLUME_LABEL % ''),
+    _MAX_GROUP_COPY_GROUP_NAME_MEASURED)
 
 _MIRROR_IDENTIFIER = 'G'
 _ASYNC_IDENTIFIER = 'U'
@@ -2339,6 +2345,13 @@ class HBSDREPLICATION(rest.HBSDREST):
         return self._get_active_backend().create_group()
 
     def delete_group(self, group, volumes):
+        # Logged at the dispatcher, not only in the group-replication branch:
+        # a group whose type lacks the replication spec takes another path
+        # entirely, and the silence was indistinguishable from no call at all.
+        LOG.info('Group replication: delete_group %(group)s. (volumes: '
+                 '%(n)d, group replication: %(gr)s)',
+                 {'group': group.id, 'n': len(volumes),
+                  'gr': _is_group_replication(group)})
         # Group-replication members carry a pair in the group's copy group,
         # and it has to be torn down before their LDEVs can go.
         if _is_group_replication(group):
@@ -2386,6 +2399,11 @@ class HBSDREPLICATION(rest.HBSDREST):
             return model_update, volumes_model_update
 
     def update_group(self, group, add_volumes=None, remove_volumes=None):
+        LOG.info('Group replication: update_group %(group)s. (add: %(a)d, '
+                 'remove: %(r)d, group replication: %(gr)s)',
+                 {'group': group.id, 'a': len(add_volumes or []),
+                  'r': len(remove_volumes or []),
+                  'gr': _is_group_replication(group)})
         # Group-replication members are added to / removed from the
         # group's copy group; every other group keeps the upstream path.
         if _is_group_replication(group):
@@ -2416,6 +2434,10 @@ class HBSDREPLICATION(rest.HBSDREST):
             return self._get_active_backend().update_group(group, add_volumes)
 
     def create_group_snapshot(self, context, group_snapshot, snapshots):
+        LOG.info('Group replication: create_group_snapshot %(gs)s. '
+                 '(snapshots: %(n)d, group replication: %(gr)s)',
+                 {'gs': group_snapshot.id, 'n': len(snapshots),
+                  'gr': _is_group_snapshot_replication(group_snapshot)})
         if _is_group_snapshot_replication(group_snapshot):
             return self._group_repl_create_group_snapshot(
                 context, group_snapshot, snapshots)
@@ -2435,6 +2457,10 @@ class HBSDREPLICATION(rest.HBSDREST):
             return rtn
 
     def delete_group_snapshot(self, group_snapshot, snapshots):
+        LOG.info('Group replication: delete_group_snapshot %(gs)s. '
+                 '(snapshots: %(n)d, group replication: %(gr)s)',
+                 {'gs': group_snapshot.id, 'n': len(snapshots),
+                  'gr': _is_group_snapshot_replication(group_snapshot)})
         if _is_group_snapshot_replication(group_snapshot):
             return self._group_repl_delete_group_snapshot(
                 group_snapshot, snapshots)
@@ -3143,6 +3169,8 @@ class HBSDREPLICATION(rest.HBSDREST):
         return model_update, add_volumes_update, remove_volumes_update
 
     def enable_replication(self, context, group, volumes):
+        LOG.info('Group replication: enable_replication %(group)s. '
+                 '(volumes: %(n)d)', {'group': group.id, 'n': len(volumes)})
         copy_group_name = self._resolve_copy_group_name(
             group, volumes)
         if self._group_repl_adopted_members(volumes):
@@ -3187,15 +3215,16 @@ class HBSDREPLICATION(rest.HBSDREST):
         return model_update, volumes_model_update
 
     def disable_replication(self, context, group, volumes):
+        LOG.info('Group replication: disable_replication %(group)s. '
+                 '(volumes: %(n)d)', {'group': group.id, 'n': len(volumes)})
         self._require_rep_primary()
         self._require_rep_secondary()
         copy_group_name = self._resolve_copy_group_name(
             group, volumes)
         journal_ids = self._group_repl_journal_ids(copy_group_name)
-        LOG.info('Group replication: disabling on group %(group)s. (copy '
-                 'group: %(cg)s, volumes: %(n)d, journals: %(j)s)',
-                 {'group': group.id, 'cg': copy_group_name,
-                  'n': len(volumes), 'j': journal_ids})
+        LOG.info('Group replication: disabling on copy group %(cg)s. '
+                 '(journals: %(j)s)',
+                 {'cg': copy_group_name, 'j': journal_ids})
         volumes_model_update = [
             self._group_repl_delete_volume(
                 volume, copy_group_name, 'disable group replication')
