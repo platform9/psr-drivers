@@ -633,6 +633,7 @@ class HBSDMsg(enum.Enum):
         'msg': 'The REST API failed. (source: %(errorSource)s, '
                'ID: %(messageId)s, message: %(message)s, cause: %(cause)s, '
                'solution: %(solution)s, code: %(errorCode)s, '
+               'detail: %(detailCode)s, '
                'method: %(method)s, url: %(url)s, params: %(params)s, '
                'body: %(body)s)',
         'suffix': ERROR_SUFFIX,

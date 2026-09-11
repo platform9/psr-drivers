@@ -238,6 +238,12 @@ class ResponseData(dict):
             'cause': self['errobj'].get('cause', ''),
             'solution': self['errobj'].get('solution', ''),
             'errorCode': self['errobj'].get('errorCode', {}),
+            # PF9 Start
+            # detailCode carries the nested SSB1/SSB2 or CCI code for an error
+            # raised on the REMOTE array's REST server, where errorCode comes
+            # back empty -- the only field that names the real cause.
+            'detailCode': self['errobj'].get('detailCode', ''),
+            # PF9 End
         }
 
     def get_job_result(self):

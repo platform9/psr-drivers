@@ -127,18 +127,12 @@ _REP_FAILBACK = manager.VolumeManager.FAILBACK_SENTINEL
 
 _JOURNAL_VOLUME_LABEL = '%s-JNL'
 
-# Empirical cap on the copy group name the group path builds. Two limits are
-# derived -- _MAX_COPY_GROUP_NAME, and MAX_LDEV_LABEL less the '-JNL' suffix
-# create_journals() appends to label the journal LDEV. The third is measured:
-# the pair body also derives '<name>P'/'<name>S' device group names, and a
-# 29-character device group fails to start a HORCM instance on VSP 5600 while
-# the 24-character one _create_rep_copy_group_name builds pairs fine. Pinned to
-# that known-good length until the real device-group cap is confirmed.
-_MAX_GROUP_COPY_GROUP_NAME_MEASURED = 23
+# The longest copy group name whose journal label still fits MAX_LDEV_LABEL.
+# create_journals() labels every journal LDEV '<copy group name>-JNL', so the
+# name is bounded by the LABEL limit, not just _MAX_COPY_GROUP_NAME.
 _MAX_GROUP_COPY_GROUP_NAME = min(
     rest._MAX_COPY_GROUP_NAME,
-    rest.MAX_LDEV_LABEL - len(_JOURNAL_VOLUME_LABEL % ''),
-    _MAX_GROUP_COPY_GROUP_NAME_MEASURED)
+    rest.MAX_LDEV_LABEL - len(_JOURNAL_VOLUME_LABEL % ''))
 
 _MIRROR_IDENTIFIER = 'G'
 _ASYNC_IDENTIFIER = 'U'
@@ -1283,9 +1277,13 @@ class HBSDREPLICATION(rest.HBSDREST):
         # _MAX_GROUP_COPY_GROUP_NAME rather than _MAX_COPY_GROUP_NAME:
         # create_journals() suffixes this name with '-JNL' to label the
         # journal LDEV, and a 29-character name overruns that field by one.
+        #
+        # Upper cased to match _create_rep_copy_group_name's '%02X'. On the
+        # VSP 5600 that name starts a HORCM instance every time while this
+        # one, same length and differing only in content, fails every time.
         prefix = self.driver_info['target_prefix']
         name = prefix + group_id.replace(
-            '-', '')[:_MAX_GROUP_COPY_GROUP_NAME - len(prefix)]
+            '-', '').upper()[:_MAX_GROUP_COPY_GROUP_NAME - len(prefix)]
         if len(name) > _MAX_GROUP_COPY_GROUP_NAME:
             # A longer prefix would put the name over the limit silently,
             # and every enable_replication would then fail at the array.
