@@ -91,6 +91,7 @@ class HBSDISCSIDriver(driver.ISCSIDriver):
         2.7.0 - Support adaptive QoS upperIops setting.
         2.7.1 - Support GAD coexisting with ADR.
         2.7.2 - Add caching/batching to fix severe performance issues.
+        2.8.0 - Add generic volume group replication support.
 
     """
 
@@ -114,10 +115,6 @@ class HBSDISCSIDriver(driver.ISCSIDriver):
         self.configuration.append_config_values(common.COMMON_EXTEND_OPTS)
         self.configuration.append_config_values(
             replication.COMMON_MIRROR_OPTS)
-        # PF9 Start
-        self.configuration.append_config_values(
-            replication.COMMON_REPLICATION_OPTS)
-        # PF9 End
         os.environ['LANG'] = 'C'
         kwargs.setdefault('driver_info', _DRIVER_INFO)
         self.driver_info = dict(kwargs['driver_info'])
@@ -328,10 +325,14 @@ class HBSDISCSIDriver(driver.ISCSIDriver):
     def update_group(
             self, context, group, add_volumes=None, remove_volumes=None):
         try:
-            return self.common.update_group(group, add_volumes)
+            return self.common.update_group(
+                group, add_volumes, remove_volumes)
         except Exception:
             with excutils.save_and_reraise_exception():
-                for remove_volume in remove_volumes:
+                # 'or []': Cinder passes None for a pure add, and iterating
+                # that raised TypeError from inside the re-raise, masking
+                # the real exception.
+                for remove_volume in remove_volumes or []:
                     utils.cleanup_cg_in_volume(remove_volume)
 
     @volume_utils.trace
@@ -354,3 +355,21 @@ class HBSDISCSIDriver(driver.ISCSIDriver):
     @volume_utils.trace
     def failover_completed(self, context, active_backend_id=None):
         return self.common.failover_completed(active_backend_id)
+
+    @volume_utils.trace
+    def enable_replication(self, context, group, volumes):
+        return self.common.enable_replication(context, group, volumes)
+
+    @volume_utils.trace
+    def disable_replication(self, context, group, volumes):
+        return self.common.disable_replication(context, group, volumes)
+
+    @volume_utils.trace
+    def failover_replication(self, context, group, volumes,
+                             secondary_backend_id=None):
+        return self.common.failover_replication(
+            context, group, volumes, secondary_backend_id)
+
+    @volume_utils.trace
+    def list_replication_targets(self, context, group):
+        return self.common.list_replication_targets(context, group)

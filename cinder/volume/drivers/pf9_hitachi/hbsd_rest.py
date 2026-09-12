@@ -15,6 +15,8 @@
 #
 """REST interface module for Hitachi HBSD Driver."""
 
+from __future__ import annotations
+
 from collections import defaultdict
 import concurrent.futures
 import json
@@ -95,6 +97,9 @@ EX_INVARG = 'EX_INVARG'
 _INVALID_RANGE = [EX_ENLDEV, EX_INVARG]
 
 _MAX_COPY_GROUP_NAME = 29
+# CM's limit on an LDEV 'label'. Tighter than it looks: labels are derived from
+# a copy group name by suffixing, so the suffix eats into the name's budget.
+MAX_LDEV_LABEL = 32
 _MAX_CTG_COUNT_EXCEEDED_ADD_SNAPSHOT = ('2E10', '2302')
 _MAX_PAIR_COUNT_IN_CTG_EXCEEDED_ADD_SNAPSHOT = ('2E13', '9900')
 
@@ -1414,7 +1419,7 @@ class HBSDREST(common.HBSDCommon):
                         self.output_log(MSG.DELETE_LDEV_FAILED, ldev=new_ldev)
         return None, volumes_model_update
 
-    def update_group(self, group, add_volumes=None):
+    def update_group(self, group, add_volumes=None, remove_volumes=None):
         if add_volumes and volume_utils.is_group_a_cg_snapshot_type(group):
             for volume in add_volumes:
                 ldev = self.get_ldev(volume)
@@ -1478,9 +1483,11 @@ class HBSDREST(common.HBSDCommon):
                 self.output_log(MSG.DELETE_PAIR_FAILED, pvol=pair['pvol'],
                                 svol=pair['svol'])
 
-    def _create_ctg_snap_pair(self, pairs):
-        snapshotgroup_name = self._create_ctg_snapshot_group_name(
-            pairs[0]['pvol'])
+    def _create_ctg_snap_pair(self, pairs, snapshotgroup_name=None):
+        # Callers that own the group's identity pass their own name.
+        if snapshotgroup_name is None:
+            snapshotgroup_name = self._create_ctg_snapshot_group_name(
+                pairs[0]['pvol'])
         try:
             for pair in pairs:
                 try:

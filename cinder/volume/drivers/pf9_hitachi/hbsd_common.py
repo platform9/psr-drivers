@@ -1375,7 +1375,7 @@ class HBSDCommon():
             self, context, group, volumes, snapshots=None, source_vols=None):
         raise NotImplementedError()
 
-    def update_group(self, group, add_volumes=None):
+    def update_group(self, group, add_volumes=None, remove_volumes=None):
         raise NotImplementedError()
 
     def create_group_snapshot(self, context, group_snapshot, snapshots):

@@ -15,6 +15,8 @@
 #
 """REST interface iSCSI module for Hitachi HBSD Driver."""
 
+from __future__ import annotations
+
 from oslo_log import log as logging
 
 # PF9 Start

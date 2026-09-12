@@ -27,6 +27,14 @@ from oslo_service import loopingcall
 from oslo_utils import timeutils
 import requests
 from requests.adapters import HTTPAdapter
+# PF9 Start
+import urllib3
+
+# The driver defaults to verify=False (hitachi_verify_ssl_cert), so every REST
+# call emits an InsecureRequestWarning. At one warning per request it buries
+# the driver's own logs; the insecure default is logged once by Cinder itself.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# PF9 End
 
 from cinder import exception
 from cinder.i18n import _
@@ -90,8 +98,10 @@ REST_NO_RETRY_ERRORS = [
     INVALID_SNAPSHOT_POOL,
 ]
 MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST = 'KART30013-E'
+MSGID_REMOTE_STORAGE_NOT_REGISTERED = 'KART40152-E'
 _REST_NO_RETRY_MESSAGEIDS = [
-    MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST
+    MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST,
+    MSGID_REMOTE_STORAGE_NOT_REGISTERED,
 ]
 
 LOG = logging.getLogger(__name__)
@@ -228,6 +238,12 @@ class ResponseData(dict):
             'cause': self['errobj'].get('cause', ''),
             'solution': self['errobj'].get('solution', ''),
             'errorCode': self['errobj'].get('errorCode', {}),
+            # PF9 Start
+            # detailCode carries the nested SSB1/SSB2 or CCI code for an error
+            # raised on the REMOTE array's REST server, where errorCode comes
+            # back empty -- the only field that names the real cause.
+            'detailCode': self['errobj'].get('detailCode', ''),
+            # PF9 End
         }
 
     def get_job_result(self):
@@ -988,11 +1004,20 @@ class RestApiClient():
         with RemoteSession(remote_client) as session:
             return self._get_objects(url, params=params, remote_auth=session)
 
-    def get_remote_copy_grp(self, remote_client, copy_group_name, **kwargs):
+    def get_remote_copy_grp(self, remote_client, copy_group_name,
+                            is_secondary=False, **kwargs):
         url = '%(url)s/remote-mirror-copygroups/%(id)s' % {
             'url': self.object_url,
-            'id': self._remote_copygroup_id(remote_client, copy_group_name),
+            'id': self._remote_copygroup_id(remote_client, copy_group_name,
+                                            is_secondary),
         }
+        if remote_client is None:
+            # Secondary-side read. The object id becomes
+            # "NotSpecified,<cg>,<cg>S,NotSpecified" and no session on the
+            # peer is opened -- the same shape takeover_remote_copy_grp
+            # relies on, which is what lets it work with the primary gone.
+            # get_remote_copypair already branches this way.
+            return self._get_object(url, **kwargs)
         with RemoteSession(remote_client) as session:
             return self._get_object(url, remote_auth=session, **kwargs)
 
@@ -1108,6 +1133,17 @@ class RestApiClient():
             'id': self._remote_copypair_id(
                 None, copy_group_name, pvol_ldev_id, svol_ldev_id,
                 is_secondary=True),
+            'action': 'takeover',
+        } + '/invoke'
+        self._invoke(url, body=body, job_nowait=True)
+
+    @utils.synchronized_on_copy_group()
+    def takeover_remote_copy_grp(self, remote_client, copy_group_name):
+        body = {"parameters": {"mode": "forceSplit"}}
+        url = '%(url)s/remote-mirror-copygroups/%(id)s/actions/%(action)s' % {
+            'url': self.object_url,
+            'id': self._remote_copygroup_id(
+                None, copy_group_name, is_secondary=True),
             'action': 'takeover',
         } + '/invoke'
         self._invoke(url, body=body, job_nowait=True)
