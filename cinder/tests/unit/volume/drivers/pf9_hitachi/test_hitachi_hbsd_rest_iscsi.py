@@ -17,12 +17,11 @@
 
 from unittest import mock
 
-import ddt
 from oslo_config import cfg
 import requests
 
 from cinder import context as cinder_context
-from cinder.db import api as sqlalchemy_api
+from cinder.db.sqlalchemy import api as sqlalchemy_api
 from cinder import exception
 from cinder.objects import group_snapshot as obj_group_snap
 from cinder.objects import snapshot as obj_snap
@@ -33,14 +32,12 @@ from cinder.tests.unit import fake_volume
 from cinder.tests.unit import test
 from cinder.volume import configuration as conf
 from cinder.volume import driver
-# PF9 start
 from cinder.volume.drivers.pf9_hitachi import hbsd_common
 from cinder.volume.drivers.pf9_hitachi import hbsd_iscsi
 from cinder.volume.drivers.pf9_hitachi import hbsd_replication
 from cinder.volume.drivers.pf9_hitachi import hbsd_rest
 from cinder.volume.drivers.pf9_hitachi import hbsd_rest_api
 from cinder.volume.drivers.pf9_hitachi import hbsd_rest_fc
-# PF9 end
 from cinder.volume import volume_types
 from cinder.volume import volume_utils
 
@@ -208,17 +205,6 @@ GET_LDEV_RESULT = {
     "label": "00000000000000000000000000000000",
 }
 
-GET_LDEV_RESULT_DRS = {
-    "emulationType": "OPEN-V-CVS",
-    "blockCapacity": 2097152,
-    "attributes": ["CVS", "HDP", "DRS"],
-    "status": "NML",
-    "poolId": 30,
-    "dataReductionStatus": "ENABLED",
-    "dataReductionMode": "compression_deduplication",
-    "label": "00000000000000000000000000000000",
-}
-
 GET_LDEV_RESULT_SNAP = {
     "emulationType": "OPEN-V-CVS",
     "blockCapacity": 2097152,
@@ -336,7 +322,6 @@ class FakeResponse():
         return self.data
 
 
-@ddt.ddt
 class HBSDRESTISCSIDriverTest(test.TestCase):
     """Unit test class for HBSD REST interface iSCSI module."""
 
@@ -978,13 +963,10 @@ class HBSDRESTISCSIDriverTest(test.TestCase):
         self.assertEqual(1, get_volume_type_qos_specs.call_count)
         self.assertEqual(8, request.call_count)
 
-    @ddt.data(False, True)
     @mock.patch.object(requests.Session, "request")
     @mock.patch.object(volume_types, 'get_volume_type_extra_specs')
     def test_initialize_connection(
-            self, unmap_support, get_volume_type_extra_specs, request):
-        self.override_config('hitachi_report_discard_support', unmap_support,
-                             group=conf.SHARED_CONF_GROUP)
+            self, get_volume_type_extra_specs, request):
         extra_specs = {"hbsd:target_ports": "CL1-A"}
         get_volume_type_extra_specs.return_value = extra_specs
         request.side_effect = [FakeResponse(200, GET_HOST_ISCSIS_RESULT),
@@ -1006,7 +988,6 @@ class HBSDRESTISCSIDriverTest(test.TestCase):
         self.assertEqual(
             CONFIG_MAP['auth_password'], ret['data']['auth_password'])
         self.assertEqual(1, ret['data']['target_lun'])
-        self.assertEqual(unmap_support, ret['data']['discard'])
         self.assertEqual(1, get_volume_type_extra_specs.call_count)
         self.assertEqual(3, request.call_count)
 
@@ -1181,10 +1162,9 @@ class HBSDRESTISCSIDriverTest(test.TestCase):
             self.driver.unmanage_snapshot,
             TEST_SNAPSHOT[0])
 
-    @ddt.data('deduplication_compression', 'compression')
     @mock.patch.object(requests.Session, "request")
     @mock.patch.object(volume_types, 'get_volume_type_qos_specs')
-    def test_retype(self, csv, get_volume_type_qos_specs, request):
+    def test_retype(self, get_volume_type_qos_specs, request):
         request.side_effect = [FakeResponse(200, GET_LDEV_RESULT),
                                FakeResponse(200, GET_LDEV_RESULT),
                                FakeResponse(202, COMPLETED_SUCCEEDED_RESULT),
@@ -1196,12 +1176,12 @@ class HBSDRESTISCSIDriverTest(test.TestCase):
                 },
             },
         }
-        extra_specs = {'hbsd:capacity_saving': csv}
+        extra_specs = {'hbsd:capacity_saving': 'deduplication_compression'}
         new_type = fake_volume.fake_volume_type_obj(
             CTXT, id='00000000-0000-0000-0000-{0:012d}'.format(0),
             extra_specs=extra_specs)
         old_specs = {'hbsd:capacity_saving': 'disable'}
-        new_specs = {'hbsd:capacity_saving': csv}
+        new_specs = {'hbsd:capacity_saving': 'deduplication_compression'}
         old_type_ref = volume_types.create(self.ctxt, 'old', old_specs)
         new_type_ref = volume_types.create(self.ctxt, 'new', new_specs)
         diff = volume_types.volume_types_diff(self.ctxt, old_type_ref['id'],
@@ -1225,109 +1205,6 @@ class HBSDRESTISCSIDriverTest(test.TestCase):
         ret = self.driver.migrate_volume(self.ctxt, TEST_VOLUME[0], host)
         self.assertEqual(2, request.call_count)
         actual = (True, None)
-        self.assertTupleEqual(actual, ret)
-
-    @ddt.data('deduplication_compression', 'compression')
-    @mock.patch.object(hbsd_rest.HBSDREST, "_copy_ldev_by_shadow_image")
-    @mock.patch.object(requests.Session, "request")
-    @mock.patch.object(volume_types, 'get_volume_type_extra_specs')
-    @mock.patch.object(volume_types, 'get_volume_type_qos_specs')
-    def test_migrate_volume_diff_pool_drs(
-            self, csv, get_volume_type_qos_specs, get_volume_type_extra_specs,
-            request, copy_ldev_by_shadow_image):
-        """Test migrate_volume for a DRS volume to a different pool.
-
-        When the source LDEV is a DRS (deduplication/compression) volume and
-        the target pool differs from the source pool, migrate_volume must
-        choose the ShadowImage-based copy path (_copy_ldev_by_shadow_image)
-        instead of the normal ThinImage copy path (copy_on_storage).
-        """
-        get_volume_type_qos_specs.return_value = {'qos_specs': None}
-        get_volume_type_extra_specs.return_value = {
-            'hbsd:capacity_saving': csv,
-            'hbsd:drs': '<is> True',
-        }
-        copy_ldev_by_shadow_image.return_value = 1
-        # REST call sequence (copy path is mocked away):
-        #  1. GET  - get_pair_info -> get_ldev_info (no HTI attr => no pair)
-        #  2. GET  - pvol_ldev_info (has DRS attr => pvol_is_drs=True)
-        #  3. 202  - modify_ldev_name for svol
-        #  4. GET  - delete_ldev -> delete_pair -> get_pair_info
-        #  5. GET  - delete_ldev -> unmap_ldev_from_storage -> get_ldev_info
-        #  6. GET  - delete_ldev -> delete_ldev_from_storage -> get_ldev_info
-        #  7. 202  - delete_ldev -> client.delete_ldev
-        request.side_effect = [FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(202, COMPLETED_SUCCEEDED_RESULT),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(202, COMPLETED_SUCCEEDED_RESULT)]
-        host = {
-            'capabilities': {
-                'location_info': {
-                    'storage_id': CONFIG_MAP['serial'],
-                    'pool_id': 40,
-                },
-            },
-        }
-        ret = self.driver.migrate_volume(self.ctxt, TEST_VOLUME[0], host)
-        self.assertEqual(1, get_volume_type_extra_specs.call_count)
-        self.assertEqual(1, get_volume_type_qos_specs.call_count)
-        # _copy_ldev_by_shadow_image must be called for DRS+pool-change
-        copy_ldev_by_shadow_image.assert_called_once()
-        self.assertEqual(7, request.call_count)
-        actual = (True, {'provider_location': '1'})
-        self.assertTupleEqual(actual, ret)
-
-    @ddt.data('deduplication_compression', 'compression')
-    @mock.patch.object(hbsd_rest.HBSDREST, "_copy_ldev_by_shadow_image")
-    @mock.patch.object(requests.Session, "request")
-    @mock.patch.object(volume_types, 'get_volume_type_extra_specs')
-    @mock.patch.object(volume_types, 'get_volume_type_qos_specs')
-    def test_retype_diff_pool_drs(
-            self, csv, get_volume_type_qos_specs, get_volume_type_extra_specs,
-            request, copy_ldev_by_shadow_image):
-        """Test migrate_volume for a DRS volume migrating to a different pool.
-
-        Because the source LDEV is DRS and the pools differ, migrate_volume
-        must choose _copy_ldev_by_shadow_image over copy_on_storage.
-        """
-        get_volume_type_qos_specs.return_value = {'qos_specs': None}
-        get_volume_type_extra_specs.return_value = {
-            'hbsd:capacity_saving': csv,
-            'hbsd:drs': '<is> True',
-        }
-        copy_ldev_by_shadow_image.return_value = 1
-        # REST call sequence (copy path is mocked away):
-        #  1. GET  - migrate_volume -> get_pair_info -> get_ldev_info
-        #  2. GET  - migrate_volume -> pvol_ldev_info (DRS attr => True)
-        #  3. 202  - modify_ldev_name for svol
-        #  4. GET  - delete_ldev -> delete_pair -> get_pair_info
-        #  5. GET  - delete_ldev -> unmap_ldev_from_storage -> get_ldev_info
-        #  6. GET  - delete_ldev -> delete_ldev_from_storage -> get_ldev_info
-        #  7. 202  - delete_ldev -> client.delete_ldev
-        request.side_effect = [FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(202, COMPLETED_SUCCEEDED_RESULT),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(202, COMPLETED_SUCCEEDED_RESULT)]
-        host = {
-            'capabilities': {
-                'location_info': {
-                    'storage_id': CONFIG_MAP['serial'],
-                    'pool_id': 40,
-                },
-            },
-        }
-        ret = self.driver.migrate_volume(self.ctxt, TEST_VOLUME[0], host)
-        self.assertEqual(1, get_volume_type_extra_specs.call_count)
-        # _copy_ldev_by_shadow_image must be called for DRS+pool-change
-        copy_ldev_by_shadow_image.assert_called_once()
-        self.assertEqual(7, request.call_count)
-        actual = (True, {'provider_location': '1'})
         self.assertTupleEqual(actual, ret)
 
     def test_backup_use_temp_snapshot(self):

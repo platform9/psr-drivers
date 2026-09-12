@@ -329,7 +329,10 @@ class HBSDISCSIDriver(driver.ISCSIDriver):
                 group, add_volumes, remove_volumes)
         except Exception:
             with excutils.save_and_reraise_exception():
-                for remove_volume in remove_volumes:
+                # 'or []': Cinder passes None for a pure add, and iterating
+                # that raised TypeError from inside the re-raise, masking
+                # the real exception.
+                for remove_volume in remove_volumes or []:
                     utils.cleanup_cg_in_volume(remove_volume)
 
     @volume_utils.trace

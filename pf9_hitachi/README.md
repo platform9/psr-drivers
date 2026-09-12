@@ -2,10 +2,32 @@
 
 Hitachi custom driver implementing 8 missing Cinder gaps for disaster recovery replication.
 
-> **Status:** H1-H8 are implemented and unit tested (71 tests,
-> `cinder/tests/unit/volume/drivers/pf9_hitachi/test_hitachi_hbsd_replication.py`).
-> The other test modules in that directory are upstream-derived and cover the
-> base driver.
+> **Status:** H1-H8 are implemented, and the whole suite passes: **386
+> tests across six modules.**
+>
+> `test_hitachi_hbsd_replication.py` (103 tests) covers the PF9 additions.
+> The other five modules are upstream's own tests for the base driver,
+> back-ported from the exact commit this driver was forked from --
+> `openstack/cinder` **`f830ca517`** ("Replace eventlet sleep calls in volume
+> drivers", 2026-06-10), where six of the nine vendored files are still
+> byte-identical. Three of their assertions are annotated where PF9 changed
+> the behaviour deliberately.
+>
+> **Run them against a cinder checkout at that commit**, not against master.
+> Master is 221 commits ahead and has moved `cinder.db.sqlalchemy`, so the
+> tests fail on framework drift that has nothing to do with this driver:
+>
+> ```bash
+> git -C <cinder> worktree add --detach /tmp/cinder-fork f830ca517
+> cp -r cinder/volume/drivers/pf9_hitachi /tmp/cinder-fork/cinder/volume/drivers/
+> cp -r cinder/tests/unit/volume/drivers/pf9_hitachi \
+>       /tmp/cinder-fork/cinder/tests/unit/volume/drivers/
+> cd /tmp/cinder-fork && python -m unittest \
+>   cinder.tests.unit.volume.drivers.pf9_hitachi.test_hitachi_hbsd_replication
+> ```
+>
+> On macOS, shim `socket.TCP_KEEPIDLE`/`TCP_KEEPCNT`/`TCP_KEEPINTVL` first --
+> the driver sets Linux-only socket options, as upstream does.
 
 ---
 
@@ -47,17 +69,67 @@ Beyond the 8 core gaps:
 
 | Feature | Purpose |
 |---------|---------|
-| **Pair state and RPO in the pool capabilities** | With `hitachi_replication_report_pair_status` (default `true`), each pool carries `pf9_group_replication_pairs` — a JSON map of copy group → `{pair_status, consistency_time, journal_usage_rate, pair_count}` — plus `..._updated_at`, `..._peer_initialized` and `..._enumerated`. Read it with `GET /v3/scheduler-stats/get_pools?detail=True`. Cinder exposes replication lag and vendor pair state through no other API. Costs one Configuration Manager request per copy group per statistics cycle (60s by default), capped at 64 groups. |
-| **LDEV ids in volume metadata** | `psr_pvol_id`, `psr_svol_id` and `psr_copy_group` are stamped on each member, because `provider_location` appears in no Cinder API view and this driver sets no `provider_id`. |
+| **Pair state and RPO in the pool capabilities** | With `hitachi_replication_report_pair_status` (default `true`), each pool carries `group_replication_pairs` — a JSON map of copy group → `{pair_status, consistency_time, journal_usage_rate, pair_count}` — plus `..._updated_at`, `..._peer_initialized` and `..._enumerated`. Read it with `GET /v3/scheduler-stats/get_pools?detail=True`. Cinder exposes replication lag and vendor pair state through no other API. Costs one Configuration Manager request per copy group per statistics cycle (60s by default), capped at 64 groups. |
+| **LDEV ids in volume metadata** | `hbsd_pvol_id`, `hbsd_svol_id` and `hbsd_copy_group` are stamped on each member, because `provider_location` appears in no Cinder API view and this driver sets no `provider_id`. |
 | **Selectable failover mode** | `secondary_backend_id` accepts a `:graceful` or `:emergency` suffix; a group type may set `hbsd:group_replication_failover_mode`. See [Failover mode](#failover-mode). |
 | **Recovery-site adoption** | A backend set to `hitachi_replication_role = target` adopts promoted S-VOLs instead of creating them: `manage_existing` accepts an LDEV whose copy pair still exists, `enable_replication` records the existing pairs without touching the array, and the takeover is issued to the local storage system rather than the peer. See [Recovery-site backends](#recovery-site-backends). |
-| **Explicit copy-group binding** | A Cinder group can be bound to a named array copy group through its members' `psr_copy_group` metadata, instead of deriving the name from the Cinder group id. Required at a recovery site, where the group has a different id. |
+| **Replication by group membership** | `hitachi_replication_group_only` (default **`true`**, unlike upstream) stops a replication-enabled volume type from pairing every volume it creates, leaving the pair to be made when the volume joins a group. See [One spec, two readings](#one-spec-two-readings). |
+| **Explicit copy-group binding** | A Cinder group can be bound to a named array copy group through its members' `hbsd_copy_group` metadata, instead of deriving the name from the Cinder group id. Required at a recovery site, where the group has a different id. |
 | **Restart instead of rebuild** | `enable_replication` on a copy group that still exists resyncs the suspended pairs (non-swap) rather than allocating fresh S-VOLs. |
+| **Pairs are confirmed, not assumed** | Pairs are created with `Job-Mode-Wait-Configuration-Change: NoWait`, so the create job completes as soon as the array accepts the command. `enable_replication` and `update_group` therefore create every pair first, then poll each to `PAIR` before reporting `enabled`. A member whose pair never arrives is reported `error`; its LDEVs are left alone, because a slow initial copy and a dead one look identical from here. |
+| **Secondary volumes are freed on disable** | `disable_replication`, and removing a member with `update_group`, delete the pair *and* the S-VOL, and drop `sldev` from `provider_location`. The driver created that S-VOL; once the pair is gone Cinder holds no record of it, so leaving it leaks an LDEV on the secondary array permanently. Re-enabling allocates a fresh S-VOL and does a full initial copy either way, because the pair is gone. |
 | `manage_existing_get_size()` | Size of an existing LDEV, for import validation. |
+
+**Deployment note.** `hitachi_replication_report_pair_status` is on by
+default and costs `1 + N` Configuration Manager requests every statistics
+cycle (60s), each copy-group read opening its own session on the peer -- up
+to 65 remote sessions a minute at the 64-group cap. Nothing in PSR reads
+`group_replication_pairs` today. Set it to `false` unless something is
+consuming it.
 
 There is **no** `get_replication_lag()`. Cinder defines no such driver
 contract, so a driver method would be unreachable; the pool capabilities
 above are the working substitute.
+
+---
+
+## One spec, two readings
+
+Cinder will not run a group replication action unless every volume type in the
+group sets `replication_enabled='<is> True'` -- `GroupAPI._check_type` refuses
+it. This driver reads that same spec at volume-create time as an instruction to
+build a per-volume replication pair immediately.
+
+Both readings are defensible; they cannot both apply at once. Where volumes are
+created first and protected later -- which is what a DR orchestrator adopting
+existing VMs does -- the volume is already the P-VOL of a pair by the time it
+reaches a protection group, and the group's pair would be a second one on the
+same P-VOL asking for the same mirror unit (`hitachi_replication_mun`,
+default 1). The storage system refuses that, and the error names neither the
+cause nor a remedy.
+
+There is no conversion: no operation moves a pair between copy groups, and
+deleting a pair discards its delta bitmap, so unpairing and repairing costs a
+full initial copy and an unprotected window. The driver will not do that to you
+silently. Instead:
+
+- **`hitachi_replication_group_only = true`** -- **the default here**, and the
+  setting PSR needs. Volumes are created unpaired and the group creates the
+  only pair.
+- **Set it `false`** to restore upstream's behaviour: volumes pair at create
+  time. Adding an already-paired volume to a group is then refused with a
+  message naming both options, rather than failing at the array.
+
+> **This default differs from the upstream Hitachi driver, deliberately.**
+> With it enabled a replication-enabled volume type does **not** replicate a
+> volume until that volume joins a replication group. On a backend where
+> volume-level replication is driven directly rather than through PSR, set it
+> to `false` -- otherwise volumes an operator believes are replicated will not
+> be. The driver logs which reading is in force at startup, at WARNING when
+> group-only is on.
+
+Volumes that are *already* double-paired predate either setting. Freeing them
+means deleting the per-volume pair by hand, knowing it costs a full resync.
 
 ---
 
@@ -80,12 +152,15 @@ backend owns the group object, and a recovery site owns nothing until it has
 adopted something, so it has to be told.
 
 **Why the binding is needed.** The array copy-group name is normally derived
-from the Cinder group id, keeping 25 of its 32 hex characters. A group created
+from the Cinder group id, keeping 23 of its 32 hex characters (28 characters
+less the 5-character `HBSD-` prefix; 28 rather than the copy group limit of 29
+because `create_journals` labels the journal LDEV `<copy group name>-JNL` and a
+label is capped at 32). A group created
 at the recovery site has a different id — and the derivation is not reversible
 — so it would name a copy group the storage system has never heard of. Bind
 the group explicitly instead, in precedence order:
 
-1. **Members' `psr_copy_group` metadata** — the intended channel.
+1. **Members' `hbsd_copy_group` metadata** — the intended channel.
    `POST /manageable_volumes` accepts a `metadata` dict, and Cinder puts it on
    the volume before the driver sees it, so the binding arrives on the same
    call that adopts the S-VOL.
@@ -101,7 +176,7 @@ manageability check still requires the LDEV to have no LUN paths, because
 Cinder owns the export from the adopt onward.
 
 1. `POST /manageable_volumes` per S-VOL, with `metadata:
-   {"psr_copy_group": "<copy group>"}` and a replication-enabled volume type.
+   {"hbsd_copy_group": "<copy group>"}` and a replication-enabled volume type.
 2. `POST /groups` with a group-replication group type.
 3. `PUT /groups/{id}` to add the members.
 4. `POST /groups/{id}/action {"enable_replication": {}}` — records the
@@ -170,7 +245,10 @@ path.
 **Benefits:**
 - No new driver classes, so no new third-party CI is required upstream
 - Non-replicated volumes keep upstream's validated behaviour
-- All PF9 additions are bracketed by `# PF9 Start` / `# PF9 End` markers
+- Only the added imports are bracketed by `# PF9 Start` / `# PF9 End`
+  markers. The behavioural changes are not marked; find them by diffing
+  against the pristine upstream import (`git diff 4715527..HEAD --
+  cinder/volume/drivers/pf9_hitachi`)
 
 ---
 

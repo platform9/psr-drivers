@@ -873,6 +873,27 @@ class HBSDMsg(enum.Enum):
                '%(volume)s, copy group: %(copy_group)s)',
         'suffix': ERROR_SUFFIX,
     }
+    GROUP_REPLICATION_PAIR_WRONG_STATE = {
+        'msg_id': 788,
+        'loglevel': base_logging.ERROR,
+        'msg': 'The copy pair is in a state that enabling replication '
+               'cannot act on. A pair reported as SSWS is failed over, and '
+               'returning it belongs to failover_replication with the '
+               'failback target. (volume: %(volume)s, copy group: '
+               '%(copy_group)s, pair status: %(status)s)',
+        'suffix': ERROR_SUFFIX,
+    }
+    GROUP_REPLICATION_ALREADY_PAIRED = {
+        'msg_id': 787,
+        'loglevel': base_logging.ERROR,
+        'msg': 'The volume is already a primary volume of a replication '
+               'pair, so a second pair cannot be created for the group: the '
+               'storage system allows one pair per mirror unit. Create '
+               'volumes unpaired by setting '
+               'hitachi_replication_group_only, or delete the existing pair '
+               'first. (volume: %(volume)s, LDEV: %(ldev)s)',
+        'suffix': ERROR_SUFFIX,
+    }
     GROUP_REPLICATION_PAIR_DELETE_FAILED = {
         'msg_id': 786,
         'loglevel': base_logging.ERROR,

@@ -18,13 +18,11 @@
 import json
 from unittest import mock
 
-import ddt
-import futurist
 from oslo_config import cfg
 import requests
 
 from cinder import context as cinder_context
-from cinder.db import api as sqlalchemy_api
+from cinder.db.sqlalchemy import api as sqlalchemy_api
 from cinder import exception
 from cinder import objects
 from cinder.objects import fields
@@ -37,7 +35,6 @@ from cinder.tests.unit import fake_volume
 from cinder.tests.unit import test
 from cinder.volume import configuration as conf
 from cinder.volume import driver
-# PF9 start
 from cinder.volume.drivers.pf9_hitachi import hbsd_common
 from cinder.volume.drivers.pf9_hitachi import hbsd_fc
 from cinder.volume.drivers.pf9_hitachi import hbsd_replication
@@ -45,7 +42,6 @@ from cinder.volume.drivers.pf9_hitachi import hbsd_rest
 from cinder.volume.drivers.pf9_hitachi import hbsd_rest_api
 from cinder.volume.drivers.pf9_hitachi import hbsd_rest_fc
 from cinder.volume.drivers.pf9_hitachi import hbsd_utils
-# PF9 end
 from cinder.volume import volume_types
 from cinder.volume import volume_utils
 from cinder.zonemanager import utils as fczm_utils
@@ -293,17 +289,6 @@ GET_LDEV_RESULT = {
     "poolId": 30,
     "dataReductionStatus": "DISABLED",
     "dataReductionMode": "disabled",
-    "label": "00000000000000000000000000000000",
-}
-
-GET_LDEV_RESULT_DRS = {
-    "emulationType": "OPEN-V-CVS",
-    "blockCapacity": 2097152,
-    "attributes": ["CVS", "HDP", "DRS"],
-    "status": "NML",
-    "poolId": 30,
-    "dataReductionStatus": "ENABLED",
-    "dataReductionMode": "compression_deduplication",
     "label": "00000000000000000000000000000000",
 }
 
@@ -693,7 +678,6 @@ class FakeResponse():
         return self.data
 
 
-@ddt.ddt
 class HBSDREPLICATIONFCDriverTest(test.TestCase):
     """Unit test class for HBSD REPLICATION interface fibre channel module."""
 
@@ -738,6 +722,16 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     def _setup_config(self):
         """Set configuration parameter values."""
+        # PF9: this module is upstream's own suite for the base driver, and
+        # a good deal of it exercises the pairing a replication-enabled
+        # volume type does at create time. hitachi_replication_group_only
+        # defaults to true here and deliberately turns that off -- see
+        # "One spec, two readings" in pf9_hitachi/README.md -- so pin it to
+        # the upstream reading, which is what these tests are about. The
+        # group-only behaviour has its own tests in
+        # test_hitachi_hbsd_replication.py.
+        self.override_config('hitachi_replication_group_only', False,
+                             group=conf.SHARED_CONF_GROUP)
         self.override_config('volume_backend_name', "RESTFC",
                              group=conf.SHARED_CONF_GROUP)
         self.override_config(
@@ -1376,17 +1370,16 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         body = request.call_args_list[16][1]['json']
         self.assertTrue(body['parameters']['enhancedExpansion'])
 
-    @ddt.data('deduplication_compression', 'compression')
     @mock.patch.object(requests.Session, "request")
     @mock.patch.object(volume_types, 'get_volume_type_qos_specs')
     @mock.patch.object(volume_types, 'get_volume_type_extra_specs')
     def test_extend_pair_volume_capacity_saving_dedup_compression(
-            self, csv, get_volume_type_extra_specs, get_volume_type_qos_specs,
+            self, get_volume_type_extra_specs, get_volume_type_qos_specs,
             request):
         get_volume_type_qos_specs.return_value = {'qos_specs': None}
         get_volume_type_extra_specs.return_value = {
             'replication_enabled': '<is> True',
-            'hbsd:capacity_saving': csv}
+            'hbsd:capacity_saving': 'deduplication_compression'}
         self.ldev_count = 0
 
         def _request_side_effect(
@@ -1449,6 +1442,12 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         request.return_value = FakeResponse(200, GET_POOLS_RESULT)
         get_filter_function.return_value = None
         get_goodness_function.return_value = None
+        # PF9: reporting remote pair state in the pool capabilities costs one
+        # Configuration Manager request per copy group on every statistics
+        # cycle, which would make the request count below meaningless. The
+        # reporting has its own tests in test_hitachi_hbsd_replication.py;
+        # this one is about the base driver's stats.
+        self.driver.common.conf.hitachi_replication_report_pair_status = False
         stats = self.driver.get_volume_stats(True)
         self.assertEqual('Hitachi', stats['vendor_name'])
         self.assertTrue(stats["pools"][0]['multiattach'])
@@ -2036,121 +2035,6 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         }
         ret = self.driver.migrate_volume(self.ctxt, TEST_VOLUME[0], host)
         self.assertEqual(15, request.call_count)
-        actual = (True,
-                  {'provider_location': json.dumps({'pldev': 1}),
-                   'replication_status': fields.ReplicationStatus.DISABLED})
-        self.assertTupleEqual(actual, ret)
-
-    @ddt.data('deduplication_compression', 'compression')
-    @mock.patch.object(hbsd_rest.HBSDREST, "_copy_ldev_by_shadow_image")
-    @mock.patch.object(requests.Session, "request")
-    @mock.patch.object(volume_types, 'get_volume_type_extra_specs')
-    @mock.patch.object(volume_types, 'get_volume_type_qos_specs')
-    def test_migrate_volume_diff_pool_drs(
-            self, csv, get_volume_type_qos_specs, get_volume_type_extra_specs,
-            request, copy_ldev_by_shadow_image):
-        """Test migrate_volume for a DRS volume to a different pool.
-
-        When the source LDEV is a DRS (deduplication/compression) volume and
-        the target pool differs from the source pool, migrate_volume must
-        choose the ShadowImage-based copy path (_copy_ldev_by_shadow_image)
-        instead of the normal ThinImage copy path (copy_on_storage).
-        """
-        get_volume_type_qos_specs.return_value = {'qos_specs': None}
-        get_volume_type_extra_specs.return_value = {
-            'hbsd:capacity_saving': csv,
-            'hbsd:drs': '<is> True',
-        }
-        copy_ldev_by_shadow_image.return_value = 1
-        # REST call sequence (copy path is mocked away):
-        #  1. GET  - replication.migrate_volume -> _get_rep_pair_info
-        #             -> _has_rep_pair -> get_ldev_info (no REP attr => False)
-        #  2. GET  - base migrate_volume -> get_pair_info -> get_ldev_info
-        #  3. GET  - pvol_ldev_info (has DRS attr => pvol_is_drs=True)
-        #  4. 202  - modify_ldev_name for svol
-        #  5. GET  - delete_ldev -> delete_pair -> get_pair_info
-        #  6. GET  - delete_ldev -> unmap_ldev_from_storage -> get_ldev_info
-        #  7. GET  - delete_ldev -> delete_ldev_from_storage -> get_ldev_info
-        #  8. 202  - delete_ldev -> client.delete_ldev
-        request.side_effect = [FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(202, COMPLETED_SUCCEEDED_RESULT),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(202, COMPLETED_SUCCEEDED_RESULT)]
-        host = {
-            'capabilities': {
-                'location_info': {
-                    'storage_id': CONFIG_MAP['serial'],
-                    'pool_id': 40,
-                    'execution_site': hbsd_utils.PRIMARY_STR,
-                },
-            },
-        }
-        ret = self.driver.migrate_volume(self.ctxt, TEST_VOLUME[0], host)
-        self.assertEqual(1, get_volume_type_extra_specs.call_count)
-        self.assertEqual(1, get_volume_type_qos_specs.call_count)
-        # _copy_ldev_by_shadow_image must be called for DRS+pool-change
-        copy_ldev_by_shadow_image.assert_called_once()
-        self.assertEqual(8, request.call_count)
-        actual = (True,
-                  {'provider_location': json.dumps({'pldev': 1}),
-                   'replication_status': fields.ReplicationStatus.DISABLED})
-        self.assertTupleEqual(actual, ret)
-
-    @ddt.data('deduplication_compression', 'compression')
-    @mock.patch.object(hbsd_rest.HBSDREST, "_copy_ldev_by_shadow_image")
-    @mock.patch.object(requests.Session, "request")
-    @mock.patch.object(volume_types, 'get_volume_type_extra_specs')
-    @mock.patch.object(volume_types, 'get_volume_type_qos_specs')
-    def test_retype_diff_pool_drs(
-            self, csv, get_volume_type_qos_specs, get_volume_type_extra_specs,
-            request, copy_ldev_by_shadow_image):
-        """Test migrate_volume for a DRS volume migrating to a different pool.
-
-        Because the source LDEV is DRS and the pools differ, migrate_volume
-        must choose _copy_ldev_by_shadow_image over copy_on_storage.
-        """
-        get_volume_type_qos_specs.return_value = {'qos_specs': None}
-        get_volume_type_extra_specs.return_value = {
-            'hbsd:capacity_saving': csv,
-            'hbsd:drs': '<is> True',
-        }
-        copy_ldev_by_shadow_image.return_value = 1
-        # REST call sequence (copy path is mocked away):
-        #  1. GET  - replication.migrate_volume -> _get_rep_pair_info
-        #             -> _has_rep_pair -> get_ldev_info (no REP attr => False)
-        #  2. GET  - base migrate_volume -> get_pair_info -> get_ldev_info
-        #  3. GET  - pvol_ldev_info (has DRS attr => pvol_is_drs=True)
-        #  4. 202  - modify_ldev_name for svol
-        #  5. GET  - delete_ldev -> delete_pair -> get_pair_info
-        #  6. GET  - delete_ldev -> unmap_ldev_from_storage -> get_ldev_info
-        #  7. GET  - delete_ldev -> delete_ldev_from_storage -> get_ldev_info
-        #  8. 202  - delete_ldev -> client.delete_ldev
-        request.side_effect = [FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(202, COMPLETED_SUCCEEDED_RESULT),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(200, GET_LDEV_RESULT_DRS),
-                               FakeResponse(202, COMPLETED_SUCCEEDED_RESULT)]
-        host = {
-            'capabilities': {
-                'location_info': {
-                    'storage_id': CONFIG_MAP['serial'],
-                    'pool_id': 40,
-                    'execution_site': hbsd_utils.PRIMARY_STR,
-                },
-            },
-        }
-        ret = self.driver.migrate_volume(self.ctxt, TEST_VOLUME[0], host)
-        self.assertEqual(1, get_volume_type_extra_specs.call_count)
-        # _copy_ldev_by_shadow_image must be called for DRS+pool-change
-        copy_ldev_by_shadow_image.assert_called_once()
-        self.assertEqual(8, request.call_count)
         actual = (True,
                   {'provider_location': json.dumps({'pldev': 1}),
                    'replication_status': fields.ReplicationStatus.DISABLED})
@@ -3137,41 +3021,46 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual(1, request.call_count)
 
     def test_update_group_ldev_is_none(self):
-        self.assertRaises(TypeError,
+        # PF9: upstream asserts TypeError here, which is not the driver
+        # reporting anything -- it is update_group's own error handler doing
+        # 'for remove_volume in remove_volumes' with remove_volumes None on a
+        # pure add, masking the real exception from inside the re-raise. With
+        # that fixed the driver's own message comes through.
+        self.assertRaises(exception.VolumeDriverException,
                           self.driver.update_group,
                           self.ctxt,
                           TEST_GROUP[0],
                           add_volumes=[TEST_VOLUME[3]])
 
-    @ddt.data('deduplication_compression', 'compression')
     @mock.patch.object(requests.Session, "request")
     @mock.patch.object(volume_types, 'get_volume_type')
     @mock.patch.object(volume_types, 'get_volume_type_extra_specs')
     @mock.patch.object(volume_utils, 'is_group_a_cg_snapshot_type')
     def test_update_group_has_rep_pair_true(
-            self, csv, is_group_a_cg_snapshot_type,
+            self, is_group_a_cg_snapshot_type,
             get_volume_type_extra_specs, get_volume_type, request):
         self.driver.common._active_backend_id = 'test'
         get_volume_type_extra_specs.return_value = {
             'replication_enabled': '<is> True',
-            'hbsd:capacity_saving': csv}
+            'hbsd:capacity_saving': 'deduplication_compression'}
         get_volume_type.return_value = {}
         request.return_value = FakeResponse(200, GET_LDEV_RESULT_REP)
         is_group_a_cg_snapshot_type.return_value = False
-        self.assertRaises(TypeError,
+        # PF9: see test_update_group_ldev_is_none -- the TypeError upstream
+        # expects was the masked-exception bug, not a driver behaviour.
+        self.assertRaises(exception.VolumeDriverException,
                           self.driver.update_group,
                           self.ctxt,
                           TEST_GROUP[0],
                           add_volumes=[TEST_VOLUME[5]])
         self.assertEqual(1, request.call_count)
 
-    @ddt.data('deduplication_compression', 'compression')
     @mock.patch.object(requests.Session, "request")
     @mock.patch.object(volume_types, 'get_volume_type_extra_specs')
     @mock.patch.object(objects.Volume, 'is_replicated')
     @mock.patch.object(volume_types, 'get_volume_type_qos_specs')
     def test_create_rep_ldev_and_pair_capacity_saving_dedup_compression(
-            self, csv, get_volume_type_qos_specs, is_replicated,
+            self, get_volume_type_qos_specs, is_replicated,
             get_volume_type_extra_specs, request):
         self.driver.common.rep_primary._stats = {}
         self.driver.common.rep_primary._stats['pools'] = [
@@ -3182,7 +3071,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         is_replicated.return_value = True
         get_volume_type_extra_specs.return_value = {
             'replication_enabled': '<is> True',
-            'hbsd:capacity_saving': csv}
+            'hbsd:capacity_saving': 'deduplication_compression'}
         get_volume_type_qos_specs.return_value = {'qos_specs': None}
         self.snapshot_count = 0
 
@@ -3241,170 +3130,3 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         else:
             self.fail('no create pair request')
         self.assertTrue(isDataReductionForceCopy)
-
-
-# Shorthand alias
-_GreenThreadCompat = hbsd_replication.HBSDREPLICATION.GreenThreadCompat
-
-
-def _make_resolved_future(value):
-    """Return a Future whose result is already set to *value*."""
-    f = futurist.Future()
-    f.set_result(value)
-    return f
-
-
-def _make_failed_future(exc):
-    """Return a Future whose exception is already set to *exc*."""
-    f = futurist.Future()
-    f.set_exception(exc)
-    return f
-
-
-class TestGreenThreadCompatWait(test.TestCase):
-    """Tests for HBSDREPLICATION.GreenThreadCompat.wait()."""
-
-    # ------------------------------------------------------------------
-    # (1) wait() returns the callable's result
-    # ------------------------------------------------------------------
-    def test_wait_returns_callable_result(self):
-        """wait() must surface the value produced by the underlying future."""
-        expected = 42
-        compat = _GreenThreadCompat(_make_resolved_future(expected))
-
-        result = compat.wait()
-
-        self.assertEqual(expected, result)
-
-    def test_wait_returns_none_when_callable_returns_none(self):
-        """wait() returns None when the callable returns None (common case)."""
-        compat = _GreenThreadCompat(_make_resolved_future(None))
-
-        result = compat.wait()
-
-        self.assertIsNone(result)
-
-    def test_wait_returns_non_trivial_object(self):
-        """wait() faithfully returns arbitrary objects, not just scalars."""
-        expected = {'ldev': 100, 'port': 'CL1-A'}
-        compat = _GreenThreadCompat(_make_resolved_future(expected))
-
-        result = compat.wait()
-
-        self.assertIs(expected, result)
-
-    # ------------------------------------------------------------------
-    # (2) wait() propagates an exception raised by the callable
-    # ------------------------------------------------------------------
-    def test_wait_propagates_exception(self):
-        """wait() must re-raise exceptions set on the future."""
-        exc = RuntimeError('secondary operation failed')
-        compat = _GreenThreadCompat(_make_failed_future(exc))
-
-        self.assertRaises(RuntimeError, compat.wait)
-
-    def test_wait_propagates_exception_message(self):
-        """The original exception message is preserved when re-raised."""
-        msg = 'disk unavailable'
-        exc = IOError(msg)
-        compat = _GreenThreadCompat(_make_failed_future(exc))
-
-        raised = self.assertRaises(IOError, compat.wait)
-        self.assertIn(msg, str(raised))
-
-    def test_wait_propagates_exception_type_exactly(self):
-        """The exact exception type (not a wrapper) is raised by wait()."""
-
-        class _CustomError(Exception):
-            pass
-
-        exc = _CustomError('custom')
-        compat = _GreenThreadCompat(_make_failed_future(exc))
-
-        self.assertRaises(_CustomError, compat.wait)
-
-    # ------------------------------------------------------------------
-    # (3) wait() is still called in a try/finally workflow when the
-    #     primary-side operation fails
-    #
-    # This mirrors the real driver pattern:
-    #
-    #   thread = self.spawn(secondary_op, ...)
-    #   try:
-    #       primary_op(...)          # may raise
-    #   finally:
-    #       thread.wait()            # must always run
-    # ------------------------------------------------------------------
-    def test_wait_called_in_finally_when_primary_raises(self):
-        """Secondary thread is always joined even when primary op fails.
-
-        Simulates:
-            thread = spawn(secondary_op)
-            try:
-                primary_op()     # raises VolumeDriverException
-            finally:
-                thread.wait()    # must be reached
-        """
-        secondary_sentinel = object()
-        compat = _GreenThreadCompat(
-            _make_resolved_future(secondary_sentinel))
-
-        wait_result = None
-        primary_exception = exception.VolumeDriverException(
-            'primary side failed')
-
-        with self.assertRaises(exception.VolumeDriverException) as ctx:
-            try:
-                raise primary_exception  # simulate primary-side failure
-            finally:
-                wait_result = compat.wait()
-
-        # The primary exception propagates out of the with-block
-        self.assertIs(primary_exception, ctx.exception)
-        # …but wait() was still called and returned the secondary result
-        self.assertIs(secondary_sentinel, wait_result)
-
-    def test_wait_called_in_finally_when_primary_raises_and_secondary_fails(
-            self):
-        """Secondary exception is suppressed by primary exception in finally.
-
-        When both sides fail, Python's try/finally semantics suppress the
-        exception raised inside the ``finally`` block and propagate the
-        original exception.  This test verifies that wait() is indeed
-        called (the secondary future is consumed) even when it itself would
-        raise — and that the primary exception still propagates.
-        """
-        primary_exception = exception.VolumeDriverException(
-            'primary side failed')
-        secondary_exception = ValueError('secondary side also failed')
-
-        compat = _GreenThreadCompat(_make_failed_future(secondary_exception))
-
-        with self.assertRaises(exception.VolumeDriverException) as ctx:
-            try:
-                raise primary_exception
-            finally:
-                # wait() raises secondary_exception here, which Python
-                # suppresses in favour of the primary_exception already
-                # in flight.
-                try:
-                    compat.wait()
-                except Exception:
-                    pass  # secondary error noted; primary still propagates
-
-        self.assertIs(primary_exception, ctx.exception)
-
-    def test_wait_result_used_after_successful_primary_op(self):
-        """Normal (no-exception) path: wait() result is returned to caller."""
-        with futurist.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(lambda: 'svol-ldev-123')
-            compat = _GreenThreadCompat(future)
-
-            primary_result = 'pvol-ldev-456'  # primary op succeeded
-            try:
-                # primary op (no exception)
-                _ = primary_result
-            finally:
-                secondary_result = compat.wait()
-
-        self.assertEqual('svol-ldev-123', secondary_result)

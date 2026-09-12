@@ -134,6 +134,14 @@ _MAX_GROUP_COPY_GROUP_NAME = min(
     rest._MAX_COPY_GROUP_NAME,
     rest.MAX_LDEV_LABEL - len(_JOURNAL_VOLUME_LABEL % ''))
 
+# How a copy pair's reported status decides what enable_replication may do.
+# The same vocabulary the wait parameters use: PAIR/PFUL is a running pair,
+# COPY is one still doing its initial copy, and the suspended set is what a
+# resync is defined from. SSWS is deliberately in neither -- it means failed
+# over, and returning from that is failback.
+_PAIR_REPLICATING = ('PAIR', 'PFUL', 'COPY')
+_PAIR_SUSPENDED = ('PSUS', 'SSUS', 'PSUE', 'PFUS')
+
 _MIRROR_IDENTIFIER = 'G'
 _ASYNC_IDENTIFIER = 'U'
 
@@ -200,6 +208,26 @@ COMMON_REPLICATION_OPTS = [
              'derived at run time, because the group replication actions '
              'reach whichever backend owns the group object and a recovery '
              'site owns nothing until it adopts.'),
+    cfg.BoolOpt(
+        'hitachi_replication_group_only',
+        default=True,
+        help='Whether replication on this backend is conferred only by '
+             'membership of a replication group. Cinder requires every '
+             'volume type in such a group to set replication_enabled, and '
+             'this driver otherwise reads that same spec as an instruction '
+             'to build a replication pair as soon as a volume is created. '
+             'Where volumes are created first and protected later, that '
+             'leaves the volume already paired, and adding it to a group '
+             'asks the storage system for a second pair on the same primary '
+             'volume and the same mirror unit, which it refuses. This '
+             'driver therefore defaults to true, UNLIKE the upstream '
+             'Hitachi driver: volumes are created unpaired and the group '
+             'creates the only pair. Note what that means -- a '
+             'replication-enabled volume type does NOT replicate a volume '
+             'until the volume joins a replication group. Set it to false '
+             'on a backend where volume-level replication is driven '
+             'directly rather than through groups, which restores the '
+             'upstream behaviour.'),
     cfg.BoolOpt(
         'hitachi_replication_report_pair_status',
         default=True,
@@ -604,7 +632,11 @@ def _delays(short_interval, long_interval, timeout):
         watch.restart()
         yield i
         if utils.timed_out(start_time, timeout):
-            raise StopIteration()
+            # Not 'raise StopIteration': PEP 479 turns that into a
+            # RuntimeError inside a generator, which made the for...else
+            # timeout branch in _wait_pair_status_change unreachable and
+            # escaped every caller's except clause.
+            return
         watch.stop()
         interval = long_interval if utils.timed_out(
             start_time, long_interval) else short_interval
@@ -818,6 +850,25 @@ class HBSDREPLICATION(rest.HBSDREST):
                 self.rep_secondary.output_log(
                     MSG.SITE_INITIALIZATION_FAILED, site='secondary')
                 self.rep_secondary = None
+            # Which reading of replication_enabled is in force is not
+            # something anyone should have to infer from behaviour, least of
+            # all during an incident.
+            if self.conf.hitachi_replication_group_only:
+                LOG.warning(
+                    'Group replication: hitachi_replication_group_only is '
+                    'enabled (the default for this driver, unlike '
+                    'upstream), so a replication-enabled volume type does '
+                    'NOT replicate a volume on its own -- replication '
+                    'starts when the volume joins a replication group. Set '
+                    'it to false to pair volumes as they are created.')
+            else:
+                LOG.info(
+                    'Group replication: hitachi_replication_group_only is '
+                    'disabled, so a replication-enabled volume type pairs '
+                    'every volume it creates, as the upstream driver does. '
+                    'Such a volume cannot then be added to a replication '
+                    'group: its primary volume already holds a pair on the '
+                    'same mirror unit.')
 
     def _check_param(self):
         """Check parameter values and consistency among them."""
@@ -1145,6 +1196,25 @@ class HBSDREPLICATION(rest.HBSDREST):
                 site='secondary')
             self.raise_error(msg)
 
+    def _pairs_at_create_time(self, volume):
+        """Whether a replication-enabled volume is paired as it is created.
+
+        Cinder's group replication actions require every volume type in the
+        group to carry replication_enabled -- GroupAPI._check_type refuses
+        them otherwise -- and this driver reads that same spec at create time
+        as "build a per-volume pair now". Those are two readings of one spec,
+        and where volumes are created first and protected later the collision
+        is unavoidable: the volume is already paired, and joining a group
+        asks for a second pair on the same P-VOL and the same mirror unit.
+
+        hitachi_replication_group_only says which reading this backend wants.
+        """
+        if _volume_in_group_replication(volume):
+            # Created directly into the group: _group_repl_add_volume takes
+            # the plain LDEV as the P-VOL and builds the pair itself.
+            return False
+        return not self.conf.hitachi_replication_group_only
+
     def _is_target_role(self):
         """True when this backend adopts S-VOLs rather than creating them."""
         return self.conf.hitachi_replication_role == _ROLE_TARGET
@@ -1278,9 +1348,23 @@ class HBSDREPLICATION(rest.HBSDREST):
         # create_journals() suffixes this name with '-JNL' to label the
         # journal LDEV, and a 29-character name overruns that field by one.
         #
-        # Upper cased to match _create_rep_copy_group_name's '%02X'. On the
-        # VSP 5600 that name starts a HORCM instance every time while this
-        # one, same length and differing only in content, fails every time.
+        # Upper cased to match _create_rep_copy_group_name's '%02X'.
+        # That was done because a lower cased name appeared to fail on the
+        # VSP 5600 where an upper cased one worked; the investigation later
+        # found a sufficient explanation for those failures elsewhere, so
+        # treat the case theory as unconfirmed rather than established.
+        #
+        # The spelling stays as it is because groups have since been made
+        # with it, and changing it back would strand those instead.
+        #
+        # Copy group names are case sensitive on the storage system and
+        # this derivation cannot be reversed, so a group created under the
+        # earlier spelling is not reachable by deriving it again. What
+        # makes it reachable is the binding: _group_repl_add_volume stamps
+        # the name it really used on every member, and
+        # _resolve_copy_group_name prefers that metadata over this
+        # derivation. A group whose members have lost that metadata has to
+        # be bound by hand -- see the group name marker.
         prefix = self.driver_info['target_prefix']
         name = prefix + group_id.replace(
             '-', '').upper()[:_MAX_GROUP_COPY_GROUP_NAME - len(prefix)]
@@ -1413,8 +1497,40 @@ class HBSDREPLICATION(rest.HBSDREST):
             return self.rep_primary.conf.hitachi_copy_speed
 
     def _get_wait_pair_status_change_params(self, wait_type):
-        """Get a replication pair status information."""
-        _wait_pair_status_change_params = {
+        """Get a replication pair status information.
+
+        Built one entry at a time rather than as a single dict literal. A
+        literal evaluates every value before any key is looked up, and three
+        of the four entries dereference rep_secondary.client -- so asking for
+        _WAIT_SSWS, the one wait that needs no peer at all, raised
+        AttributeError whenever the peer was gone. That is exactly when a
+        takeover is issued, so a recovery site could never confirm one, and
+        AttributeError is neither VolumeDriverException nor CinderException,
+        so it escaped every handler and left the group in failing-over.
+        """
+        if wait_type == _WAIT_SSWS:
+            # Issued to the storage system holding the S-VOLs with no
+            # session on the peer -- the only form that still answers once
+            # the other site is gone. Site-relative for the same reason
+            # _svol_instance() exists: rep_secondary at a source-role
+            # backend, rep_primary at a recovery site that has adopted
+            # promoted S-VOLs.
+            self._require_svol_instance()
+            return {
+                'instance': self._svol_instance(),
+                'remote_client': None,
+                'is_secondary': True,
+                'transitional_status': ['PAIR', 'PFUL', 'PFUS', 'PSUE',
+                                        'SSUS'],
+                'expected_status': ['SSWS'],
+                'msgid': MSG.SPLIT_REPLICATION_PAIR_FAILED,
+                'status_keys': ['svolStatus'],
+            }
+        # Every other wait is issued from the primary with a session on the
+        # peer, so the peer has to be up. Say so with the driver's own error
+        # rather than an AttributeError out of the entries below.
+        self._require_rep_secondary()
+        return {
             _WAIT_PAIR: {
                 'instance': self.rep_primary,
                 'remote_client': self.rep_secondary.client,
@@ -1433,16 +1549,6 @@ class HBSDREPLICATION(rest.HBSDREST):
                 'msgid': MSG.SPLIT_REPLICATION_PAIR_FAILED,
                 'status_keys': ['pvolStatus', 'svolStatus'],
             },
-            _WAIT_SSWS: {
-                'instance': self.rep_secondary,
-                'remote_client': None,
-                'is_secondary': True,
-                'transitional_status': ['PAIR', 'PFUL', 'PFUS', 'PSUE',
-                                        'SSUS'],
-                'expected_status': ['SSWS'],
-                'msgid': MSG.SPLIT_REPLICATION_PAIR_FAILED,
-                'status_keys': ['svolStatus'],
-            },
             _WAIT_SPLIT: {
                 'instance': self.rep_primary,
                 'remote_client': self.rep_secondary.client,
@@ -1451,9 +1557,8 @@ class HBSDREPLICATION(rest.HBSDREST):
                 'expected_status': ['PSUS', 'SSUS', 'PSUE', 'PFUS', 'SSWS'],
                 'msgid': MSG.SPLIT_REPLICATION_PAIR_FAILED,
                 'status_keys': ['pvolStatus', 'svolStatus'],
-            }
-        }
-        return _wait_pair_status_change_params[wait_type]
+            },
+        }[wait_type]
 
     def _wait_pair_status_change(self, copy_group_name, pvol, svol,
                                  rep_type, wait_type, instance=None):
@@ -1619,12 +1724,9 @@ class HBSDREPLICATION(rest.HBSDREST):
             return {
                 'provider_location': provider_location
             }
-        if (volume.is_replicated() and
-                not _volume_in_group_replication(volume)):
-            # A member of a group-replication group is created unpaired:
-            # _group_repl_add_volume takes the plain LDEV as the P-VOL and
-            # builds the pair itself. _check_rep_ldev still rejects a
-            # replicated volume in any other kind of group.
+        if volume.is_replicated() and self._pairs_at_create_time(volume):
+            # _check_rep_ldev still rejects a replicated volume in any other
+            # kind of group.
             _check_rep_ldev(self, volume, 'create a volume')
             rep_type = _get_rep_type(self, extra_specs)
             pldev, sldev = self._create_rep_ldev_and_pair(
@@ -1936,8 +2038,7 @@ class HBSDREPLICATION(rest.HBSDREST):
             return self._create_rep_volume_from_src(
                 volume, extra_specs, src, src_type, operation,
                 self.driver_info['mirror_attr'])
-        if (volume.is_replicated() and
-                not _volume_in_group_replication(volume)):
+        if volume.is_replicated() and self._pairs_at_create_time(volume):
             return self._create_rep_volume_from_src(
                 volume, extra_specs, src, src_type, operation,
                 _get_rep_type(self, extra_specs))
@@ -2494,7 +2595,6 @@ class HBSDREPLICATION(rest.HBSDREST):
                 'copyGroupName': copy_group_name,
                 'copyPairName': parent._LDEV_NAME % (pvol, svol),
                 'replicationType': parent.driver_info['rep_type_async'],
-                'fenceLevel': 'ASYNC',
                 'remoteStorageDeviceId': parent.rep_secondary.storage_id,
                 'pvolLdevId': pvol,
                 'svolLdevId': svol,
@@ -2505,10 +2605,15 @@ class HBSDREPLICATION(rest.HBSDREST):
                 'isNewGroupCreation': is_new_copy_grp,
                 'doInitialCopy': True,
                 'isDataReductionForceCopy': is_data_reduction_force_copy,
-                'muNumber':
-                    parent.rep_secondary.conf.hitachi_replication_mun,
             }
             if is_new_copy_grp:
+                # The mirror unit belongs to the copy group, and the schema
+                # allows naming one only on the request that creates it --
+                # a pair joining an existing copy group inherits it. Sending
+                # it every time was out of contract, and it named the very
+                # MU the volume's own per-volume pair already holds.
+                body['muNumber'] = (
+                    parent.rep_secondary.conf.hitachi_replication_mun)
                 # An asynchronous UR pair has nowhere to stage writes
                 # without them, so the pair that creates the copy group
                 # creates its journals too, exactly as _create_rep_pair
@@ -2530,6 +2635,55 @@ class HBSDREPLICATION(rest.HBSDREST):
             with excutils.save_and_reraise_exception():
                 if created_journal_ids:
                     self._delete_journals(created_journal_ids)
+
+    def _group_repl_confirm_new_pairs(self, copy_group_name,
+                                      volumes_model_update):
+        """Confirm each freshly created pair really reached PAIR.
+
+        Pairs are created with Job-Mode-Wait-Configuration-Change: NoWait,
+        so the create job completes as soon as the storage system accepts
+        the command. The vendor documentation says as much in as many
+        words: "data copying continues even after job execution ends. To
+        check whether data copying has finished, check the pair status of
+        the target resource instead of the job status." Reporting ENABLED
+        off the job alone let a group be failed over while its S-VOLs were
+        still in initial copy, and a takeover then promotes an incomplete
+        volume.
+
+        Called once after every pair has been asked for, rather than inside
+        _group_repl_add_volume: the storage system copies them
+        concurrently, so this costs the longest initial copy and not the
+        sum of them. Members restarted by _group_repl_resync_members never
+        reach here -- that path does its own waiting.
+
+        A pair that does not arrive is reported, not cleaned up. A slow
+        initial copy and a dead one look the same from here, and deleting
+        an S-VOL that is merely behind would be the worse mistake.
+        """
+        rep_type = self.driver_info['rep_type_async']
+        for volume_update in volumes_model_update:
+            location = volume_update.get('provider_location')
+            if (volume_update.get('replication_status') !=
+                    fields.ReplicationStatus.ENABLED or not location):
+                continue
+            loc = json.loads(location)
+            pvol, svol = loc.get('pldev'), loc.get('sldev')
+            if pvol is None or svol is None:
+                continue
+            try:
+                with _log_step('confirm replication pair',
+                               copy_group=copy_group_name,
+                               pvol=pvol, svol=svol):
+                    self._wait_pair_status_change(
+                        copy_group_name, pvol, svol, rep_type, _WAIT_PAIR)
+            except exception.VolumeDriverException:
+                self.rep_primary.output_log(
+                    MSG.GROUP_REPLICATION_PAIR_CREATE_FAILED,
+                    volume=volume_update['id'],
+                    copy_group=copy_group_name)
+                volume_update['replication_status'] = (
+                    fields.ReplicationStatus.ERROR)
+        return volumes_model_update
 
     def _group_repl_journal_ids(self, copy_group_name):
         """The copy group's journal ids, read while its pairs still exist.
@@ -2561,16 +2715,33 @@ class HBSDREPLICATION(rest.HBSDREST):
         """
         if not journal_ids:
             return
+        # Ask the listing, not the object: it is authoritative about whether
+        # the copy group exists and, unlike a get, does not raise when it is
+        # absent. Reading the object meant every outcome except one exact
+        # message id fell through a bare return with no log, and a journal
+        # plus its LDEV were left on each array with nothing referencing
+        # them.
         try:
-            rtn = self.rep_primary.client.get_remote_copy_grp(
-                self.rep_secondary.client, copy_group_name,
-                ignore_message_id=[_MSGID_INSTANCE_CANNOT_OPERATED])
+            still_there = self._group_repl_copy_grp_exists(copy_group_name)
         except exception.VolumeDriverException:
+            # A read that failed is not evidence the copy group has gone,
+            # and deleting a journal still carrying a pair is the worse
+            # mistake. Leave them and say so.
+            LOG.warning(
+                'Group replication: could not list the copy groups, so '
+                'journals %(j)s for copy group %(cg)s were left in place. '
+                'Remove them by hand if the copy group is gone.',
+                {'j': journal_ids, 'cg': copy_group_name})
             return
-        if rtn.get('messageId') == _MSGID_INSTANCE_CANNOT_OPERATED:
-            with _log_step('delete journals', copy_group=copy_group_name,
-                           journals=journal_ids):
-                self._delete_journals(journal_ids)
+        if still_there:
+            LOG.info(
+                'Group replication: copy group %(cg)s still exists, so its '
+                'journals %(j)s are kept.',
+                {'cg': copy_group_name, 'j': journal_ids})
+            return
+        with _log_step('delete journals', copy_group=copy_group_name,
+                       journals=journal_ids):
+            self._delete_journals(journal_ids)
 
     def _group_repl_copy_grp_exists(self, copy_group_name):
         """Check the copy group with the list call, not the get (B3)."""
@@ -2593,6 +2764,19 @@ class HBSDREPLICATION(rest.HBSDREST):
                     MSG.LDEV_NUMBER_NOT_FOUND, operation=operation,
                     obj='volume', obj_id=volume.id)
                 self.raise_error(msg)
+            if self._has_rep_pair(pvol, instance=self.rep_primary):
+                # The storage system allows one pair per mirror unit, and the
+                # group asks for the same one the existing pair is holding, so
+                # this fails at the array with an error that names neither
+                # cause nor remedy. Say both here instead. No operation moves
+                # a pair between copy groups, so there is nothing to convert:
+                # either create volumes unpaired
+                # (hitachi_replication_group_only) or drop the existing pair
+                # first, knowingly, because it discards the delta bitmap.
+                msg = utils.output_log(
+                    MSG.GROUP_REPLICATION_ALREADY_PAIRED,
+                    volume=volume.id, ldev=pvol)
+                self.raise_error(msg)
             extra_specs = self.rep_primary.get_volume_extra_specs(volume)
             capacity_saving = None
             if self.driver_info.get('driver_dir_name'):
@@ -2605,6 +2789,15 @@ class HBSDREPLICATION(rest.HBSDREST):
                     self.rep_secondary.storage_info['ldev_range'],
                     qos_specs=utils.get_qos_specs_from_volume(volume))
             try:
+                # Name it after the volume, the same way
+                # _group_repl_manage_existing and the group snapshot path
+                # do. _delete_volume_pre_check identifies an S-VOL by
+                # comparing this label with the volume id, and
+                # manage_existing resolves source-name through
+                # get_ldev_by_name; an unlabelled S-VOL is invisible to
+                # both, and reads as junk on the array.
+                self.rep_secondary.modify_ldev_name(
+                    svol, volume.id.replace('-', ''))
                 self._group_repl_create_pair(
                     volume, copy_group_name, pvol, svol,
                     capacity_saving == 'deduplication_compression',
@@ -2633,6 +2826,36 @@ class HBSDREPLICATION(rest.HBSDREST):
                 'id': volume.id,
                 'replication_status': fields.ReplicationStatus.ERROR}
 
+    def _group_repl_pair_absent(self, copy_group_name, pvol):
+        """True when the array has no pair for this P-VOL in this copy group.
+
+        Asked only after a teardown has already failed, to tell "there is
+        nothing here to remove" apart from a failure worth reporting. A copy
+        group the storage system does not have answers with an exception,
+        and that is the commonest form of this: enable_replication never got
+        far enough to create it.
+        """
+        try:
+            grp = self.rep_primary.client.get_remote_copy_grp(
+                self.rep_secondary.client, copy_group_name)
+        except exception.VolumeDriverException:
+            return True
+        return not any(pair.get('pvolLdevId') == pvol
+                       for pair in grp.get('copyPairs') or [])
+
+    def _group_repl_delete_member_by_volume(self, volume):
+        """Tear a member down through the per-volume path.
+
+        For a member the group's copy group cannot account for.
+        delete_volume reads the pair from the storage system instead of
+        deriving a copy group name, so it finds the per-volume pair
+        create_volume builds for a replication-enabled volume type -- which
+        is what a member of a group whose enable_replication never completed
+        is still carrying -- and it copes with there being no pair at all.
+        """
+        self.delete_volume(volume)
+        return {'id': volume.id, 'status': 'deleted'}
+
     def _group_repl_delete_volume(self, volume, copy_group_name, operation):
         """Delete one member's copy pair.
 
@@ -2648,16 +2871,55 @@ class HBSDREPLICATION(rest.HBSDREST):
                     MSG.LDEV_NUMBER_NOT_FOUND, operation=operation,
                     obj='volume', obj_id=volume.id)
                 self.raise_error(msg)
-            with _log_step('delete replication pair',
-                           copy_group=copy_group_name, pvol=pvol, svol=svol):
-                self.rep_primary.client.delete_remote_copypair(
-                    self.rep_secondary.client, copy_group_name, pvol, svol)
-            utils.output_log(
-                MSG.GROUP_REPLICATION_PAIR_DELETED,
-                copy_group=copy_group_name, pvol=pvol, svol=svol)
+            try:
+                with _log_step('delete replication pair',
+                               copy_group=copy_group_name,
+                               pvol=pvol, svol=svol):
+                    self.rep_primary.client.delete_remote_copypair(
+                        self.rep_secondary.client, copy_group_name,
+                        pvol, svol)
+            except exception.VolumeDriverException:
+                if not self._group_repl_pair_absent(copy_group_name, pvol):
+                    raise
+                # Nothing of ours to unpair, which is not a failure. It was
+                # reported as one, and an error here puts the group into
+                # replication status error -- out of which
+                # disable_replication is the only transition Cinder offers.
+                # The failure closed the one door out of itself.
+                LOG.info(
+                    'Group replication: no pair for P-VOL %(pvol)s in copy '
+                    'group %(cg)s, so there is nothing to disable. '
+                    '(volume: %(volume)s)',
+                    {'pvol': pvol, 'cg': copy_group_name,
+                     'volume': volume.id})
+            else:
+                utils.output_log(
+                    MSG.GROUP_REPLICATION_PAIR_DELETED,
+                    copy_group=copy_group_name, pvol=pvol, svol=svol)
+            # _group_repl_add_volume made this S-VOL for this pair and
+            # nothing else refers to it. With the pair gone Cinder holds no
+            # record of it at all, so leaving it behind leaks an LDEV on the
+            # secondary array permanently -- and a later enable_replication
+            # allocates a fresh one rather than finding it. A failure here
+            # is logged, not raised: the pair is already gone, so
+            # replication really is disabled.
+            if svol is not None:
+                try:
+                    with _log_step('delete secondary volume',
+                                   volume=volume.id, svol=svol):
+                        self.rep_secondary.delete_ldev(svol)
+                except exception.VolumeDriverException:
+                    self.rep_secondary.output_log(
+                        MSG.DELETE_LDEV_FAILED, ldev=svol)
+            # Drop the S-VOL from the location too. Left there, the volume
+            # still reads as primary-and-secondary, and the next
+            # enable_replication treats it as a suspended pair to resync
+            # instead of a member to add.
             volume_update = {
                 'id': volume.id,
-                'replication_status': fields.ReplicationStatus.DISABLED}
+                'replication_status': fields.ReplicationStatus.DISABLED,
+                'provider_location': _pack_rep_provider_location(
+                    pldev=pvol)}
             volume_update.update(_metadata_model_update(
                 volume, **{_MD_PVOL: None,
                            _MD_SVOL: None,
@@ -2723,18 +2985,35 @@ class HBSDREPLICATION(rest.HBSDREST):
                             MSG.DELETE_LDEV_FAILED, ldev=new_ldev)
         return None, volumes_model_update
 
-    def _group_repl_suspended_members(self, copy_group_name, volumes):
-        """Members that already have a pair in this copy group.
+    def _group_repl_classify_members(self, copy_group_name, volumes):
+        """Split members by what the copy group already holds for them.
+
+        Returns (suspended, replicating, wrong_state): pairs to restart,
+        pairs already running that must be left alone, and pairs in a state
+        enable_replication has no business acting on. A member in none of
+        the three has no pair here and is added.
+
+        Keying on membership alone -- which is what this did -- sent a
+        member whose pair was already PAIR, or still in initial COPY, down
+        the resync path, and a resync is not a transition the storage system
+        defines from either. In the order an orchestrator actually drives
+        Cinder (update_group builds the copy group and its pairs,
+        enable_replication follows on a later pass) that was every member of
+        every group.
+
+        SSWS is the third case: the pair is failed over. Resyncing it is a
+        failback, which belongs to failover_replication with the failback
+        sentinel, so it is reported rather than acted on.
 
         The storage system is only asked when at least one member's
-        provider_location claims both LDEVs: a member carrying only a
-        P-VOL has never been paired, and the query costs a remote-mirror
-        session on every enable_replication.
+        provider_location claims both LDEVs: a member carrying only a P-VOL
+        has never been paired, and the query costs a remote-mirror session
+        on every enable_replication.
         """
         candidates = [volume for volume in volumes
                       if _get_ldev_site(volume) == _PRIMARY_SECONDARY]
         if not candidates:
-            return []
+            return [], [], []
         try:
             grp = self.rep_primary.client.get_remote_copy_grp(
                 self.rep_secondary.client, copy_group_name)
@@ -2745,11 +3024,53 @@ class HBSDREPLICATION(rest.HBSDREST):
             LOG.warning('Could not read copy group %s; enabling replication '
                         'will add pairs rather than restart them.',
                         copy_group_name)
-            return []
-        paired = {pair.get('pvolLdevId')
-                  for pair in grp.get('copyPairs') or []}
-        return [volume for volume in candidates
-                if self.rep_primary.get_ldev(volume) in paired]
+            return [], [], []
+        status_of = {}
+        for pair in grp.get('copyPairs') or []:
+            pvol = pair.get('pvolLdevId')
+            if pvol is not None:
+                status_of[pvol] = pair.get('pvolStatus') or pair.get(
+                    'svolStatus')
+        suspended, replicating, wrong_state = [], [], []
+        for volume in candidates:
+            pvol = self.rep_primary.get_ldev(volume)
+            if pvol not in status_of:
+                continue
+            status = status_of[pvol]
+            if status in _PAIR_REPLICATING:
+                replicating.append(volume)
+            elif status in _PAIR_SUSPENDED or status is None:
+                # No status reported at all: fall back to what this did
+                # before it looked, rather than refuse. A resync that is
+                # not a legal transition fails per member and is reported.
+                suspended.append(volume)
+            else:
+                wrong_state.append((volume, status))
+        return suspended, replicating, wrong_state
+
+    def _group_repl_already_replicating_update(self, volumes):
+        """Report a running pair as enabled without touching the array."""
+        updates = []
+        for volume in volumes:
+            LOG.info('Group replication: volume %s is already replicating; '
+                     'leaving its pair alone.', volume.id)
+            updates.append(
+                {'id': volume.id,
+                 'replication_status': fields.ReplicationStatus.ENABLED})
+        return updates
+
+    def _group_repl_wrong_state_update(self, copy_group_name, wrong_state):
+        """Report a pair enable_replication must not act on."""
+        updates = []
+        for volume, status in wrong_state:
+            utils.output_log(
+                MSG.GROUP_REPLICATION_PAIR_WRONG_STATE,
+                volume=volume.id, copy_group=copy_group_name,
+                status=status or 'unknown')
+            updates.append(
+                {'id': volume.id,
+                 'replication_status': fields.ReplicationStatus.ERROR})
+        return updates
 
     def _group_repl_resync_members(self, copy_group_name, volumes):
         """Restart replication for members whose pairs are only suspended.
@@ -2874,9 +3195,22 @@ class HBSDREPLICATION(rest.HBSDREST):
         """
         self._require_rep_primary()
         self._require_rep_secondary()
-        copy_group_name = self._resolve_copy_group_name(
-            group, volumes)
-        journal_ids = self._group_repl_journal_ids(copy_group_name)
+        try:
+            copy_group_name = self._resolve_copy_group_name(group, volumes)
+        except exception.VolumeDriverException:
+            # Members naming different copy groups is refused everywhere
+            # else, because acting on one while reporting on another is
+            # worse than refusing. Deleting is the exception: a binding on
+            # a group that is going away cannot be repaired, so raising
+            # here left the group undeletable through every Cinder API.
+            # Take every member down the per-volume path instead.
+            LOG.warning('Group replication: the members of group %s name '
+                        'different copy groups, so the group is not bound '
+                        'to one. Deleting each member through the '
+                        'per-volume path instead.', group.id)
+            copy_group_name = None
+        journal_ids = (self._group_repl_journal_ids(copy_group_name)
+                       if copy_group_name else None)
         LOG.info('Group replication: deleting group %(group)s. (copy group: '
                  '%(cg)s, volumes: %(n)d, journals: %(j)s)',
                  {'group': group.id, 'cg': copy_group_name,
@@ -2889,7 +3223,8 @@ class HBSDREPLICATION(rest.HBSDREST):
             if volume_update['status'] != 'deleted':
                 model_update['status'] = 'error'
             volumes_model_update.append(volume_update)
-        self._group_repl_delete_journals(copy_group_name, journal_ids)
+        if copy_group_name:
+            self._group_repl_delete_journals(copy_group_name, journal_ids)
         return model_update, volumes_model_update
 
     def _group_repl_delete_group_volume(self, group, volume,
@@ -2899,16 +3234,36 @@ class HBSDREPLICATION(rest.HBSDREST):
         Errors are reported per volume rather than raised, so one member
         that will not go does not strand the rest of the group.
         """
-        pvol = self.rep_primary.get_ldev(volume)
-        svol = self.rep_secondary.get_ldev(volume)
         try:
+            if copy_group_name is None:
+                return self._group_repl_delete_member_by_volume(volume)
+            pvol = self.rep_primary.get_ldev(volume)
+            svol = self.rep_secondary.get_ldev(volume)
             if pvol is not None and svol is not None:
-                with _log_step('delete replication pair',
-                               copy_group=copy_group_name,
-                               pvol=pvol, svol=svol):
-                    self.rep_primary.client.delete_remote_copypair(
-                        self.rep_secondary.client, copy_group_name,
-                        pvol, svol)
+                try:
+                    with _log_step('delete replication pair',
+                                   copy_group=copy_group_name,
+                                   pvol=pvol, svol=svol):
+                        self.rep_primary.client.delete_remote_copypair(
+                            self.rep_secondary.client, copy_group_name,
+                            pvol, svol)
+                except exception.VolumeDriverException:
+                    if not self._group_repl_pair_absent(
+                            copy_group_name, pvol):
+                        raise
+                    # The group's copy group cannot account for this pair.
+                    # Either enable_replication never created it and the
+                    # member still carries the per-volume pair, or it has
+                    # already gone. Reporting an error here made the whole
+                    # group undeletable: volume delete and unmanage both
+                    # need group_id to be NULL first.
+                    LOG.info(
+                        'Group replication: no pair for P-VOL %(pvol)s in '
+                        'copy group %(cg)s; deleting volume %(volume)s '
+                        'through the per-volume path.',
+                        {'pvol': pvol, 'cg': copy_group_name,
+                         'volume': volume.id})
+                    return self._group_repl_delete_member_by_volume(volume)
                 utils.output_log(
                     MSG.GROUP_REPLICATION_PAIR_DELETED,
                     copy_group=copy_group_name, pvol=pvol, svol=svol)
@@ -3131,15 +3486,22 @@ class HBSDREPLICATION(rest.HBSDREST):
                   'exists': copy_grp_exists})
         # A member whose pair is merely suspended is restarted, not added:
         # adding it would allocate a second S-VOL and then fail to pair it.
-        suspended = (
-            self._group_repl_suspended_members(
+        suspended, replicating, wrong_state = (
+            self._group_repl_classify_members(
                 copy_group_name, add_volumes or [])
-            if copy_grp_exists else [])
-        suspended_ids = {volume.id for volume in suspended}
+            if copy_grp_exists else ([], [], []))
+        suspended_ids = ({volume.id for volume in suspended} |
+                         {volume.id for volume in replicating} |
+                         {volume.id for volume, _ in wrong_state})
         add_volumes_update = []
         if suspended:
             add_volumes_update.extend(
                 self._group_repl_resync_members(copy_group_name, suspended))
+        add_volumes_update.extend(
+            self._group_repl_already_replicating_update(replicating))
+        add_volumes_update.extend(
+            self._group_repl_wrong_state_update(copy_group_name, wrong_state))
+        added_updates = []
         is_new_copy_grp = not copy_grp_exists
         for volume in add_volumes or []:
             if volume.id in suspended_ids:
@@ -3150,7 +3512,10 @@ class HBSDREPLICATION(rest.HBSDREST):
             if (volume_model_update['replication_status'] !=
                     fields.ReplicationStatus.ERROR):
                 is_new_copy_grp = False
-            add_volumes_update.append(volume_model_update)
+            added_updates.append(volume_model_update)
+        add_volumes_update.extend(
+            self._group_repl_confirm_new_pairs(
+                copy_group_name, added_updates))
         remove_volumes_update = [
             self._group_repl_delete_volume(
                 volume, copy_group_name,
@@ -3188,14 +3553,21 @@ class HBSDREPLICATION(rest.HBSDREST):
                  'group: %(cg)s, volumes: %(n)d, copy group exists: %(e)s)',
                  {'group': group.id, 'cg': copy_group_name,
                   'n': len(volumes), 'e': copy_grp_exists})
-        suspended = (
-            self._group_repl_suspended_members(copy_group_name, volumes)
-            if copy_grp_exists else [])
-        suspended_ids = {volume.id for volume in suspended}
+        suspended, replicating, wrong_state = (
+            self._group_repl_classify_members(copy_group_name, volumes)
+            if copy_grp_exists else ([], [], []))
+        suspended_ids = ({volume.id for volume in suspended} |
+                         {volume.id for volume in replicating} |
+                         {volume.id for volume, _ in wrong_state})
         volumes_model_update = []
         if suspended:
             volumes_model_update.extend(
                 self._group_repl_resync_members(copy_group_name, suspended))
+        volumes_model_update.extend(
+            self._group_repl_already_replicating_update(replicating))
+        volumes_model_update.extend(
+            self._group_repl_wrong_state_update(copy_group_name, wrong_state))
+        added_updates = []
         is_new_copy_grp = not copy_grp_exists
         for volume in volumes:
             if volume.id in suspended_ids:
@@ -3206,7 +3578,10 @@ class HBSDREPLICATION(rest.HBSDREST):
             if (volume_model_update['replication_status'] !=
                     fields.ReplicationStatus.ERROR):
                 is_new_copy_grp = False
-            volumes_model_update.append(volume_model_update)
+            added_updates.append(volume_model_update)
+        volumes_model_update.extend(
+            self._group_repl_confirm_new_pairs(
+                copy_group_name, added_updates))
         model_update = {
             'replication_status': self._group_repl_aggregate_status(
                 volumes_model_update, fields.ReplicationStatus.ENABLED)}
@@ -3350,10 +3725,25 @@ class HBSDREPLICATION(rest.HBSDREST):
                 volumes_model_update, status)}
         return model_update, volumes_model_update
 
+    def _group_members(self, group):
+        """The group's members, or None if they cannot be read.
+
+        For the entry points Cinder hands no volume list. Without the
+        members there is no metadata binding to honour, and the copy group
+        name falls back to the derivation -- which is the wrong name
+        anywhere but the site that created the group.
+        """
+        try:
+            return list(group.volumes or [])
+        except Exception:
+            LOG.debug('Could not read the members of group %s.', group.id,
+                      exc_info=True)
+            return None
+
     def list_replication_targets(self, context, group):
         self._require_rep_primary()
         copy_group_name = self._resolve_copy_group_name(
-            group, None)
+            group, self._group_members(group))
         # Listing copy groups needs a session on the peer, which a failed
         # over or target-role backend cannot open -- and this is exactly
         # where a client asks what it can fail over to. Read the one copy
