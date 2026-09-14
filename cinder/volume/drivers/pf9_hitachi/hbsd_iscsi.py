@@ -91,6 +91,18 @@ class HBSDISCSIDriver(driver.ISCSIDriver):
         2.7.0 - Support adaptive QoS upperIops setting.
         2.7.1 - Support GAD coexisting with ADR.
         2.7.2 - Add caching/batching to fix severe performance issues.
+        2.7.3 - Enable space reclaim via setting.
+        2.7.4 - Remove eventlet usage.
+        2.7.5 - Fix issue with VSP One Block snapshot creation with different
+                sizes.
+        2.8.0 - Add support for immutable snapshots.
+        2.8.1 - Add support for storage-assisted volume migration on different
+                pools for VSP One Block.
+        2.8.2 - Add support for DRS volume configuration in cinder.conf instead
+                of requiring extra specs.
+        2.8.3 - Fix zombie issue with vClone parents on VSP One Block when
+                volumes are quickly created and destroyed.
+        2.8.4 - Add support for 'compression' capacity saving setting.
 
     """
 
@@ -114,10 +126,6 @@ class HBSDISCSIDriver(driver.ISCSIDriver):
         self.configuration.append_config_values(common.COMMON_EXTEND_OPTS)
         self.configuration.append_config_values(
             replication.COMMON_MIRROR_OPTS)
-        # PF9 Start
-        self.configuration.append_config_values(
-            replication.COMMON_REPLICATION_OPTS)
-        # PF9 End
         os.environ['LANG'] = 'C'
         kwargs.setdefault('driver_info', _DRIVER_INFO)
         self.driver_info = dict(kwargs['driver_info'])

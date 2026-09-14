@@ -16,10 +16,12 @@
 """REST interface module for Hitachi HBSD Driver."""
 
 from collections import defaultdict
-import concurrent.futures
+from itertools import count
 import json
 import re
+import time
 
+import futurist
 from oslo_config import cfg
 from oslo_config import types
 from oslo_log import log as logging
@@ -28,6 +30,7 @@ from oslo_utils import excutils
 from oslo_utils import timeutils
 from oslo_utils import units
 
+from cinder import coordination
 from cinder import exception
 from cinder.objects import fields
 from cinder.objects import SnapshotList
@@ -99,27 +102,32 @@ _MAX_CTG_COUNT_EXCEEDED_ADD_SNAPSHOT = ('2E10', '2302')
 _MAX_PAIR_COUNT_IN_CTG_EXCEEDED_ADD_SNAPSHOT = ('2E13', '9900')
 
 _PAIR_TARGET_NAME_BODY_DEFAULT = 'pair00'
+_MIGRATION_TARGET_NAME_BODY = 'migration-shadow-image'
 
 _DR_VOL_PATTERN = {
     'disabled': ('REHYDRATING',),
     'compression_deduplication': ('ENABLED',),
+    'compression': ('ENABLED',),
     None: ('DELETING',),
 }
 _DISABLE_ABLE_DR_STATUS = {
     'disabled': ('DISABLED', 'ENABLING', 'REHYDRATING'),
     'compression_deduplication': ('ENABLED', 'ENABLING'),
+    'compression': ('ENABLED', 'ENABLING'),
 }
 _DEDUPCOMP_ABLE_DR_STATUS = {
     'disabled': ('DISABLED', 'ENABLING'),
     'compression_deduplication': ('ENABLED', 'ENABLING'),
+    'compression': ('ENABLED', 'ENABLING'),
 }
 _CAPACITY_SAVING_DR_MODE = {
     'disable': 'disabled',
     'deduplication_compression': 'compression_deduplication',
+    'compression': 'compression',
     '': 'disabled',
     None: 'disabled',
 }
-_DRS_MODE = common.DRS_MODE
+_DRS_MODE = utils.DRS_MODE
 
 REST_VOLUME_OPTS = [
     cfg.BoolOpt(
@@ -227,6 +235,19 @@ REST_VOLUME_OPTS = [
         'hitachi_rest_max_request_workers',
         default=rest_api._MAX_REQUEST_WORKERS,
         help='The maximum number of workers for concurrent requests.'),
+    cfg.IntOpt(
+        'hitachi_csv_delete_timeout',
+        default=rest_api._CSV_DELETE_TIMEOUT,
+        help='Maximum wait time in seconds for deleting CSV via REST API.'),
+    cfg.IntOpt(
+        'hitachi_vcp_delete_timeout',
+        default=rest_api._VCP_DELETE_TIMEOUT,
+        help='Maximum wait time in seconds for VCP deletion.'),
+    cfg.IntOpt(
+        'hitachi_vcp_delete_sleep_interval',
+        default=rest_api._VCP_DELETE_RETRY_INTERVAL,
+        help='Sleep interval in seconds for VCP deletion.'),
+
 ]
 
 REST_PAIR_OPTS = [
@@ -285,7 +306,7 @@ def _check_ldev_manageability(self, ldev_info, ldev, existing_ref):
 
 def _check_ldev_size(self, ldev_info, ldev, existing_ref):
     """Hitachi storage calculates volume sizes in a block unit, 512 bytes."""
-    if ldev_info['blockCapacity'] % utils.GIGABYTE_PER_BLOCK_SIZE:
+    if not utils.is_block_capacity_gb_aligned(ldev_info['blockCapacity']):
         msg = self.output_log(MSG.INVALID_LDEV_SIZE_FOR_MANAGE, ldev=ldev)
         raise exception.ManageExistingInvalidReference(
             existing_ref=existing_ref, reason=msg)
@@ -318,7 +339,7 @@ class HBSDREST(common.HBSDCommon):
         self.client = None
 
         self.request_thread_pool_executor = \
-            concurrent.futures.ThreadPoolExecutor(
+            futurist.ThreadPoolExecutor(
                 max_workers=self.conf.safe_get(
                     self.driver_info['param_prefix'] +
                     '_rest_max_request_workers'))
@@ -337,7 +358,7 @@ class HBSDREST(common.HBSDCommon):
     def __del__(self):
         """Shut down the driver."""
         self.request_thread_pool_executor.shutdown(wait=False,
-                                                   cancel_futures=True)
+                                                   cancel_futures=False)
 
     def do_setup(self, context):
         if hasattr(
@@ -391,25 +412,12 @@ class HBSDREST(common.HBSDCommon):
         # this method behavior.
         pass
 
-    def _set_dr_mode(self, body, capacity_saving):
-        dr_mode = _CAPACITY_SAVING_DR_MODE.get(capacity_saving)
-        if not dr_mode:
-            msg = self.output_log(
-                MSG.INVALID_EXTRA_SPEC_KEY,
-                key=self.driver_info['driver_dir_name'] + ':capacity_saving',
-                value=capacity_saving)
-            self.raise_error(msg)
-        body['dataReductionMode'] = dr_mode
+    def _get_driver_context(self):
+        return utils.DriverContext(self.driver_info, self.conf,
+                                   self.storage_id)
 
-    def _set_drs_mode(self, body, drs):
-        drs_mode = _DRS_MODE.get(drs, False)
-        if not drs_mode:
-            msg = self.output_log(
-                MSG.INVALID_EXTRA_SPEC_KEY,
-                key=self.driver_info['driver_dir_name'] + ':drs',
-                value=drs)
-            self.raise_error(msg)
-        body['isDataReductionSharedVolumeEnabled'] = drs_mode
+    def _get_csv_and_drs(self, extra_specs):
+        return utils.get_csv_and_drs(self._get_driver_context(), extra_specs)
 
     def _create_ldev_on_storage(self, size, extra_specs, pool_id, ldev_range):
         """Create an LDEV on the storage system."""
@@ -418,19 +426,11 @@ class HBSDREST(common.HBSDCommon):
             'poolId': pool_id,
             'isParallelExecutionEnabled': True,
         }
-        capacity_saving = None
-        drs = None
-        has_drs = False
-        if self.driver_info.get('driver_dir_name'):
-            capacity_saving = extra_specs.get(
-                self.driver_info['driver_dir_name'] + ':capacity_saving')
-            drs_spec_name = self.driver_info['driver_dir_name'] + ':drs'
-            has_drs = drs_spec_name in extra_specs
-            drs = extra_specs.get(drs_spec_name)
-        if capacity_saving:
-            self._set_dr_mode(body, capacity_saving)
-        if has_drs:
-            self._set_drs_mode(body, drs)
+        csv, drs = self._get_csv_and_drs(extra_specs)
+        if csv:
+            body['dataReductionMode'] = _CAPACITY_SAVING_DR_MODE.get(csv)
+        if drs:
+            body['isDataReductionSharedVolumeEnabled'] = drs
         if self.storage_info['ldev_range']:
             min_ldev, max_ldev = self.storage_info['ldev_range'][:2]
             body['startLdevId'] = min_ldev
@@ -462,8 +462,61 @@ class HBSDREST(common.HBSDCommon):
         body = {'label': name}
         self.client.modify_ldev(ldev, body)
 
+    def check_then_delete_vcp(self, ldev, parent_ldev, body):
+        def _is_ldev_gone_from_ss(ldev, parent_ldev):
+            sf_result = self.client.get_snapshotfamily(parent_ldev)
+            for r in (sf_result or []):
+                if (r['ldevId'] == ldev and
+                        r['parentLdevId'] == parent_ldev):
+                    return False, sf_result
+            return True, sf_result
+
+        #
+        start_time = timeutils.utcnow()
+        for round in count(1):
+            ldevs_gone, sf_result = \
+                _is_ldev_gone_from_ss(ldev, parent_ldev)
+            LOG.debug(
+                "ctdv. ldev=%d,pLDEV=%s,round=%d,sf_ldevList=%s,"
+                "ldevs_gone=%s",
+                ldev, parent_ldev, round, repr(sf_result), ldevs_gone)
+            if ldevs_gone:
+                break
+            if utils.timed_out(start_time,
+                               self.conf.hitachi_vcp_delete_timeout):
+                LOG.warning("ctdv. timeout waiting for ldev=%d,pLDEV=%s "
+                            "gone from snapshotfamily", ldev, parent_ldev)
+                return
+            else:
+                time.sleep(
+                    self.conf.hitachi_vcp_delete_sleep_interval)
+
+        #
+        lock_key = '%s-dtdv-managed-vcp-del-%s-%d' % (
+            self.driver_info['driver_file_prefix'],
+            self.conf.hitachi_storage_id,
+            parent_ldev)
+
+        @coordination.synchronized(lock_key)
+        def _delete_managed_vcp_ldev():
+            parent_info = self.get_ldev_info(['attributes', 'label'],
+                                             parent_ldev)
+            LOG.debug("ctdv. ldev=%d,pLDEV=%s,parent_info=%s,",
+                      ldev, parent_ldev, repr(parent_info))
+            if ((not parent_info['attributes'] or
+                 utils.VCP_VOL_ATTR not in parent_info['attributes']) and
+                (parent_info['label'] and
+                 parent_info['label'] == common.STR_MANAGED_VCP_LDEV_NAME)):
+                self.client.delete_ldev(
+                    parent_ldev, body,
+                    timeout_message=(MSG.LDEV_DELETION_WAIT_TIMEOUT,
+                                     {'ldev': parent_ldev}))
+
+        _delete_managed_vcp_ldev()
+
     def delete_ldev_from_storage(self, ldev):
         """Delete the specified LDEV from the storage."""
+        timeout_ldev = self.conf.hitachi_rest_timeout
         result = self.get_ldev_info(['emulationType',
                                      'dataReductionMode',
                                      'dataReductionStatus',
@@ -475,13 +528,16 @@ class HBSDREST(common.HBSDCommon):
         if result['dataReductionStatus'] in _DR_VOL_PATTERN.get(
                 result['dataReductionMode'], ()):
             body = {'isDataReductionDeleteForceExecute': True}
+            timeout_ldev = self.conf.hitachi_csv_delete_timeout
         else:
             body = None
         if result['emulationType'] == 'NOT DEFINED':
             self.output_log(MSG.LDEV_NOT_EXIST, ldev=ldev)
             return
+
+        LOG.debug("dlfs. del_ldev=%d,body=%s", ldev, repr(body))
         self.client.delete_ldev(
-            ldev, body,
+            ldev, body, timeout=timeout_ldev,
             timeout_message=(MSG.LDEV_DELETION_WAIT_TIMEOUT, {'ldev': ldev}))
 
         # If we have a managed parent that is no longer a parent,
@@ -490,15 +546,11 @@ class HBSDREST(common.HBSDCommon):
             parent_ldev = int(result['parentLdevId'])
             parent_info = self.get_ldev_info(['attributes', 'label'],
                                              parent_ldev)
-            if ((not parent_info['attributes'] or
-                utils.VCP_VOL_ATTR not in parent_info['attributes']) and
-                (parent_info['label'] and
+            LOG.debug("dlfs. ldev=%d,pLDEV=%d,parent_info=%s",
+                      ldev, parent_ldev, repr(parent_info))
+            if ((parent_info['label'] and
                  parent_info['label'] == common.STR_MANAGED_VCP_LDEV_NAME)):
-                LOG.debug("Deleting managed VCP LDEV %d.", parent_ldev)
-                self.client.delete_ldev(
-                    parent_ldev, body,
-                    timeout_message=(MSG.LDEV_DELETION_WAIT_TIMEOUT,
-                                     {'ldev': parent_ldev}))
+                self.check_then_delete_vcp(ldev, parent_ldev, body)
 
     def _get_snap_pool_id(self, pvol):
         return (
@@ -543,7 +595,8 @@ class HBSDREST(common.HBSDCommon):
                 MSG.PAIR_STATUS_WAIT_TIMEOUT, svol=ldev)
             self.raise_error(msg)
 
-    def _create_snap_pair(self, pvol, svol):
+    def _create_snap_pair(self, pvol, svol,
+                          retention=common.NO_SNAPSHOT_RETENTION):
         """Create a snapshot copy pair on the storage."""
         snapshot_name = '%(prefix)s%(svol)s' % {
             'prefix': self.driver_info['driver_prefix'] + '-snap',
@@ -557,6 +610,8 @@ class HBSDREST(common.HBSDCommon):
                     "autoSplit": True,
                     "canCascade": True,
                     "isDataReductionForceCopy": True}
+            if retention != common.NO_SNAPSHOT_RETENTION and retention > 0:
+                body['retentionPeriod'] = retention
             self.client.add_snapshot(body)
         except exception.VolumeDriverException as ex:
             if (utils.safe_get_err_code(ex.kwargs.get('errobj')) ==
@@ -653,8 +708,12 @@ class HBSDREST(common.HBSDCommon):
                     "canCascade": True}
             self.client.add_snapshot(body)
         except exception.VolumeDriverException as ex:
-            if (utils.safe_get_err_code(ex.kwargs.get('errobj')) ==
-                    rest_api.INVALID_SNAPSHOT_POOL and
+            err_code = utils.safe_get_err_code(ex.kwargs.get('errobj'))
+            if err_code == rest_api.SVOL_COPY_IN_USE:
+                LOG.debug('SVOL_COPY_IN_USE: svol already in use, '
+                          'proceeding to convert existing pair. '
+                          '(pvol: %s, svol: %s)', pvol, svol)
+            elif (err_code == rest_api.INVALID_SNAPSHOT_POOL and
                     not self.conf.hitachi_snap_pool):
                 msg = self.output_log(
                     MSG.INVALID_PARAMETER,
@@ -702,10 +761,12 @@ class HBSDREST(common.HBSDCommon):
             self._create_regular_clone_pair(pvol, svol, snap_pool_id)
 
     def create_pair_on_storage(
-            self, pvol, svol, snap_pool_id, is_snapshot=False):
+            self, pvol, svol, snap_pool_id, is_snapshot=False,
+            snapshot_retention_period=common.NO_SNAPSHOT_RETENTION):
         """Create a copy pair on the storage."""
         if is_snapshot:
-            self._create_snap_pair(pvol, svol)
+            self._create_snap_pair(pvol, svol,
+                                   retention=snapshot_retention_period)
         else:
             self._create_clone_pair(pvol, svol, snap_pool_id)
 
@@ -1224,7 +1285,7 @@ class HBSDREST(common.HBSDCommon):
         ldev_info = self.get_ldev_info(
             _CHECK_LDEV_SIZE_KEYS, ldev)
         _check_ldev_size(self, ldev_info, ldev, existing_ref)
-        return ldev_info['blockCapacity'] / utils.GIGABYTE_PER_BLOCK_SIZE
+        return utils.blocks_to_gb(ldev_info)
 
     def _get_pool_id(self, pool_list, pool_name_or_id):
         """Get the pool id from specified name."""
@@ -1668,11 +1729,223 @@ class HBSDREST(common.HBSDCommon):
         msg = self.output_log(MSG.MAP_PAIR_TARGET_FAILED, ldev=ldev)
         self.raise_error(msg)
 
+    @coordination.synchronized(
+        '{self.driver_info[driver_file_prefix]}-si-migration-'
+        '{self.conf.hitachi_storage_id}-{port}')
+    def _create_migrate_hostgrp_then_add_ldevs(self, pvol, svol, port):
+        """Create migration host group and add PVOL/SVOL LUNs under a lock."""
+        # create host group "HBSD-migration-shadow-image"
+        migration_host_grp_name = (self.driver_info['target_prefix'] +
+                                   _MIGRATION_TARGET_NAME_BODY)
+        gid = None
+        try:
+            gid = self.client.add_host_grp(
+                {'portId': port, 'hostGroupName': migration_host_grp_name},
+                no_log=True)
+        except exception.VolumeDriverException:
+            # Host group may be a leftover from a previously failed migration.
+            # Find and reuse it.
+            host_grp_list = self.client.get_host_grps({'portId': port})
+            gid = next(
+                (hg['hostGroupNumber'] for hg in host_grp_list
+                 if hg['hostGroupName'] == migration_host_grp_name),
+                None)
+            if gid is None:
+                self.output_log(MSG.CREATE_HOST_GROUP_FAILED, port=port)
+                raise
+            LOG.debug('reusing existing migration hostgrp. '
+                      'port: %r, gid: %r', port, gid)
+        # add PVOL/SVOL to host group
+        try:
+            self._run_add_lun(pvol, port, gid)
+        except exception.VolumeDriverException:
+            self.output_log(
+                MSG.MAP_LDEV_FAILED, ldev=pvol, port=port, id=gid, lun=None)
+            raise
+        try:
+            self._run_add_lun(svol, port, gid)
+        except exception.VolumeDriverException:
+            self.output_log(
+                MSG.MAP_LDEV_FAILED, ldev=svol, port=port, id=gid, lun=None)
+            self.client.delete_lun(port, gid, pvol)
+            raise
+        #
+        LOG.debug('created hostgrp/lun. port: %r,gid: %r,pvol: %r,svol: %r',
+                  port, gid, pvol, svol)
+        return gid
+
+    @coordination.synchronized(
+        '{self.driver_info[driver_file_prefix]}-si-migration-'
+        '{self.conf.hitachi_storage_id}-{port}')
+    def _del_migrate_ldevs_then_destroy_hostgrp(self, pvol, svol, port, gid):
+        """Remove PVOL/SVOL LUNs and delete migration host group"""
+        LOG.debug('will del hostgrp/ldevs. port=%r,gid=%r,pvol=%r,svol=%r',
+                  port, gid, pvol, svol)
+        # Remove PVOL and SVOL from host group
+        for ldev in (pvol, svol):
+            lun = self._find_lun(ldev, port, gid)
+            if lun is not None:
+                self.client.delete_lun(port, gid, lun)
+        # Delete host group.
+        self.delete_target_from_storage(port, gid)
+        LOG.debug('del hostgrp/ldevs done. port=%r,gid=%r,pvol=%r,svol=%r',
+                  port, gid, pvol, svol)
+
+    def _cleanup_after_shadow_image_migrate(
+            self, pvol, svol, port, gid,
+            copy_group_name, pvol_device_group_name,
+            svol_device_group_name, copy_pair_name,
+            delete_svol):
+        """Delete SI copy pair, migration host group, and SVOL."""
+        # Step 1: delete ShadowImage copy pair
+        try:
+            LOG.debug('csim. will delete SI copy pair. copy_group_name: %r, '
+                      'pvol_device_group_name: %r, '
+                      'svol_device_group_name: %r, copy_pair_name: %r',
+                      copy_group_name, pvol_device_group_name,
+                      svol_device_group_name, copy_pair_name)
+            self.client.delete_local_clone_copypair(
+                copy_group_name, pvol_device_group_name,
+                svol_device_group_name, copy_pair_name)
+        except exception.VolumeDriverException:
+            self.output_log(MSG.DELETE_PAIR_FAILED, pvol=pvol, svol=svol)
+
+        # Step 2: remove PVOL/SVOL LUNs from migration host group, then
+        #         delete the host group
+        try:
+            LOG.debug('csim. del hostgrp and remove LDEVs.'
+                      ' port: %r, gid: %r, pvol: %r, svol: %r',
+                      port, gid, pvol, svol)
+            self._del_migrate_ldevs_then_destroy_hostgrp(pvol,
+                                                         svol, port, gid)
+        except exception.VolumeDriverException:
+            self.output_log(
+                MSG.DELETE_TARGET_FAILED, port=port, id=gid)
+
+        # Step 3: delete SVOL if needed
+        if delete_svol:
+            try:
+                LOG.debug('csim. will delete SVOL. svol: %r', svol)
+                self.delete_ldev(svol)
+            except exception.VolumeDriverException:
+                self.output_log(MSG.DELETE_LDEV_FAILED, ldev=svol)
+
+    def _wait_si_copy_pair_status(self, copy_group_name,
+                                  pvol_device_group_name,
+                                  svol_device_group_name,
+                                  copy_pair_name, svol, **kwargs):
+        """Wait until the ShadowImage pair finish."""
+        interval = kwargs.pop(
+            'interval', self.conf.hitachi_copy_check_interval)
+        timeout = kwargs.pop(
+            'timeout', self.conf.hitachi_state_transition_timeout)
+        success = PSUS
+        failure = PSUE
+
+        def _wait_for_si_pair_status(start_time, success, failure, timeout):
+            """Raise LoopingCallDone when pair reaches target status."""
+            if not isinstance(success, set):
+                success = set([success])
+            result = self.client.get_local_clone_copypair(
+                copy_group_name, pvol_device_group_name,
+                svol_device_group_name, copy_pair_name)
+            LOG.debug('wfsps. result: %r', result)
+            current = _STATUS_TABLE.get(result.get('pvolStatus'), UNKN)
+            if current == failure:
+                raise loopingcall.LoopingCallDone(False)
+            if current in success:
+                raise loopingcall.LoopingCallDone()
+            if utils.timed_out(start_time, timeout):
+                raise loopingcall.LoopingCallDone(False)
+
+        loop = loopingcall.FixedIntervalLoopingCall(
+            _wait_for_si_pair_status, timeutils.utcnow(),
+            success, failure, timeout)
+        if not loop.start(interval=interval).wait():
+            msg = self.output_log(
+                MSG.PAIR_STATUS_WAIT_TIMEOUT, svol=svol)
+            self.raise_error(msg)
+
+    def _copy_ldev_by_shadow_image(self, pvol, volume, extra_specs,
+                                   new_pool_id, ldev_range, qos_specs):
+        """Copy an LDEV to a new pool using a ShadowImage pair."""
+        # step 1: create a new LDEV as SVOL in the new pool
+        svol = self.create_ldev(
+            volume.size, extra_specs, new_pool_id, ldev_range,
+            qos_specs=qos_specs)
+        port = self._get_pair_ports()[0]
+        LOG.debug('clbsi. port=%r, pvol=%r, svol=%r, newPool=%r,extraSpecs=%r',
+                  port, pvol, svol, new_pool_id, extra_specs)
+        # step 2: create "migration host group" then add PVOL/SVOL into it
+        gid = self._create_migrate_hostgrp_then_add_ldevs(pvol, svol, port)
+
+        try:
+            # step 3: create ShadowImage with PVOL and SVOL
+            copy_group_name = '%(prefix)s-SI-%(pvol)d' % {
+                'prefix': self.driver_info['driver_prefix'],
+                'pvol': pvol,
+            }
+            copy_pair_name = '%(prefix)s-%(pvol)d-%(svol)d' % {
+                'prefix': self.driver_info['driver_prefix'],
+                'pvol': pvol,
+                'svol': svol,
+            }
+            pvol_device_group_name = copy_group_name + 'P_'
+            svol_device_group_name = copy_group_name + 'S_'
+            body = {
+                "copyGroupName": copy_group_name,
+                "copyPairName": copy_pair_name,
+                "replicationType": "SI",
+                "pvolLdevId": pvol,
+                "svolLdevId": svol,
+                "pvolDeviceGroupName": pvol_device_group_name,
+                "svolDeviceGroupName": svol_device_group_name,
+                "isNewGroupCreation": True,
+                "pvolMuNumber": 0,
+                "copyPace": 15,
+                "autoSplit": True,
+                "quickMode": True,
+                "isDataReductionForceCopy": True,
+            }
+            LOG.debug('clbsi. Will create copypair. body: %r', body)
+            self.client.add_local_clone_copypair(body)
+            # step 4: wait finish
+            LOG.debug('clbsi. created copypair, wait finish. body: %r', body)
+            self._wait_si_copy_pair_status(
+                copy_group_name, pvol_device_group_name,
+                svol_device_group_name, copy_pair_name,
+                svol)
+        except Exception:
+            self.output_log(
+                MSG.MIGRATE_SI_FAILED, pvol=repr(pvol), svol=repr(svol),
+                pool=repr(new_pool_id), port=repr(port))
+            with excutils.save_and_reraise_exception():
+                self._cleanup_after_shadow_image_migrate(
+                    pvol, svol, port, gid,
+                    copy_group_name, pvol_device_group_name,
+                    svol_device_group_name, copy_pair_name,
+                    delete_svol=True)
+
+        # step 5: destroy copy pair
+        # step 6: del PVOL/SVOL from "migration host group" then del hostGroup
+        LOG.debug('clbsi. will clearup. body: %r', body)
+        self._cleanup_after_shadow_image_migrate(
+            pvol, svol, port, gid,
+            copy_group_name, pvol_device_group_name,
+            svol_device_group_name, copy_pair_name,
+            delete_svol=False)
+
+        # step 7: return svol
+        return svol
+
     def migrate_volume(self, volume, host, new_type=None):
         """Migrate the specified volume."""
         attachments = volume.volume_attachment
         if attachments:
             return False, None
+
+        LOG.debug('migvol. volume=%r; host=%r; new_type=%r',
+                  volume, host, new_type)
 
         pvol = self.get_ldev(volume)
         if pvol is None:
@@ -1681,6 +1954,7 @@ class HBSDREST(common.HBSDCommon):
             self.raise_error(msg)
 
         pair_info = self.get_pair_info(pvol)
+        LOG.debug('migvol.pair_info: %r', pair_info)
         if pair_info:
             if pair_info['pvol'] == pvol:
                 svols = []
@@ -1717,15 +1991,18 @@ class HBSDREST(common.HBSDCommon):
         old_storage_id = self.conf.hitachi_storage_id
         new_storage_id = (
             host['capabilities']['location_info'].get('storage_id'))
+        pvol_ldev_info = self.get_ldev_info(['poolId', 'attributes'], pvol)
+        old_pool_id = None
         if new_type is None:
-            old_pool_id = self.get_ldev_info(['poolId'], pvol)['poolId']
+            old_pool_id = pvol_ldev_info['poolId']
         new_pool_id = host['capabilities']['location_info'].get('pool_id')
 
         if old_storage_id != new_storage_id:
             return False, None
 
         ldev_range = host['capabilities']['location_info'].get('ldev_range')
-        if (new_type or old_pool_id != new_pool_id or
+        if (new_type or
+                (old_pool_id is not None and old_pool_id != new_pool_id) or
                 (ldev_range and
                  (pvol < ldev_range[0] or ldev_range[1] < pvol))):
             extra_specs = self.get_volume_extra_specs(volume)
@@ -1738,12 +2015,28 @@ class HBSDREST(common.HBSDCommon):
                 'snap_pool_id')
             ldev_range = host['capabilities']['location_info'].get(
                 'ldev_range')
-            svol = self.copy_on_storage(
-                pvol, volume.size, extra_specs, new_pool_id,
-                snap_pool_id, ldev_range,
-                is_snapshot=False, sync=True, qos_specs=qos_specs)
+            LOG.debug('migvol. extra_specs=%r; pvol_ldev_info=%r',
+                      extra_specs, pvol_ldev_info)
+            pvol_is_drs = utils.is_vclone(
+                extra_specs, pvol_ldev_info,
+                pvol_ldev_info['poolId'],
+                pvol_ldev_info['poolId'],
+                self._get_driver_context())
+            svol = None
+            LOG.debug('migvol. pvol_is_drs=%r; old_pool_id=%r; new_pool_id=%r',
+                      pvol_is_drs, old_pool_id, new_pool_id)
+            if pvol_is_drs and \
+               (old_pool_id is not None and old_pool_id != new_pool_id):
+                svol = self._copy_ldev_by_shadow_image(
+                    pvol, volume, extra_specs, new_pool_id,
+                    ldev_range, qos_specs)
+            else:
+                svol = self.copy_on_storage(
+                    pvol, volume.size, extra_specs, new_pool_id,
+                    snap_pool_id, ldev_range,
+                    is_snapshot=False, sync=True, qos_specs=qos_specs)
             self.modify_ldev_name(svol, volume['id'].replace("-", ""))
-
+            LOG.debug('migvol. svol=%r, volume_id=%r', svol, volume['id'])
             try:
                 self.delete_ldev(pvol)
             except exception.VolumeDriverException:
@@ -1770,7 +2063,8 @@ class HBSDREST(common.HBSDCommon):
             if is_drs:
                 return False
             return dr_status in _DISABLE_ABLE_DR_STATUS.get(dr_mode, ())
-        elif new_dr_mode == 'compression_deduplication':
+        elif (new_dr_mode == 'compression_deduplication' or
+              new_dr_mode == 'compression'):
             return dr_status in _DEDUPCOMP_ABLE_DR_STATUS.get(dr_mode, ())
         return False
 
@@ -1805,14 +2099,14 @@ class HBSDREST(common.HBSDCommon):
         new_drs = None
         allowed_extra_specs = []
         if self.driver_info.get('driver_dir_name'):
-            extra_specs_capacity_saving = (
-                self.driver_info['driver_dir_name'] + ':capacity_saving')
+            extra_specs_capacity_saving = utils.format_extra_spec(
+                self.driver_info, utils.EXTRA_SPEC_CSV)
             new_capacity_saving = (
                 new_type['extra_specs'].get(extra_specs_capacity_saving))
             allowed_extra_specs.append(extra_specs_capacity_saving)
 
-            extra_specs_drs = (
-                self.driver_info['driver_dir_name'] + ':drs')
+            extra_specs_drs = utils.format_extra_spec(self.driver_info,
+                                                      utils.EXTRA_SPEC_DRS)
             new_drs = (
                 new_type['extra_specs'].get(extra_specs_drs))
 
@@ -1887,6 +2181,10 @@ class HBSDREST(common.HBSDCommon):
             self.raise_error(msg)
 
     def create_target_name(self, connector):
+        if ('ip' in connector and
+                connector['ip'] == _MIGRATION_TARGET_NAME_BODY):
+            return (self.driver_info['target_prefix'] +
+                    _MIGRATION_TARGET_NAME_BODY)
         if ('ip' in connector and connector['ip']
                 == self._PAIR_TARGET_NAME_BODY):
             return self._PAIR_TARGET_NAME

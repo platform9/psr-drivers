@@ -50,6 +50,9 @@ _KEEP_SESSION_LOOP_INTERVAL = 3 * 60
 _ANOTHER_LDEV_MAPPED_RETRY_TIMEOUT = 10 * 60
 _LOCK_RESOURCE_GROUP_TIMEOUT = 3 * 60
 _MAX_REQUEST_WORKERS = 8
+_CSV_DELETE_TIMEOUT = 10 * 60
+_VCP_DELETE_TIMEOUT = 120
+_VCP_DELETE_RETRY_INTERVAL = 3
 
 _TCP_KEEPIDLE = 60
 _TCP_KEEPINTVL = 15
@@ -72,6 +75,7 @@ _MSGID_REST_SERVER_BUSY = ('KART00003-E',)
 _MSGID_LOCK_FAILURE = ('KART40050-E', 'KART40051-E', 'KART40052-E')
 EXCEED_WWN_MAX = ('B957', '4184')
 ANOTHER_LDEV_MAPPED = ('B958', '0947')
+SVOL_COPY_IN_USE = ('2E30', '0078')
 REST_NO_RETRY_ERRORS = [
     ('2E10', '9705'),
     ('2E10', '9706'),
@@ -935,6 +939,14 @@ class RestApiClient():
         }
         self._add_object(url, body=body)
 
+    def get_snapshotfamily(self, ldev_id, **kwargs):
+        """Get information about volumes that have the vClone attribute."""
+        url = '%(url)s/snapshot-family?ldevId=%(id)d' % {
+            'url': self.object_url,
+            'id': ldev_id,
+        }
+        return self._get_objects(url, **kwargs)
+
     def discard_zero_page(self, ldev_id):
         """Return the ldev's no-data pages to the storage pool."""
         url = '%(url)s/ldevs/%(id)s/actions/%(action)s/invoke' % {
@@ -943,6 +955,47 @@ class RestApiClient():
             'action': 'discard-zero-page',
         }
         self._invoke(url)
+
+    def add_local_clone_copypair(self, body, **kwargs):
+        """Create a ShadowImage pair."""
+        url = '%(url)s/local-clone-copypairs' % {
+            'url': self.object_url,
+        }
+        return self._add_object(url, body=body, **kwargs)[0]
+
+    def get_local_clone_copypair(self, copy_group_name,
+                                 pvol_device_group_name,
+                                 svol_device_group_name,
+                                 copy_pair_name, **kwargs):
+        """Get information about a specific ShadowImage pair."""
+        local_clone_copypair_id = '%(cg)s,%(pvol_dg)s,%(svol_dg)s,%(pair)s' % {
+            'cg': copy_group_name,
+            'pvol_dg': pvol_device_group_name,
+            'svol_dg': svol_device_group_name,
+            'pair': copy_pair_name,
+        }
+        url = '%(url)s/local-clone-copypairs/%(id)s' % {
+            'url': self.object_url,
+            'id': local_clone_copypair_id,
+        }
+        return self._get_object(url, **kwargs)
+
+    def delete_local_clone_copypair(self, copy_group_name,
+                                    pvol_device_group_name,
+                                    svol_device_group_name,
+                                    copy_pair_name, **kwargs):
+        """Delete a ShadowImage pair."""
+        local_clone_copypair_id = '%(cg)s,%(pvol_dg)s,%(svol_dg)s,%(pair)s' % {
+            'cg': copy_group_name,
+            'pvol_dg': pvol_device_group_name,
+            'svol_dg': svol_device_group_name,
+            'pair': copy_pair_name,
+        }
+        url = '%(url)s/local-clone-copypairs/%(id)s' % {
+            'url': self.object_url,
+            'id': local_clone_copypair_id,
+        }
+        self._delete_object(url, **kwargs)
 
     def get_journals(self):
         url = '%(url)s/journals' % {

@@ -53,12 +53,9 @@ STR_SNAPSHOT = 'snapshot'
 
 STR_MANAGED_VCP_LDEV_NAME = 'HBSD-VCP'
 
-_UUID_PATTERN = re.compile(r'^[\da-f]{32}$')
+NO_SNAPSHOT_RETENTION = 0
 
-DRS_MODE = {
-    '<is> True': True,
-    '<is> False': False,
-}
+_UUID_PATTERN = re.compile(r'^[\da-f]{32}$')
 
 _INHERITED_VOLUME_OPTS = [
     'volume_backend_name',
@@ -136,9 +133,26 @@ COMMON_VOLUME_OPTS = [
              'a copy pair deletion or data restoration.'),
     cfg.BoolOpt(
         'hitachi_manage_drs_volumes',
-        default=False,
+        default=True,
         help='If true, the driver will create a driver managed vClone parent '
-             'for each non-cloned DRS volume it creates.'),
+             'for each non-cloned DRS volume it creates. It is recommended '
+             'to keep this value True to avoid issues with volume expansion '
+             'while using DRS volumes.'),
+    cfg.BoolOpt(
+        'hitachi_use_drs_volumes',
+        default=False,
+        help='If True, the driver will always create DRS volumes unless '
+             'specifically told not to via extra specs.'),
+    cfg.StrOpt(
+        'hitachi_drs_default_csv',
+        default='deduplication_compression',
+        help='The default capacity saving value to use when '
+             'hitachi_use_drs_volumes is enabled and no extra spec has been '
+             'specified.'),
+    cfg.BoolOpt(
+        'hitachi_report_discard_support',
+        default=False,
+        help='Set True to announce auto unmap/discard support.'),
 ]
 
 COMMON_PORT_OPTS = [
@@ -311,32 +325,33 @@ class HBSDCommon():
     def is_managed_drs_volume(self, extra_specs):
 
         is_managed_drs = False
-        if (self.conf.hitachi_manage_drs_volumes and
-                self.driver_info.get('driver_dir_name')):
-
-            extra_specs_drs = (self.driver_info['driver_dir_name'] +
-                               ':drs')
-            drs = extra_specs.get(extra_specs_drs)
-
-            is_managed_drs = DRS_MODE.get(drs, False)
+        if (self.conf.hitachi_manage_drs_volumes):
+            _, drs = self._get_csv_and_drs(extra_specs)
+            is_managed_drs = drs
 
         return is_managed_drs
+
+    def _get_driver_context(self):
+        return utils.DriverContext(self.driver_info, self.conf,
+                                   self.storage_id)
+
+    def _get_csv_and_drs(self, extra_specs):
+        return utils.get_csv_and_drs(self._get_driver_context(), extra_specs)
 
     def get_drs_parent_extra_specs(self, extra_specs):
         """Build subset of extra specs for a DRS vClone parent."""
 
         extra_specs_parent = {}
 
-        extra_specs_drs = (self.driver_info['driver_dir_name'] +
-                           ':drs')
-        drs = extra_specs.get(extra_specs_drs)
+        csv, drs = self._get_csv_and_drs(extra_specs)
 
-        extra_specs_csv = (self.driver_info['driver_dir_name'] +
-                           ':capacity_saving')
-        capacity_saving = extra_specs.get(extra_specs_csv)
-
-        extra_specs_parent[extra_specs_drs] = drs
-        extra_specs_parent[extra_specs_csv] = capacity_saving
+        extra_specs_parent[
+            utils.format_extra_spec(self.driver_info,
+                                    utils.EXTRA_SPEC_DRS)] = (utils.DRS_TRUE if
+                                                              drs else
+                                                              utils.DRS_FALSE)
+        extra_specs_parent[utils.format_extra_spec(self.driver_info,
+                                                   utils.EXTRA_SPEC_CSV)] = csv
 
         LOG.debug("Managed parent extra specs: %s", extra_specs_parent)
 
@@ -388,7 +403,8 @@ class HBSDCommon():
         raise NotImplementedError()
 
     def create_pair_on_storage(
-            self, pvol, svol, snap_pool_id, is_snapshot=False):
+            self, pvol, svol, snap_pool_id, is_snapshot=False,
+            snapshot_retention_period=NO_SNAPSHOT_RETENTION):
         """Create a copy pair on the storage."""
         raise NotImplementedError()
 
@@ -396,21 +412,85 @@ class HBSDCommon():
         """Wait until copy is completed."""
         raise NotImplementedError()
 
+    def _extend_ldevs_for_ss(self, svol, ldev_info, curr_size, new_size):
+        if new_size == curr_size:
+            return
+        LOG.debug("extend-svol=%s, curr_size=%d,new_size=%d ",
+                  svol, curr_size, new_size)
+        self._extend_ldevs(ldev_info, new_size, svol, curr_size)
+
+    def _get_snapshot_retention_period(self, extra_specs, meta_data):
+        extra_specs_ss_ret = (self.driver_info['driver_dir_name'] +
+                              ':snapshot_retention')
+
+        do_raise = False
+
+        if meta_data and extra_specs_ss_ret in meta_data:
+            ss_ret = meta_data[extra_specs_ss_ret]
+        else:
+            ss_ret = extra_specs.get(extra_specs_ss_ret)
+
+        if ss_ret is not None:
+            try:
+                int_ss_ret = int(ss_ret)
+
+                # Also make sure that we haven't been given a floating
+                # point value that is not equal to a whole number.
+                if float(ss_ret) != float(int_ss_ret):
+                    do_raise = True
+
+                ss_ret = int_ss_ret
+            except ValueError:
+                do_raise = True
+        else:
+            ss_ret = NO_SNAPSHOT_RETENTION  # No Retention
+
+        if do_raise or ss_ret < 0:
+            msg = self.output_log(MSG.INVALID_SNAPSHOT_RETENTION_VALUE,
+                                  retention=ss_ret)
+            self.raise_error(msg)
+
+        return ss_ret
+
     def copy_on_storage(
             self, pvol, size, extra_specs, pool_id, snap_pool_id, ldev_range,
-            is_snapshot=False, sync=False, is_rep=False, qos_specs=None):
+            is_snapshot=False, sync=False, is_rep=False, qos_specs=None,
+            meta_data=None):
         """Create a copy of the specified LDEV on the storage."""
-        ldev_info = self.get_ldev_info(['status', 'attributes'], pvol)
+        ldev_info = self.get_ldev_info(
+            ['blockCapacity', 'poolId', 'status', 'attributes',
+             'parentLdevId'], pvol)
         if ldev_info['status'] != 'NML':
             msg = self.output_log(MSG.INVALID_LDEV_STATUS_FOR_COPY, ldev=pvol)
             self.raise_error(msg)
+
+        snapshot_retention_period = 0
+        if is_snapshot:
+            snapshot_retention_period =\
+                self._get_snapshot_retention_period(
+                    extra_specs, meta_data)
+
+        new_size = size
+        if not is_snapshot and utils.is_vclone(
+                extra_specs, ldev_info, pool_id, snap_pool_id,
+                self._get_driver_context()):
+            new_size = utils.blocks_to_gb(ldev_info)
+        LOG.debug("pvol=%d, is_snapshot=%s, extra_specs=%s, "
+                  "pvol_ldev_info=%s, new_size=%d, size=%d, "
+                  "pool_id=%d, snap_pool_id=%d",
+                  pvol, is_snapshot, repr(extra_specs), repr(ldev_info),
+                  new_size, size, pool_id, snap_pool_id)
         svol = self.create_ldev(
-            size, extra_specs, pool_id, ldev_range, qos_specs=qos_specs)
+            new_size, extra_specs, pool_id, ldev_range, qos_specs=qos_specs)
         try:
             self.create_pair_on_storage(
-                pvol, svol, snap_pool_id, is_snapshot=is_snapshot)
+                pvol, svol, snap_pool_id, is_snapshot=is_snapshot,
+                snapshot_retention_period=snapshot_retention_period)
             if sync or is_rep:
                 self.wait_copy_completion(pvol, svol)
+            if size != new_size:
+                self._extend_ldevs_for_ss(svol, ldev_info,
+                                          new_size, size)
         except Exception:
             with excutils.save_and_reraise_exception():
                 try:
@@ -593,9 +673,12 @@ class HBSDCommon():
         snap_pool_id = self.storage_info['snap_pool_id']
         ldev_range = self.storage_info['ldev_range']
         qos_specs = utils.get_qos_specs_from_volume(snapshot)
+        meta_data = None
+        if 'metadata' in snapshot:
+            meta_data = snapshot['metadata']
         new_ldev = self.copy_on_storage(
             ldev, size, extra_specs, pool_id, snap_pool_id, ldev_range,
-            is_snapshot=True, qos_specs=qos_specs)
+            is_snapshot=True, qos_specs=qos_specs, meta_data=meta_data)
         self.modify_ldev_name(new_ldev, snapshot.id.replace("-", ""))
         return {
             'provider_location': str(new_ldev),
@@ -709,6 +792,24 @@ class HBSDCommon():
         """Extend the specified LDEV to the specified new size."""
         raise NotImplementedError()
 
+    def _extend_ldevs(self, ldev_info, new_size, ldev,
+                      old_size):
+        parent_ldev_id = ldev_info.get('parentLdevId')
+        if parent_ldev_id:
+            parent_ldev_id = int(parent_ldev_id)
+            parent_ldev_info = self.get_ldev_info(
+                ['blockCapacity', 'label'], parent_ldev_id)
+            if (parent_ldev_info['label'] and
+                    parent_ldev_info['label'] == STR_MANAGED_VCP_LDEV_NAME and
+                    (utils.blocks_to_gb(parent_ldev_info) < new_size)):
+                LOG.debug("Will extend managed VCP parent ldev %d to %d GB",
+                          parent_ldev_id, new_size)
+                self.extend_ldev(parent_ldev_id,
+                                 utils.blocks_to_gb(parent_ldev_info),
+                                 new_size)
+        LOG.debug("Will extend _ldev %d to %d GB", ldev, new_size)
+        self.extend_ldev(ldev, old_size, new_size)
+
     def extend_volume(self, volume, new_size):
         """Extend the specified volume to the specified size."""
         ldev = self.get_ldev(volume)
@@ -731,25 +832,7 @@ class HBSDCommon():
 
         # Extend a Managed parent if we have one and it's necessary.
         ldev_info = self.get_ldev_info(['parentLdevId'], ldev)
-        if ldev_info['parentLdevId']:
-            parent_ldev = int(ldev_info['parentLdevId'])
-            parent_ldev_info = self.get_ldev_info(
-                ['blockCapacity', 'label'], parent_ldev)
-
-            if (parent_ldev_info['label'] and
-                parent_ldev_info['label'] == STR_MANAGED_VCP_LDEV_NAME and
-                (parent_ldev_info['blockCapacity'] /
-                 utils.GIGABYTE_PER_BLOCK_SIZE < new_size)):
-
-                LOG.debug("Resizing Managed parent volume %d.",
-                          parent_ldev)
-                self.extend_ldev(parent_ldev,
-                                 int(parent_ldev_info['blockCapacity'] /
-                                     utils.GIGABYTE_PER_BLOCK_SIZE),
-                                 new_size)
-
-        # Finally, extend our LDEV
-        self.extend_ldev(ldev, volume['size'], new_size)
+        self._extend_ldevs(ldev_info, new_size, ldev, volume['size'])
 
         # If we have adaptive QoS, let's update our QoS now as well.
         old_qos = utils.get_qos_specs_from_volume(volume)
@@ -1206,6 +1289,7 @@ class HBSDCommon():
                 if targets['lun'][target[0]]:
                     target_luns.append(target_lun)
             data['target_luns'] = target_luns
+        data['discard'] = self.conf.hitachi_report_discard_support
         return data
 
     # A synchronization to prevent conflicts between host group creation
@@ -1450,14 +1534,7 @@ class HBSDCommon():
             self.raise_error(msg)
 
     def raise_error(self, msg):
-        """Raise a VolumeDriverException by driver error message."""
-        message = _(
-            '%(prefix)s error occurred. %(msg)s' % {
-                'prefix': self.driver_info['driver_prefix'],
-                'msg': msg,
-            }
-        )
-        raise exception.VolumeDriverException(message)
+        utils.raise_error(self.driver_info, msg)
 
     def raise_busy(self):
         """Raise a VolumeDriverException by driver busy message."""
