@@ -69,7 +69,7 @@ Beyond the 8 core gaps:
 
 | Feature | Purpose |
 |---------|---------|
-| **Pair state and RPO in the pool capabilities** | With `hitachi_replication_report_pair_status` (default `true`), each pool carries `group_replication_pairs` — a JSON map of copy group → `{pair_status, consistency_time, journal_usage_rate, pair_count}` — plus `..._updated_at`, `..._peer_initialized` and `..._enumerated`. Read it with `GET /v3/scheduler-stats/get_pools?detail=True`. Cinder exposes replication lag and vendor pair state through no other API. Costs one Configuration Manager request per copy group per statistics cycle (60s by default), capped at 64 groups. |
+| **Pair state and RPO in the pool capabilities** | Always on: each pool carries `group_replication_pairs` — a JSON map of copy group → `{pair_status, consistency_time, journal_usage_rate, pair_count}` — plus `..._updated_at`, `..._peer_initialized` and `..._enumerated`. Read it with `GET /v3/scheduler-stats/get_pools?detail=True`. Cinder exposes replication lag and vendor pair state through no other API. Costs one Configuration Manager request per copy group per statistics cycle (60s by default), capped at 64 groups — there is no config option to disable this cost. |
 | **LDEV ids in volume metadata** | `hbsd_pvol_id`, `hbsd_svol_id` and `hbsd_copy_group` are stamped on each member, because `provider_location` appears in no Cinder API view and this driver sets no `provider_id`. |
 | **Selectable failover mode** | `secondary_backend_id` accepts a `:graceful` or `:emergency` suffix; a group type may set `hbsd:group_replication_failover_mode`. See [Failover mode](#failover-mode). |
 | **Recovery-site adoption** | A backend set to `hitachi_replication_role = target` adopts promoted S-VOLs instead of creating them: `manage_existing` accepts an LDEV whose copy pair still exists, `enable_replication` records the existing pairs without touching the array, and the takeover is issued to the local storage system rather than the peer. See [Recovery-site backends](#recovery-site-backends). |
@@ -80,12 +80,17 @@ Beyond the 8 core gaps:
 | **Secondary volumes are freed on disable** | `disable_replication`, and removing a member with `update_group`, delete the pair *and* the S-VOL, and drop `sldev` from `provider_location`. The driver created that S-VOL; once the pair is gone Cinder holds no record of it, so leaving it leaks an LDEV on the secondary array permanently. Re-enabling allocates a fresh S-VOL and does a full initial copy either way, because the pair is gone. |
 | `manage_existing_get_size()` | Size of an existing LDEV, for import validation. |
 
-**Deployment note.** `hitachi_replication_report_pair_status` is on by
-default and costs `1 + N` Configuration Manager requests every statistics
-cycle (60s), each copy-group read opening its own session on the peer -- up
-to 65 remote sessions a minute at the 64-group cap. Nothing in PSR reads
-`group_replication_pairs` today. Set it to `false` unless something is
-consuming it.
+**Deployment note.** Pair-status reporting is unconditional -- there is no
+config option to turn it off -- and costs `1 + N` Configuration Manager
+requests every statistics cycle (60s), each copy-group read opening its own
+session on the peer -- up to 65 remote sessions a minute at the 64-group cap.
+`psr-dr`'s `ProtectionGroupReconciler` reads `group_replication_pairs`
+through Cinder's scheduler-stats (`internal/storage/cinder.Client.
+GetGroupReplicationStatus`) as its first choice for replication pair status,
+falling back to a direct Configuration Manager call only when this capability
+isn't reported. Deployments with many copy groups should budget for the CM
+load; there is currently no way to opt out except by not enabling this
+driver's group replication at all.
 
 There is **no** `get_replication_lag()`. Cinder defines no such driver
 contract, so a driver method would be unreachable; the pool capabilities

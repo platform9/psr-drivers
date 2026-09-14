@@ -1434,20 +1434,25 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             self.fail('no create pair api')
         self.assertTrue(isDataReductionForceCopy)
 
+    @mock.patch.object(
+        hbsd_replication.HBSDREPLICATION, "_pair_status_capabilities")
     @mock.patch.object(driver.FibreChannelDriver, "get_goodness_function")
     @mock.patch.object(driver.FibreChannelDriver, "get_filter_function")
     @mock.patch.object(requests.Session, "request")
     def test_get_volume_stats(
-            self, request, get_filter_function, get_goodness_function):
+            self, request, get_filter_function, get_goodness_function,
+            pair_status_capabilities):
         request.return_value = FakeResponse(200, GET_POOLS_RESULT)
         get_filter_function.return_value = None
         get_goodness_function.return_value = None
         # PF9: reporting remote pair state in the pool capabilities costs one
         # Configuration Manager request per copy group on every statistics
-        # cycle, which would make the request count below meaningless. The
-        # reporting has its own tests in test_hitachi_hbsd_replication.py;
-        # this one is about the base driver's stats.
-        self.driver.common.conf.hitachi_replication_report_pair_status = False
+        # cycle -- unconditional, no config option to turn it off -- which
+        # would make the request count below meaningless. The reporting has
+        # its own tests in test_hitachi_hbsd_replication.py; this one is
+        # about the base driver's stats, so stub it out rather than let it
+        # run for real.
+        pair_status_capabilities.return_value = {}
         stats = self.driver.get_volume_stats(True)
         self.assertEqual('Hitachi', stats['vendor_name'])
         self.assertTrue(stats["pools"][0]['multiattach'])

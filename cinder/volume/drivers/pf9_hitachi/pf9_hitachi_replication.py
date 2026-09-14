@@ -71,8 +71,7 @@ a client has. It accepts an optional suffix:
 A group type may set ``hbsd:group_replication_failover_mode = graceful`` to
 change the default for every request against that group.
 
-**Reporting.** With ``hitachi_replication_report_pair_status`` enabled (the
-default) the pool capabilities carry per-copy-group state under
+**Reporting.** The pool capabilities always carry per-copy-group state under
 ``group_replication_pairs``, readable through
 ``GET /v3/scheduler-stats/get_pools?detail=True``. Cinder exposes neither
 replication lag nor a vendor pair state through any other API.

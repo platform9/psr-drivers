@@ -228,16 +228,6 @@ COMMON_REPLICATION_OPTS = [
              'on a backend where volume-level replication is driven '
              'directly rather than through groups, which restores the '
              'upstream behaviour.'),
-    cfg.BoolOpt(
-        'hitachi_replication_report_pair_status',
-        default=True,
-        help='Whether or not to report remote replication pair state and '
-             'consistency time for each copy group in the pool capabilities. '
-             'Enabling this lets a client read pair state and replication '
-             'lag through the Block Storage scheduler-stats API instead of '
-             'querying the storage system directly, at the cost of one '
-             'Configuration Manager request per copy group on every '
-             'statistics cycle.'),
     cfg.IntOpt(
         'hitachi_replication_mun',
         default=1, min=0, max=3,
@@ -966,10 +956,7 @@ class HBSDREPLICATION(rest.HBSDREST):
                 # response down to a fixed field list, so these would be
                 # dropped there, while scheduler-stats returns the pool
                 # dict verbatim.
-                pair_status = (
-                    self._pair_status_capabilities()
-                    if self.conf.hitachi_replication_report_pair_status
-                    else {})
+                pair_status = self._pair_status_capabilities()
                 for pool in data['pools']:
                     pool.update(pair_status)
                     pool['replication_enabled'] = True
