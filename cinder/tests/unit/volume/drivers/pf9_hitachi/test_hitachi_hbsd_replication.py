@@ -1096,6 +1096,12 @@ class PF9GroupReplicationFCTest(test.TestCase):
         # to the wire and blocks 30s per connect.
         common.rep_secondary.modify_ldev_name = mock.Mock()
         common.rep_primary.modify_ldev_name = mock.Mock()
+        # Mapping an LDEV to the pair-target host group is an array call
+        # too; unstubbed it goes to the wire the same way.
+        common.rep_primary.initialize_pair_connection = mock.Mock()
+        common.rep_secondary.initialize_pair_connection = mock.Mock()
+        common.rep_primary.terminate_pair_connection = mock.Mock()
+        common.rep_secondary.terminate_pair_connection = mock.Mock()
         # Reading an LDEV's attributes is an array call; the double-pair
         # guard makes one per member added.
         common._has_rep_pair = mock.Mock(return_value=False)

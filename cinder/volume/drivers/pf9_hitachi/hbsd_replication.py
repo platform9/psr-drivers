@@ -2789,6 +2789,20 @@ class HBSDREPLICATION(rest.HBSDREST):
                     self.rep_secondary.storage_info['ldev_range'],
                     qos_specs=utils.get_qos_specs_from_volume(volume))
             try:
+                # HORCM/CCI issues the remote-copy commands themselves
+                # in-band, over a LU path distinct from any host
+                # attachment. _create_rep_ldev_and_pair maps both LDEVs to
+                # the pair-target host group before creating its pair;
+                # this path did not, and the storage system's REST API
+                # then failed to start the HORCM instance behind the
+                # pair-create job with nothing pointing here (KART40097-E
+                # / "HORCM inst N has failed to start").
+                thread = greenthread.spawn(
+                    self.rep_secondary.initialize_pair_connection, svol)
+                try:
+                    self.rep_primary.initialize_pair_connection(pvol)
+                finally:
+                    thread.wait()
                 # Name it after the volume, the same way
                 # _group_repl_manage_existing and the group snapshot path
                 # do. _delete_volume_pre_check identifies an S-VOL by
@@ -2804,6 +2818,14 @@ class HBSDREPLICATION(rest.HBSDREST):
                     is_new_copy_grp)
             except exception.VolumeDriverException:
                 with excutils.save_and_reraise_exception():
+                    # pvol is an existing volume this did not create, so
+                    # only its pair-target mapping is undone here, never
+                    # the LDEV itself. terminate_pair_connection only
+                    # touches the pair host group (_is_valid_target with
+                    # is_pair=True), so any compute-attach mapping on pvol
+                    # is untouched.
+                    self.rep_primary.terminate_pair_connection(pvol)
+                    self.rep_secondary.terminate_pair_connection(svol)
                     self.rep_secondary.delete_ldev(svol)
             utils.output_log(
                 MSG.GROUP_REPLICATION_PAIR_CREATED,
