@@ -2874,45 +2874,62 @@ class HBSDREPLICATION(rest.HBSDREST):
         """
         try:
             pvol = self.rep_primary.get_ldev(volume)
-            svol = self.rep_secondary.get_ldev(volume)
-            if pvol is None or svol is None:
+            if pvol is None:
                 msg = self.rep_primary.output_log(
                     MSG.LDEV_NUMBER_NOT_FOUND, operation=operation,
                     obj='volume', obj_id=volume.id)
                 self.raise_error(msg)
-            try:
-                with _log_step('delete replication pair',
-                               copy_group=copy_group_name,
-                               pvol=pvol, svol=svol):
-                    self.rep_primary.client.delete_remote_copypair(
-                        self.rep_secondary.client, copy_group_name,
-                        pvol, svol)
-            except exception.VolumeDriverException:
-                if not self._group_repl_pair_absent(copy_group_name, pvol):
-                    raise
-                # Nothing of ours to unpair, which is not a failure. It was
-                # reported as one, and an error here puts the group into
-                # replication status error -- out of which
-                # disable_replication is the only transition Cinder offers.
-                # The failure closed the one door out of itself.
+            svol = self.rep_secondary.get_ldev(volume)
+            if svol is None:
+                # No group pair was ever created for this member --
+                # enable_replication or update_group's add failed before
+                # _group_repl_add_volume set an svol, or a previous
+                # disable_replication/remove already cleared it. There is
+                # nothing to unpair and nothing to free, so this is not a
+                # failure. Raising here (as LDEV_NUMBER_NOT_FOUND used to)
+                # made the group unrecoverable: disable/remove is Cinder's
+                # one documented way out of a group stuck in replication
+                # status error, and the very member that put it there is
+                # the one this would fail on again.
                 LOG.info(
-                    'Group replication: no pair for P-VOL %(pvol)s in copy '
-                    'group %(cg)s, so there is nothing to disable. '
-                    '(volume: %(volume)s)',
-                    {'pvol': pvol, 'cg': copy_group_name,
-                     'volume': volume.id})
+                    'Group replication: volume %(volume)s has no S-VOL in '
+                    'copy group %(cg)s, so there is nothing to disable.',
+                    {'volume': volume.id, 'cg': copy_group_name})
             else:
-                utils.output_log(
-                    MSG.GROUP_REPLICATION_PAIR_DELETED,
-                    copy_group=copy_group_name, pvol=pvol, svol=svol)
-            # _group_repl_add_volume made this S-VOL for this pair and
-            # nothing else refers to it. With the pair gone Cinder holds no
-            # record of it at all, so leaving it behind leaks an LDEV on the
-            # secondary array permanently -- and a later enable_replication
-            # allocates a fresh one rather than finding it. A failure here
-            # is logged, not raised: the pair is already gone, so
-            # replication really is disabled.
-            if svol is not None:
+                try:
+                    with _log_step('delete replication pair',
+                                   copy_group=copy_group_name,
+                                   pvol=pvol, svol=svol):
+                        self.rep_primary.client.delete_remote_copypair(
+                            self.rep_secondary.client, copy_group_name,
+                            pvol, svol)
+                except exception.VolumeDriverException:
+                    if not self._group_repl_pair_absent(
+                            copy_group_name, pvol):
+                        raise
+                    # Nothing of ours to unpair, which is not a failure. It
+                    # was reported as one, and an error here puts the group
+                    # into replication status error -- out of which
+                    # disable_replication is the only transition Cinder
+                    # offers. The failure closed the one door out of itself.
+                    LOG.info(
+                        'Group replication: no pair for P-VOL %(pvol)s in '
+                        'copy group %(cg)s, so there is nothing to '
+                        'disable. (volume: %(volume)s)',
+                        {'pvol': pvol, 'cg': copy_group_name,
+                         'volume': volume.id})
+                else:
+                    utils.output_log(
+                        MSG.GROUP_REPLICATION_PAIR_DELETED,
+                        copy_group=copy_group_name, pvol=pvol, svol=svol)
+                # _group_repl_add_volume made this S-VOL for this pair and
+                # nothing else refers to it. With the pair gone Cinder
+                # holds no record of it at all, so leaving it behind leaks
+                # an LDEV on the secondary array permanently -- and a
+                # later enable_replication allocates a fresh one rather
+                # than finding it. A failure here is logged, not raised:
+                # the pair is already gone, so replication really is
+                # disabled.
                 try:
                     with _log_step('delete secondary volume',
                                    volume=volume.id, svol=svol):

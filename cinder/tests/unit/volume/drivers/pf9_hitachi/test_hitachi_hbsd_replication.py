@@ -2592,6 +2592,55 @@ class PF9GroupReplicationFCTest(test.TestCase):
         self.assertEqual(fields.ReplicationStatus.ERROR,
                          model_update['replication_status'])
 
+    def test_disable_replication_recovers_a_member_with_no_group_pair(self):
+        """A member whose group pair was never created must not wedge.
+
+        enable_replication or update_group's add can fail before
+        _group_repl_add_volume ever set an svol (LDEV_ALREADY_PAIRED, a
+        transient array error, ...), leaving the member in the group with
+        only its P-VOL known. Raising LDEV_NUMBER_NOT_FOUND here for that
+        member closed disable_replication -- Cinder's one documented way
+        out of a group stuck in replication status error -- on exactly the
+        member that put it there.
+        """
+        common = self._stub_common()
+        # _members: provider_location carries only pldev, so
+        # rep_secondary.get_ldev returns None -- no group pair was ever
+        # made for this member.
+        members = self._members(1)
+
+        model_update, vol_updates = self.driver.disable_replication(
+            self.ctxt, self._repl_group(), members)
+
+        common.rep_primary.client.delete_remote_copypair.assert_not_called()
+        common.rep_secondary.delete_ldev.assert_not_called()
+        self.assertEqual(fields.ReplicationStatus.DISABLED,
+                         vol_updates[0]['replication_status'])
+        self.assertEqual(fields.ReplicationStatus.DISABLED,
+                         model_update['replication_status'])
+
+    def test_update_group_remove_recovers_a_member_with_no_group_pair(self):
+        """The same recovery must apply through update_group's remove path.
+
+        Observed in production: disable_replication cleared a member's
+        sldev, and a separate update_group call with only that member in
+        remove_volumes (copy group already gone) raised
+        LDEV_NUMBER_NOT_FOUND and errored the whole group update.
+        """
+        common = self._stub_common()
+        members = self._members(1)
+
+        model_update, add_up, rm_up = self.driver.update_group(
+            self.ctxt, self._repl_group(), add_volumes=[],
+            remove_volumes=members)
+
+        common.rep_primary.client.delete_remote_copypair.assert_not_called()
+        self.assertEqual([], add_up)
+        self.assertEqual(fields.ReplicationStatus.DISABLED,
+                         rm_up[0]['replication_status'])
+        self.assertNotEqual(fields.GroupStatus.ERROR,
+                            model_update['status'])
+
     # ---- Pair creation must match the vendor contract and tell the truth --
 
     def test_mu_number_is_sent_only_for_a_new_copy_group(self):
