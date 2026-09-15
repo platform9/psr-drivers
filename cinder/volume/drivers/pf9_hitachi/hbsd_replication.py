@@ -2786,10 +2786,28 @@ class HBSDREPLICATION(rest.HBSDREST):
                     MSG.GROUP_REPLICATION_SNAPSHOT_DELETE_FAILED,
                     group_snapshot=group_snapshot.id)
 
+    def _is_pair_target_port(self, instance, port):
+        pair_targets = getattr(instance, '_pair_targets', None) or []
+        if (port.get('portId'), port.get('hostGroupNumber')) in pair_targets:
+            return True
+        pair_target_name = getattr(instance, '_PAIR_TARGET_NAME', None)
+        return bool(pair_target_name) and (
+            port.get('hostGroupName') == pair_target_name)
+
+    def _foreign_ldev_ports(self, instance, ldev_info):
+        if not ldev_info.get('numOfPorts'):
+            return []
+        ports = ldev_info.get('ports')
+        if not ports:
+            return None
+        return [port for port in ports
+                if not self._is_pair_target_port(instance, port)]
+
     def _check_adopted_svol_manageability(self, ldev, existing_ref):
         instance = self._svol_instance()
         ldev_info = instance.get_ldev_info(
-            ['emulationType', 'numOfPorts', 'attributes', 'status'], ldev)
+            ['emulationType', 'numOfPorts', 'attributes', 'status', 'ports'],
+            ldev)
         allowed = set([
             'CVS', utils.DRS_VOL_ATTR, utils.VC_VOL_ATTR, rest.REP_ATTR,
             self.driver_info['hdp_vol_attr'],
@@ -2804,7 +2822,12 @@ class HBSDREPLICATION(rest.HBSDREST):
                 ldevtype=self.driver_info['nvol_ldev_type'])
             raise exception.ManageExistingInvalidReference(
                 existing_ref=existing_ref, reason=msg)
-        if ldev_info['numOfPorts']:
+        # An adopted S-VOL is always mapped to the pair target host group by
+        # the driver itself, so the upstream "must not be mapped" rule would
+        # reject every volume this driver created. Only a path some host could
+        # actually use makes the LDEV unmanageable.
+        foreign_ports = self._foreign_ldev_ports(instance, ldev_info)
+        if foreign_ports is None or foreign_ports:
             msg = instance.output_log(
                 MSG.INVALID_LDEV_PORT_FOR_MANAGE, ldev=ldev)
             raise exception.ManageExistingInvalidReference(

@@ -3322,6 +3322,152 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             common._create_group_copy_group_name(TEST_GROUP[0].id),
             common._resolve_copy_group_name(group, []))
 
+    def _adopt_svol_instance(self, common, pair_targets=None,
+                             pair_target_name='HBSD-pair00'):
+        instance = common._svol_instance()
+        instance._pair_targets = (
+            [(CONFIG_MAP['port_id'], 5)] if pair_targets is None
+            else pair_targets)
+        instance._PAIR_TARGET_NAME = pair_target_name
+        return instance
+
+    @staticmethod
+    def _adopt_ldev_info(ports=None, **overrides):
+        info = {
+            'emulationType': 'OPEN-V-CVS',
+            'attributes': ['CVS', 'HDP', hbsd_rest.REP_ATTR],
+            'status': hbsd_rest.NORMAL_STS,
+            'numOfPorts': len(ports or []),
+            'ports': list(ports or []),
+        }
+        info.update(overrides)
+        return info
+
+    @staticmethod
+    def _port(host_group_number=5, host_group_name='HBSD-pair00',
+              port_id=None, lun=0):
+        return {
+            'portId': CONFIG_MAP['port_id'] if port_id is None else port_id,
+            'hostGroupNumber': host_group_number,
+            'hostGroupName': host_group_name,
+            'lun': lun,
+        }
+
+    def test_check_adopted_svol_manageability_allows_pair_target_path(self):
+        common = self._common()
+        instance = self._adopt_svol_instance(common)
+        ldev_info = self._adopt_ldev_info(ports=[self._port()])
+        with mock.patch.object(
+                instance, 'get_ldev_info', return_value=ldev_info):
+            self.assertIsNone(
+                common._check_adopted_svol_manageability(
+                    1, self.test_existing_ref))
+
+    def test_check_adopted_svol_manageability_matches_pair_target_by_name(
+            self):
+        common = self._common()
+        instance = self._adopt_svol_instance(common, pair_targets=[])
+        ldev_info = self._adopt_ldev_info(ports=[self._port()])
+        with mock.patch.object(
+                instance, 'get_ldev_info', return_value=ldev_info):
+            self.assertIsNone(
+                common._check_adopted_svol_manageability(
+                    1, self.test_existing_ref))
+
+    def test_check_adopted_svol_manageability_requests_ports(self):
+        common = self._common()
+        instance = self._adopt_svol_instance(common)
+        ldev_info = self._adopt_ldev_info(ports=[self._port()])
+        with mock.patch.object(
+                instance, 'get_ldev_info',
+                return_value=ldev_info) as get_ldev_info:
+            common._check_adopted_svol_manageability(
+                1, self.test_existing_ref)
+        self.assertIn('ports', get_ldev_info.call_args[0][0])
+
+    def test_check_adopted_svol_manageability_unmapped(self):
+        common = self._common()
+        instance = self._adopt_svol_instance(common)
+        with mock.patch.object(
+                instance, 'get_ldev_info',
+                return_value=self._adopt_ldev_info()):
+            self.assertIsNone(
+                common._check_adopted_svol_manageability(
+                    1, self.test_existing_ref))
+
+    def test_check_adopted_svol_manageability_rejects_host_path(self):
+        common = self._common()
+        instance = self._adopt_svol_instance(common)
+        ldev_info = self._adopt_ldev_info(
+            ports=[self._port(host_group_number=0,
+                              host_group_name=CONFIG_MAP['host_grp_name'])])
+        with mock.patch.object(
+                instance, 'get_ldev_info', return_value=ldev_info):
+            self.assertRaises(
+                exception.ManageExistingInvalidReference,
+                common._check_adopted_svol_manageability,
+                1, self.test_existing_ref)
+
+    def test_check_adopted_svol_manageability_rejects_mixed_paths(self):
+        common = self._common()
+        instance = self._adopt_svol_instance(common)
+        ldev_info = self._adopt_ldev_info(
+            ports=[self._port(),
+                   self._port(host_group_number=0,
+                              host_group_name=CONFIG_MAP['host_grp_name'])])
+        with mock.patch.object(
+                instance, 'get_ldev_info', return_value=ldev_info):
+            self.assertRaises(
+                exception.ManageExistingInvalidReference,
+                common._check_adopted_svol_manageability,
+                1, self.test_existing_ref)
+
+    def test_check_adopted_svol_manageability_rejects_undetailed_ports(self):
+        common = self._common()
+        instance = self._adopt_svol_instance(common)
+        ldev_info = self._adopt_ldev_info(numOfPorts=1, ports=None)
+        with mock.patch.object(
+                instance, 'get_ldev_info', return_value=ldev_info):
+            self.assertRaises(
+                exception.ManageExistingInvalidReference,
+                common._check_adopted_svol_manageability,
+                1, self.test_existing_ref)
+
+    def test_check_adopted_svol_manageability_bad_attributes(self):
+        common = self._common()
+        instance = self._adopt_svol_instance(common)
+        ldev_info = self._adopt_ldev_info(
+            ports=[self._port()], attributes=['CVS'])
+        with mock.patch.object(
+                instance, 'get_ldev_info', return_value=ldev_info):
+            self.assertRaises(
+                exception.ManageExistingInvalidReference,
+                common._check_adopted_svol_manageability,
+                1, self.test_existing_ref)
+
+    def test_foreign_ldev_ports_no_paths(self):
+        common = self._common()
+        instance = self._adopt_svol_instance(common)
+        self.assertEqual(
+            [],
+            common._foreign_ldev_ports(
+                instance, {'numOfPorts': 0, 'ports': []}))
+
+    def test_foreign_ldev_ports_undetailed(self):
+        common = self._common()
+        instance = self._adopt_svol_instance(common)
+        self.assertIsNone(
+            common._foreign_ldev_ports(
+                instance, {'numOfPorts': 2, 'ports': []}))
+
+    def test_is_pair_target_port_other_port_same_gid(self):
+        common = self._common()
+        instance = self._adopt_svol_instance(common)
+        self.assertFalse(
+            common._is_pair_target_port(
+                instance,
+                self._port(port_id='CL9-Z', host_group_name='HBSD-other')))
+
     def test_group_repl_aggregate_status_success(self):
         common = self._common()
         updates = [{'replication_status': fields.ReplicationStatus.ENABLED}]
