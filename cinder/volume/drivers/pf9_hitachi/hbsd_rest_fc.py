@@ -15,6 +15,10 @@
 #
 """REST interface fibre channel module for Hitachi HBSD Driver."""
 
+# PF9 Start
+from __future__ import annotations
+# PF9 End
+
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import excutils
