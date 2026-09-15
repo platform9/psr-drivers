@@ -660,7 +660,7 @@ class HBSDMIRRORFCDriverTest(test.TestCase):
                              group=conf.SHARED_CONF_GROUP)
         self.override_config(
             'volume_driver',
-            "cinder.volume.drivers.hitachi.hbsd_fc.HBSDFCDriver",
+            "cinder.volume.drivers.pf9_hitachi.hbsd_fc.HBSDFCDriver",
             group=conf.SHARED_CONF_GROUP)
         self.override_config('reserved_percentage', "0",
                              group=conf.SHARED_CONF_GROUP)
