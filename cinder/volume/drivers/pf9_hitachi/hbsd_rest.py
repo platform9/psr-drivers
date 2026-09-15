@@ -15,6 +15,10 @@
 #
 """REST interface module for Hitachi HBSD Driver."""
 
+# PF9 Start
+from __future__ import annotations
+# PF9 End
+
 from collections import defaultdict
 from itertools import count
 import json

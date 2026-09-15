@@ -15,6 +15,10 @@
 #
 """Utility module for Hitachi HBSD Driver."""
 
+# PF9 Start
+from __future__ import annotations
+# PF9 End
+
 import enum
 import functools
 import logging as base_logging

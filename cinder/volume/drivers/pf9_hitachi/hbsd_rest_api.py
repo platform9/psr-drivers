@@ -17,10 +17,19 @@ REST API client class for Hitachi HBSD Driver.
 
 """
 
+# PF9 Start
+from __future__ import annotations
+# PF9 End
+
 from http import client as httpclient
 import socket
 import threading
 import time
+# PF9 Start
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# PF9 End
 
 from oslo_log import log as logging
 from oslo_service import loopingcall
