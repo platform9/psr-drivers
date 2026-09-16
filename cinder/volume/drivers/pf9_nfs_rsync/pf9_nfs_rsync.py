@@ -481,6 +481,65 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
         """Release Cinder's claim on a volume, leaving the file in place."""
         LOG.info("PF9NFSRsync: unmanaged volume %s (file retained)", volume.id)
 
+    def get_manageable_volumes(self, cinder_volumes, marker, limit, offset,
+                               sort_keys, sort_dirs):
+        """List the replicated secondary volumes (svols) that can be adopted
+        with manage_existing after a failover.
+
+        PSR discovery calls this (via Cinder `manageable-list`) to learn, per
+        protected volume, its secondary LUN id AND the primary volume it maps to
+        — so it can stamp DiscoveredVolume.spec.secondaryLunId and, at failover,
+        call manage_existing with the correct source-name. The svolId lives in
+        each copygroup's pair table; `extra_info.source_cinder_id` carries the
+        primary cinder uuid so the caller can correlate svol -> protected volume
+        (a bare id list would be ambiguous).
+        """
+        already = {v.get("id") for v in (cinder_volumes or [])}
+        export = self._export()
+        entries, seen = [], set()
+        for base in ("incoming/current", "incoming", "volumes", ""):
+            try:
+                names = sorted(p.name for p in (Path(export) / base).iterdir())
+            except OSError as e:
+                LOG.debug("PF9NFSRsync: manageable scan skipping %s: %s", base, e)
+                continue
+            for name in names:
+                if not name.startswith("cg-"):
+                    continue
+                try:
+                    with (Path(export) / base / name / COPYGROUP_FILE).open() as f:
+                        cg = json.load(f)
+                except (OSError, ValueError) as e:
+                    LOG.debug("PF9NFSRsync: manageable scan skipping %s: %s",
+                              name, e)
+                    continue
+                for p in cg.get("pairs", []):
+                    svol, cinder_uuid = p.get("svolId"), p.get("cinderUuid")
+                    if not svol or svol in seen:
+                        continue
+                    seen.add(svol)
+                    try:
+                        src = self._ref_path({"source-name": cinder_uuid or svol})
+                        size_gb = max(1, int(Path(src).stat().st_size / (1024 ** 3)))
+                    except (OSError, exception.ManageExistingInvalidReference):
+                        size_gb = 1
+                    safe = cinder_uuid not in already
+                    entries.append({
+                        "reference": {"source-name": svol},
+                        "size": size_gb,
+                        "safe_to_manage": safe,
+                        "reason_not_safe":
+                            None if safe else "already managed by cinder",
+                        "cinder_id": None if safe else cinder_uuid,
+                        "extra_info": {
+                            "source_cinder_id": cinder_uuid,
+                            "pair_state": p.get("state"),
+                            "copy_group": cg.get("copyGroup"),
+                        },
+                    })
+        return volume_utils.paginate_entries_list(
+            entries, marker, limit, offset, sort_keys, sort_dirs)
+
     def _secondary_backend_id(self) -> str:
         """Parse the backend_id out of Cinder's replication_device config, which
         looks like 'backend_id:pf9-nfs-secondary,export:/export/psr'. Falls back
