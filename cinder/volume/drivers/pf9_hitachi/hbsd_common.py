@@ -1459,7 +1459,7 @@ class HBSDCommon():
             self, context, group, volumes, snapshots=None, source_vols=None):
         raise NotImplementedError()
 
-    def update_group(self, group, add_volumes=None):
+    def update_group(self, group, add_volumes=None, remove_volumes=None):
         raise NotImplementedError()
 
     def create_group_snapshot(self, context, group_snapshot, snapshots):
@@ -1467,6 +1467,24 @@ class HBSDCommon():
 
     def delete_group_snapshot(self, group_snapshot, snapshots):
         raise NotImplementedError()
+
+    def _reject_group_replication(self, operation, group):
+        msg = self.output_log(MSG.GROUP_REPLICATION_NOT_CONFIGURED,
+                              operation=operation, group=group.id)
+        self.raise_error(msg)
+
+    def enable_replication(self, context, group, volumes):
+        self._reject_group_replication('enable group replication', group)
+
+    def disable_replication(self, context, group, volumes):
+        self._reject_group_replication('disable group replication', group)
+
+    def failover_replication(self, context, group, volumes,
+                             secondary_backend_id=None):
+        self._reject_group_replication('fail over group replication', group)
+
+    def list_replication_targets(self, context, group):
+        return {'replication_targets': []}
 
     def output_log(self, msg_enum, **kwargs):
         if self.storage_id is not None:

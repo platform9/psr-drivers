@@ -17,10 +17,19 @@ REST API client class for Hitachi HBSD Driver.
 
 """
 
+# PF9 Start
+from __future__ import annotations
+# PF9 End
+
 from http import client as httpclient
 import socket
 import threading
 import time
+# PF9 Start
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# PF9 End
 
 from oslo_log import log as logging
 from oslo_service import loopingcall
@@ -94,8 +103,10 @@ REST_NO_RETRY_ERRORS = [
     INVALID_SNAPSHOT_POOL,
 ]
 MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST = 'KART30013-E'
+MSGID_REMOTE_STORAGE_NOT_REGISTERED = 'KART40152-E'
 _REST_NO_RETRY_MESSAGEIDS = [
-    MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST
+    MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST,
+    MSGID_REMOTE_STORAGE_NOT_REGISTERED,
 ]
 
 LOG = logging.getLogger(__name__)
@@ -232,6 +243,7 @@ class ResponseData(dict):
             'cause': self['errobj'].get('cause', ''),
             'solution': self['errobj'].get('solution', ''),
             'errorCode': self['errobj'].get('errorCode', {}),
+            'detailCode': self['errobj'].get('detailCode', ''),
         }
 
     def get_job_result(self):
@@ -1041,11 +1053,15 @@ class RestApiClient():
         with RemoteSession(remote_client) as session:
             return self._get_objects(url, params=params, remote_auth=session)
 
-    def get_remote_copy_grp(self, remote_client, copy_group_name, **kwargs):
+    def get_remote_copy_grp(self, remote_client, copy_group_name,
+                            is_secondary=False, **kwargs):
         url = '%(url)s/remote-mirror-copygroups/%(id)s' % {
             'url': self.object_url,
-            'id': self._remote_copygroup_id(remote_client, copy_group_name),
+            'id': self._remote_copygroup_id(
+                remote_client, copy_group_name, is_secondary),
         }
+        if remote_client is None:
+            return self._get_object(url, **kwargs)
         with RemoteSession(remote_client) as session:
             return self._get_object(url, remote_auth=session, **kwargs)
 
@@ -1161,6 +1177,22 @@ class RestApiClient():
             'id': self._remote_copypair_id(
                 None, copy_group_name, pvol_ldev_id, svol_ldev_id,
                 is_secondary=True),
+            'action': 'takeover',
+        } + '/invoke'
+        self._invoke(url, body=body, job_nowait=True)
+
+    @utils.synchronized_on_copy_group()
+    def takeover_remote_copy_grp(self, remote_client, copy_group_name):
+        """Promote every S-VOL of a copy group in one operation.
+
+        Addressed from the secondary side so the primary array does not have
+        to answer, which is the case group failover has to survive.
+        """
+        body = {"parameters": {"mode": "forceSplit"}}
+        url = '%(url)s/remote-mirror-copygroups/%(id)s/actions/%(action)s' % {
+            'url': self.object_url,
+            'id': self._remote_copygroup_id(
+                None, copy_group_name, is_secondary=True),
             'action': 'takeover',
         } + '/invoke'
         self._invoke(url, body=body, job_nowait=True)

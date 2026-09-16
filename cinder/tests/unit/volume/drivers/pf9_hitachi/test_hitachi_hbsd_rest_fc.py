@@ -17,6 +17,7 @@
 
 import copy
 import functools
+import types as pytypes
 from unittest import mock
 
 import ddt
@@ -45,6 +46,7 @@ from cinder.volume.drivers.pf9_hitachi import hbsd_replication
 from cinder.volume.drivers.pf9_hitachi import hbsd_rest
 from cinder.volume.drivers.pf9_hitachi import hbsd_rest_api
 from cinder.volume.drivers.pf9_hitachi import hbsd_rest_fc
+from cinder.volume.drivers.pf9_hitachi import hbsd_utils
 # PF9 End
 from cinder.volume import volume_types
 from cinder.volume import volume_utils
@@ -688,7 +690,7 @@ class HBSDRESTFCDriverTest(test.TestCase):
                              group=conf.SHARED_CONF_GROUP)
         self.override_config(
             'volume_driver',
-            "cinder.volume.drivers.hitachi.hbsd_fc.HBSDFCDriver",
+            "cinder.volume.drivers.pf9_hitachi.hbsd_fc.HBSDFCDriver",
             group=conf.SHARED_CONF_GROUP)
         self.override_config('reserved_percentage', "0",
                              group=conf.SHARED_CONF_GROUP)
@@ -3491,3 +3493,96 @@ class HBSDRESTFCDriverTest(test.TestCase):
         self.assertEqual(hbsd_rest_api._MAX_REQUEST_WORKERS,
                          self.driver.common.request_thread_pool_executor.
                          _max_workers)
+
+    @mock.patch.object(volume_utils, 'is_group_a_cg_snapshot_type')
+    def test_update_group_without_remove_volumes(self, is_cg_snapshot_type):
+        is_cg_snapshot_type.return_value = True
+        self.assertRaises(
+            exception.VolumeDriverException, self.driver.update_group,
+            self.ctxt, TEST_GROUP[0], add_volumes=[TEST_VOLUME[3]],
+            remove_volumes=None)
+
+    def test_enable_replication_not_configured(self):
+        self.assertRaises(
+            exception.VolumeDriverException,
+            self.driver.enable_replication,
+            self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]])
+
+    def test_disable_replication_not_configured(self):
+        self.assertRaises(
+            exception.VolumeDriverException,
+            self.driver.disable_replication,
+            self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]])
+
+    def test_failover_replication_not_configured(self):
+        self.assertRaises(
+            exception.VolumeDriverException,
+            self.driver.failover_replication,
+            self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]])
+
+    def test_list_replication_targets_not_configured(self):
+        self.assertEqual(
+            {'replication_targets': []},
+            self.driver.list_replication_targets(self.ctxt, TEST_GROUP[0]))
+
+
+class HBSDCommonGroupReplicationDefaultTest(test.TestCase):
+    """HBSDCommon's defaults for a backend with no replication_device.
+
+    The driver level counterparts live in HBSDRESTFCDriverTest; these pin
+    down the operation names the base class reports, which is what an
+    operator sees in the log when the rejection happens.
+    """
+
+    def setUp(self):
+        super(HBSDCommonGroupReplicationDefaultTest, self).setUp()
+        self.common = mock.Mock()
+        self.common.output_log.return_value = 'error message'
+        self.common.raise_error.side_effect = (
+            exception.VolumeDriverException(data='error message'))
+        # Keep the real rejection path; only logging and raising are stubbed.
+        self.common._reject_group_replication = pytypes.MethodType(
+            hbsd_common.HBSDCommon._reject_group_replication, self.common)
+        self.group = TEST_GROUP[0]
+
+    def _assert_rejected(self, func, operation, *args):
+        self.assertRaises(
+            exception.VolumeDriverException, func, self.common, *args)
+        self.common.output_log.assert_called_once_with(
+            hbsd_utils.HBSDMsg.GROUP_REPLICATION_NOT_CONFIGURED,
+            operation=operation, group=self.group.id)
+        self.common.raise_error.assert_called_once_with('error message')
+
+    def test_enable_replication_rejected(self):
+        self._assert_rejected(
+            hbsd_common.HBSDCommon.enable_replication,
+            'enable group replication', None, self.group, [])
+
+    def test_disable_replication_rejected(self):
+        self._assert_rejected(
+            hbsd_common.HBSDCommon.disable_replication,
+            'disable group replication', None, self.group, [])
+
+    def test_failover_replication_rejected(self):
+        self._assert_rejected(
+            hbsd_common.HBSDCommon.failover_replication,
+            'fail over group replication', None, self.group, [])
+
+    def test_failover_replication_rejected_with_target(self):
+        self.assertRaises(
+            exception.VolumeDriverException,
+            hbsd_common.HBSDCommon.failover_replication,
+            self.common, None, self.group, [], 'remote-backend')
+
+    def test_list_replication_targets_is_empty(self):
+        self.assertEqual(
+            {'replication_targets': []},
+            hbsd_common.HBSDCommon.list_replication_targets(
+                self.common, None, self.group))
+        self.common.raise_error.assert_not_called()
+
+    def test_update_group_accepts_remove_volumes(self):
+        self.assertRaises(
+            NotImplementedError,
+            hbsd_common.HBSDCommon.update_group,
+            self.common, self.group, [], [])
