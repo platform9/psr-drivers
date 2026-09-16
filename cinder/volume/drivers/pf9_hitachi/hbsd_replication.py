@@ -39,9 +39,9 @@ from cinder.zonemanager import utils as fczm_utils
 
 _ASYNC_STRING = 'async'
 
-_MD_PVOL = 'hbsd_pvol_id'
-_MD_SVOL = 'hbsd_svol_id'
-_MD_COPY_GROUP = 'hbsd_copy_group'
+_MD_PVOL = 'replication_pvol_id'
+_MD_SVOL = 'replication_svol_id'
+_MD_COPY_GROUP = 'replication_copy_group'
 _GROUP_NAME_BINDING_PREFIX = 'hbsd-cg:'
 _ROLE_SOURCE = 'source'
 _ROLE_TARGET = 'target'

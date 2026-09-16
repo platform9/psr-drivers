@@ -73,7 +73,7 @@ Beyond the eight entry points:
 | Behaviour | Where |
 |-----------|-------|
 | `manage_existing_get_size()` — size of an existing LDEV for import validation | `hbsd_replication.py` |
-| Copy-group binding recorded in volume metadata (`hbsd_copy_group`), so a volume added to a CG later still resolves to the right copy group | `_resolve_copy_group_name()` |
+| Copy-group binding recorded in volume metadata (`replication_copy_group`), so a volume added to a CG later still resolves to the right copy group | `_resolve_copy_group_name()` |
 | Group-name binding by prefix `hbsd-cg:<name>` for adopting an existing array copy group | `_resolve_copy_group_name()` |
 | Journal lifecycle — created on first pair, deleted on `disable_replication()` | `_group_repl_journal_ids()` / `_group_repl_delete_journals()` |
 | Target-role adoption — a DR backend adopts already-promoted S-VOLs instead of creating pairs | `hitachi_replication_role = target` |
