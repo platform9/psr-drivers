@@ -1,0 +1,20 @@
+---
+features:
+  - |
+    Hitachi driver: added ``hitachi_replication_report_pair_status``
+    (default ``False``) and ``hitachi_replication_report_pair_status_ttl``
+    (default ``300`` seconds). When the first is enabled, each copy group's
+    replication pair state is reported as the ``group_replication_pairs`` pool
+    capability, so a consumer can read pair state from the scheduler stats
+    instead of calling the storage system directly.
+upgrade:
+  - |
+    Hitachi driver: per-copy-group replication pair state is no longer
+    reported in the pool capabilities by default. Building that report costs
+    one REST call per copy group on every stats poll, against the same
+    Configuration Manager endpoint that serves pair creation, so it is now
+    opt-in via ``hitachi_replication_report_pair_status``. Set it to ``True``
+    to restore the previous behaviour.
+
+    The ``group_replication_peer_initialized`` capability is unaffected and is
+    still always reported.

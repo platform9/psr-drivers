@@ -18,6 +18,7 @@ REST API client class for Hitachi HBSD Driver.
 """
 
 # PF9 Start
+# PF9 TEMPORARY: drop before upstream.
 from __future__ import annotations
 # PF9 End
 
@@ -26,6 +27,7 @@ import socket
 import threading
 import time
 # PF9 Start
+# PF9 TEMPORARY: silences self-signed cert warnings; drop before upstream.
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -40,7 +42,7 @@ from requests.adapters import HTTPAdapter
 from cinder import exception
 from cinder.i18n import _
 # PF9 Start
-from cinder.volume.drivers.pf9_hitachi import hbsd_utils as debug
+# PF9 TEMPORARY: use cinder.volume.drivers.hitachi.hbsd_utils upstream.
 from cinder.volume.drivers.pf9_hitachi import hbsd_utils as utils
 # PF9 End
 from cinder.volume import volume_utils
@@ -289,7 +291,7 @@ class RestApiClient():
                         "accept": "application/json"}
         self.driver_prefix = driver_prefix
 
-        self.request_auditor = debug.create_default_request_auditor(conf)
+        self.request_auditor = utils.create_default_request_auditor(conf)
 
     class Session(requests.auth.AuthBase):
 

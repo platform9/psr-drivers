@@ -1061,6 +1061,12 @@ class HBSDGroupReplicationMessageTest(test.TestCase):
     def test_group_replication_message_defined(self, name):
         self.assertTrue(hasattr(hbsd_utils.HBSDMsg, name))
 
+    def test_already_paired_remedy_names_the_volume_type_spec(self):
+        msg = hbsd_utils.HBSDMsg.GROUP_REPLICATION_ALREADY_PAIRED.value
+        self.assertEqual(788, msg['msg_id'])
+        self.assertIn("group_replication_enabled='<is> True'", msg['msg'])
+        self.assertNotIn('group_only', msg['msg'])
+
     def test_rest_api_error_message_reports_detail_code(self):
         self.assertIn(
             '%(detailCode)s',

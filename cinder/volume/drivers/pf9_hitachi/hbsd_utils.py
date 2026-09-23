@@ -16,6 +16,7 @@
 """Utility module for Hitachi HBSD Driver."""
 
 # PF9 Start
+# PF9 TEMPORARY: drop before upstream.
 from __future__ import annotations
 # PF9 End
 
@@ -998,8 +999,9 @@ class HBSDMsg(enum.Enum):
                'pair, so a second pair cannot be created for the group: the '
                'storage system allows one pair per mirror unit. Create '
                'volumes unpaired by setting '
-               'hitachi_replication_group_only, or delete the existing pair '
-               'first. (volume: %(volume)s, LDEV: %(ldev)s)',
+               "group_replication_enabled='<is> True' on their volume "
+               'type, or delete the existing pair first. (volume: '
+               '%(volume)s, LDEV: %(ldev)s)',
         'suffix': ERROR_SUFFIX,
     }
     GROUP_REPLICATION_PAIR_WRONG_STATE = {

@@ -1,0 +1,47 @@
+---
+features:
+  - |
+    Hitachi driver: added the ``group_replication_enabled`` volume type
+    extra spec. A volume whose type carries ``<is> True`` for it is not paired
+    when it is created; its pair is created by ``enable_replication`` when the
+    volume joins a group's copy group. One backend can now serve both models
+    at once -- a plain ``replication_enabled`` volume type still pairs at
+    create time, unchanged.
+
+    Without this signal a replicated volume created before its Cinder group
+    exists is paired immediately, and the later
+    ``enable_replication`` fails: the driver pins one mirror unit
+    (``hitachi_replication_mun``) and the storage system rejects a second pair
+    at it. The group type could not answer the question, because a volume with
+    no ``group_id`` yet has no group type to consult.
+
+    The key is unscoped, so the scheduler matches it against the
+    ``group_replication_enabled`` pool capability, which the driver reports
+    only on a backend configured for replication. A volume of this type cannot
+    be placed on a backend that cannot do group replication. The value must be
+    exactly ``<is> True``: ``True`` and ``true`` make the type unschedulable,
+    ``<is> False`` makes it unschedulable on every backend, and ``<is> true``
+    is scheduled but not treated as group-replicated.
+upgrade:
+  - |
+    Hitachi driver: the volume type extra spec
+    ``hbsd:group_replication_enabled`` has been renamed to
+    ``group_replication_enabled``, and the old key is no longer read. A volume
+    whose type carries only the old key is paired at create time, and can then
+    never join a copy group. Before upgrading the driver, set
+    ``group_replication_enabled='<is> True'`` on every volume type that
+    carries the old key, and verify each type on every backend. For PSR this
+    is the pre-upgrade volume type check (US-12).
+  - |
+    Hitachi driver: the ``hitachi_replication_group_only`` option has been
+    removed. The ``group_replication_enabled`` volume type extra spec is now
+    the only way to stop a volume being paired when it is created. The
+    removal is not backwards compatible, and it fails silently: on a backend
+    that set the option to ``True``, every replication-enabled volume whose
+    type lacks the extra spec is now paired at create time, and nothing
+    reports it. Set the extra spec on every such volume type before
+    upgrading the driver; for PSR this ordering is required, and is the
+    pre-upgrade volume type check (US-12). A volume created in the gap stays
+    paired and cannot join a copy group. Delete and recreate it: retyping
+    does not help, because the driver decides whether to pair only when the
+    volume is created.

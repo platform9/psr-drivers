@@ -16,6 +16,7 @@
 """REST interface fibre channel module for Hitachi HBSD Driver."""
 
 # PF9 Start
+# PF9 TEMPORARY: drop before upstream.
 from __future__ import annotations
 # PF9 End
 

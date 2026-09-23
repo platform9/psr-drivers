@@ -48,6 +48,7 @@ from cinder.volume.drivers.pf9_hitachi import hbsd_rest_api
 from cinder.volume.drivers.pf9_hitachi import hbsd_rest_fc
 from cinder.volume.drivers.pf9_hitachi import hbsd_utils
 # PF9 End
+from cinder.volume import group_types
 from cinder.volume import volume_types
 from cinder.volume import volume_utils
 from cinder.zonemanager import utils as fczm_utils
@@ -2191,8 +2192,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         ret = self.driver.create_group(self.ctxt, TEST_GROUP[0])
         self.assertIsNone(ret)
 
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value=False)
     @mock.patch.object(requests.Session, "request")
-    def test_delete_group(self, request):
+    def test_delete_group(self, request, get_group_type_specs):
         request.side_effect = [FakeResponse(200, GET_LDEV_RESULT),
                                FakeResponse(200, GET_LDEV_RESULT),
                                FakeResponse(200, GET_LDEV_RESULT),
@@ -2206,13 +2209,16 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         )
         self.assertTupleEqual(actual, ret)
 
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value=False)
     @mock.patch.object(requests.Session, "request")
     @mock.patch.object(volume_types, 'get_volume_type')
     @mock.patch.object(volume_types, 'get_volume_type_extra_specs')
     @mock.patch.object(volume_types, 'get_volume_type_qos_specs')
     def test_create_group_from_src_volume(
             self, get_volume_type_qos_specs, get_volume_type_extra_specs,
-            get_volume_type, request):
+            get_volume_type, request, get_group_type_specs):
+
         get_volume_type_extra_specs.return_value = {}
         get_volume_type.return_value = {}
         get_volume_type_qos_specs.return_value = {'qos_specs': None}
@@ -2252,6 +2258,8 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
               'replication_status': fields.ReplicationStatus.DISABLED}])
         self.assertTupleEqual(actual, ret)
 
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value=False)
     @mock.patch.object(requests.Session, "request")
     @mock.patch.object(volume_types, 'get_volume_type')
     @mock.patch.object(volume_types, 'get_volume_type_extra_specs')
@@ -2261,7 +2269,8 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         '_wait_copy_pair_status')
     def test_create_group_from_src_snapshot(
             self, mock_wait_copy_pair_status, get_volume_type_qos_specs,
-            get_volume_type_extra_specs, get_volume_type, request):
+            get_volume_type_extra_specs, get_volume_type, request,
+            get_group_type_specs):
         mock_wait_copy_pair_status.return_value = None
         get_volume_type_extra_specs.return_value = {}
         get_volume_type.return_value = {}
@@ -2302,9 +2311,82 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
               'replication_status': fields.ReplicationStatus.DISABLED}])
         self.assertTupleEqual(actual, ret)
 
+    def _create_group_from_src_dispatch(self, source_vols):
+        """Run create_group_from_src with both of its paths mocked out."""
+        common = self._common()
+        volumes = [TEST_VOLUME[1]] * len(source_vols)
+        with mock.patch.object(
+                common, '_group_repl_create_group_from_src',
+                return_value=(None, [])) as group_repl, \
+            mock.patch.object(
+                common, '_get_active_backend') as backend:
+            backend.return_value.create_group_from_src.return_value = (
+                None, [])
+            common.create_group_from_src(
+                self.ctxt, TEST_GROUP[0], volumes, source_vols=source_vols)
+        return group_repl, backend.return_value.create_group_from_src
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_create_group_from_src_group_replication_secondary_resident(
+            self, get_group_type_specs):
+        group_repl, generic = self._create_group_from_src_dispatch(
+            [self._svol_only_volume(10), self._svol_only_volume(
+                11, volume_id='00000000-0000-0000-0000-000000000098')])
+        group_repl.assert_called_once()
+        generic.assert_not_called()
+
+    @ddt.data([TEST_VOLUME[0]], [TEST_VOLUME[0], TEST_VOLUME[4]])
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_create_group_from_src_group_replication_not_secondary_resident(
+            self, source_vols, get_group_type_specs):
+        group_repl, generic = self._create_group_from_src_dispatch(
+            source_vols)
+        group_repl.assert_not_called()
+        generic.assert_called_once()
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_create_group_from_src_group_replication_mixed_sites(
+            self, get_group_type_specs):
+        exc = self.assertRaises(
+            exception.VolumeDriverException,
+            self._create_group_from_src_dispatch,
+            [TEST_VOLUME[0], self._svol_only_volume(10)])
+        self.assertIn('exists in the other site', str(exc))
+        self.assertNotIn('source to be replicated was not found', str(exc))
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value=False)
+    def test_create_group_from_src_non_replicated_now_generic(
+            self, get_group_type_specs):
+        common = self._common()
+        with mock.patch.object(
+                common, '_group_repl_create_group_from_src') as group_repl:
+            self.assertRaises(
+                exception.VolumeDriverException,
+                common.create_group_from_src,
+                self.ctxt, TEST_GROUP[0], [TEST_VOLUME[1]],
+                source_vols=[self._svol_only_volume(10)])
+        group_repl.assert_not_called()
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_create_group_from_src_group_replication_failed_over(
+            self, get_group_type_specs):
+        self._common()._active_backend_id = 'test'
+        group_repl, generic = self._create_group_from_src_dispatch(
+            [self._svol_only_volume(10)])
+        group_repl.assert_not_called()
+        generic.assert_called_once()
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value=False)
     @mock.patch.object(volume_utils, 'is_group_a_cg_snapshot_type')
     @mock.patch.object(requests.Session, "request")
-    def test_update_group(self, request, is_group_a_cg_snapshot_type):
+    def test_update_group(self, request, is_group_a_cg_snapshot_type,
+                          get_group_type_specs):
         request.return_value = FakeResponse(200, GET_LDEV_RESULT)
         is_group_a_cg_snapshot_type.return_value = False
         ret = self.driver.update_group(
@@ -2312,6 +2394,8 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertTupleEqual((None, None, None), ret)
         self.assertEqual(1, request.call_count)
 
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value=False)
     @mock.patch.object(requests.Session, "request")
     @mock.patch.object(volume_types, 'get_volume_type_extra_specs')
     @mock.patch.object(sqlalchemy_api, 'volume_get', side_effect=_volume_get)
@@ -2319,7 +2403,8 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
     @mock.patch.object(volume_types, 'get_volume_type_qos_specs')
     def test_create_group_snapshot_non_cg(
             self, get_volume_type_qos_specs, is_group_a_cg_snapshot_type,
-            volume_get, get_volume_type_extra_specs, request):
+            volume_get, get_volume_type_extra_specs, request,
+            get_group_type_specs):
         is_group_a_cg_snapshot_type.return_value = False
         get_volume_type_extra_specs.return_value = {
             'replication_enabled': '<is> True'}
@@ -2347,8 +2432,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         )
         self.assertTupleEqual(actual, ret)
 
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value=False)
     @mock.patch.object(requests.Session, "request")
-    def test_delete_group_snapshot(self, request):
+    def test_delete_group_snapshot(self, request, get_group_type_specs):
         request.side_effect = [FakeResponse(200, GET_LDEV_RESULT_PAIR),
                                FakeResponse(200, NOTFOUND_RESULT),
                                FakeResponse(200, GET_SNAPSHOTS_RESULT),
@@ -3152,7 +3239,9 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual(0, get_volume_type_extra_specs.call_count)
         self.assertEqual(1, request.call_count)
 
-    def test_update_group_ldev_is_none(self):
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value=False)
+    def test_update_group_ldev_is_none(self, get_group_type_specs):
         self.assertRaises(exception.VolumeDriverException,
                           self.driver.update_group,
                           self.ctxt,
@@ -3160,13 +3249,16 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                           add_volumes=[TEST_VOLUME[3]])
 
     @ddt.data('deduplication_compression', 'compression')
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value=False)
     @mock.patch.object(requests.Session, "request")
     @mock.patch.object(volume_types, 'get_volume_type')
     @mock.patch.object(volume_types, 'get_volume_type_extra_specs')
     @mock.patch.object(volume_utils, 'is_group_a_cg_snapshot_type')
     def test_update_group_has_rep_pair_true(
             self, csv, is_group_a_cg_snapshot_type,
-            get_volume_type_extra_specs, get_volume_type, request):
+            get_volume_type_extra_specs, get_volume_type, request,
+            get_group_type_specs):
         self.driver.common._active_backend_id = 'test'
         get_volume_type_extra_specs.return_value = {
             'replication_enabled': '<is> True',
@@ -3555,7 +3647,9 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                 exception.VolumeDriverException,
                 common.list_replication_targets, self.ctxt, TEST_GROUP[0])
 
-    def test_enable_replication_new_copy_group(self):
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_enable_replication_new_copy_group(self, get_group_type_specs):
         common = self._common()
         volumes = [TEST_VOLUME[0], TEST_VOLUME[1]]
         enabled = fields.ReplicationStatus.ENABLED
@@ -3569,12 +3663,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                     'id': volume.id,
                     'replication_status': enabled}) as add_volume, \
             mock.patch.object(
-                common, '_group_repl_confirm_new_pairs') as confirm:
+                common, '_wait_pair_status_change') as wait_pair:
             model_update, volumes_update = common.enable_replication(
                 self.ctxt, TEST_GROUP[0], volumes)
-        # B5: enable_replication reports ENABLED on pair creation alone and
-        # no longer blocks on _WAIT_PAIR via _group_repl_confirm_new_pairs.
-        confirm.assert_not_called()
+        wait_pair.assert_not_called()
         self.assertEqual({'replication_status': enabled}, model_update)
         self.assertEqual(2, add_volume.call_count)
         # Only the first add may create the copy group.
@@ -3584,7 +3676,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             [enabled] * 2,
             [update['replication_status'] for update in volumes_update])
 
-    def test_enable_replication_keeps_creating_after_a_failed_add(self):
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_enable_replication_keeps_creating_after_a_failed_add(
+            self, get_group_type_specs):
         common = self._common()
         volumes = [TEST_VOLUME[0], TEST_VOLUME[1]]
         statuses = [fields.ReplicationStatus.ERROR,
@@ -3599,10 +3694,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                               'replication_status': statuses[0]},
                              {'id': volumes[1].id,
                               'replication_status': statuses[1]}]
-        ) as add_volume, \
-            mock.patch.object(
-                common, '_group_repl_confirm_new_pairs',
-                side_effect=lambda cg, updates: updates):
+        ) as add_volume:
             model_update, volumes_update = common.enable_replication(
                 self.ctxt, TEST_GROUP[0], volumes)
         self.assertTrue(add_volume.call_args_list[1][0][2])
@@ -3613,7 +3705,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             statuses,
             [update['replication_status'] for update in volumes_update])
 
-    def test_enable_replication_resyncs_suspended_members(self):
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_enable_replication_resyncs_suspended_members(
+            self, get_group_type_specs):
         common = self._common()
         volumes = [TEST_VOLUME[0]]
         enabled = fields.ReplicationStatus.ENABLED
@@ -3637,7 +3732,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual({'replication_status': enabled}, model_update)
         self.assertEqual(1, len(volumes_update))
 
-    def test_enable_replication_adopts_on_target_backend(self):
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_enable_replication_adopts_on_target_backend(
+            self, get_group_type_specs):
         common = self._common()
         volumes = [TEST_VOLUME[0]]
         enabled = fields.ReplicationStatus.ENABLED
@@ -3657,7 +3755,20 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual({'replication_status': enabled}, model_update)
         self.assertEqual(adopted, volumes_update)
 
-    def test_disable_replication(self):
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value=False)
+    @mock.patch.object(requests.Session, "request")
+    def test_enable_replication_not_replicated_raises(
+            self, request, get_group_type_specs):
+        self.assertRaises(
+            NotImplementedError,
+            self._common().enable_replication,
+            self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]])
+        request.assert_not_called()
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_disable_replication(self, get_group_type_specs):
         common = self._common()
         volumes = [TEST_VOLUME[0], TEST_VOLUME[1]]
         disabled = fields.ReplicationStatus.DISABLED
@@ -3684,7 +3795,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             [disabled] * 2,
             [update['replication_status'] for update in volumes_update])
 
-    def test_disable_replication_reports_a_failed_member(self):
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_disable_replication_reports_a_failed_member(
+            self, get_group_type_specs):
         common = self._common()
         volumes = [TEST_VOLUME[0], TEST_VOLUME[1]]
         with mock.patch.object(
@@ -3703,13 +3817,27 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             {'replication_status': fields.ReplicationStatus.ERROR},
             model_update)
 
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value=False)
+    @mock.patch.object(requests.Session, "request")
+    def test_disable_replication_not_replicated_raises(
+            self, request, get_group_type_specs):
+        self.assertRaises(
+            NotImplementedError,
+            self._common().disable_replication,
+            self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]])
+        request.assert_not_called()
+
     def _failover_patches(self, common):
         return mock.patch.multiple(
             common,
             _wait_pair_status_change=mock.DEFAULT,
             _get_ldevs=mock.DEFAULT)
 
-    def test_failover_replication_emergency_takes_over_from_secondary(self):
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_emergency_takes_over_from_secondary(
+            self, get_group_type_specs):
         common = self._common()
         volumes = [TEST_VOLUME[0]]
         copy_group_name = common._create_group_copy_group_name(
@@ -3733,7 +3861,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             [fields.ReplicationStatus.FAILED_OVER],
             [update['replication_status'] for update in volumes_update])
 
-    def test_failover_replication_graceful_splits_from_primary(self):
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_graceful_splits_from_primary(
+            self, get_group_type_specs):
         common = self._common()
         volumes = [TEST_VOLUME[0]]
         copy_group_name = common._create_group_copy_group_name(
@@ -3754,7 +3885,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             common.driver_info['rep_type_async'])
         takeover.assert_not_called()
 
-    def test_failover_replication_failback_resyncs_with_swap(self):
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_failback_resyncs_with_swap(
+            self, get_group_type_specs):
         common = self._common()
         volumes = [TEST_VOLUME[0]]
         copy_group_name = common._create_group_copy_group_name(
@@ -3775,7 +3909,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             {'replication_status': fields.ReplicationStatus.ENABLED},
             model_update)
 
-    def test_failover_replication_failback_rejects_a_mode(self):
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_failback_rejects_a_mode(
+            self, get_group_type_specs):
         common = self._common()
         self.assertRaises(
             exception.InvalidReplicationTarget,
@@ -3784,7 +3921,9 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             secondary_backend_id=(
                 hbsd_replication._REP_FAILBACK + ':graceful'))
 
-    def test_failover_replication_takeover_failure(self):
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_takeover_failure(self, get_group_type_specs):
         common = self._common()
         with self._failover_patches(common) as patches, \
             mock.patch.object(
@@ -3796,7 +3935,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                 common.failover_replication,
                 self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]])
 
-    def test_failover_replication_unpaired_volume_is_an_error(self):
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_unpaired_volume_is_an_error(
+            self, get_group_type_specs):
         common = self._common()
         with self._failover_patches(common) as patches, \
                 mock.patch.object(
@@ -3811,7 +3953,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             fields.ReplicationStatus.ERROR,
             volumes_update[0]['replication_status'])
 
-    def test_failover_replication_remembers_the_copy_group(self):
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_remembers_the_copy_group(
+            self, get_group_type_specs):
         common = self._common()
         copy_group_name = common._create_group_copy_group_name(
             TEST_GROUP[0].id)
@@ -3822,6 +3967,17 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             common.failover_replication(
                 self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]])
         self.assertIn(copy_group_name, common._known_copy_groups)
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value=False)
+    @mock.patch.object(requests.Session, "request")
+    def test_failover_replication_not_replicated_raises(
+            self, request, get_group_type_specs):
+        self.assertRaises(
+            NotImplementedError,
+            self._common().failover_replication,
+            self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]])
+        request.assert_not_called()
 
     # ------------------------------------------------------------------
     # A2: rep_secondary vs _svol_instance() on a target-role backend.
@@ -3954,7 +4110,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             common._get_ldevs(volume)
         primary_log.assert_called_once()
 
-    def test_failover_replication_target_role_promotes_svol_only(self):
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_target_role_promotes_svol_only(
+            self, get_group_type_specs):
         common = self._common()
         self._set_target_role()
         volumes = [TEST_VOLUME[0]]
@@ -3973,7 +4132,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             fields.ReplicationStatus.FAILED_OVER,
             volumes_update[0]['replication_status'])
 
-    def test_failover_replication_source_role_svol_only_still_errors(self):
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_source_role_svol_only_still_errors(
+            self, get_group_type_specs):
         """Regression check: source role still requires both LDEVs."""
         common = self._common()
         with self._failover_patches(common) as patches, \
@@ -4028,10 +4190,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                 return_value={'id': volume.id,
                               'replication_status': enabled}), \
             mock.patch.object(
-                common, '_group_repl_confirm_new_pairs') as confirm:
+                common, '_wait_pair_status_change') as wait_pair:
             model_update, add_update, remove_update = (
                 common._group_repl_update_group(TEST_GROUP[0], [volume], []))
-        confirm.assert_not_called()
+        wait_pair.assert_not_called()
         self.assertEqual(
             [enabled], [u['replication_status'] for u in add_update])
 
@@ -4164,6 +4326,243 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                 hbsd_replication.LOG, 'warning') as warn:
             common._pair_status_capabilities()
         self.assertEqual(1, warn.call_count)
+
+    def test_replication_metadata_keys(self):
+        self.assertEqual('replication_pvol_id', hbsd_replication._MD_PVOL)
+        self.assertEqual('replication_svol_id', hbsd_replication._MD_SVOL)
+        self.assertEqual(
+            'replication_copy_group', hbsd_replication._MD_COPY_GROUP)
+
+    def test_group_repl_add_volume_stamps_the_contract_keys(self):
+        common = self._common()
+        volume = TEST_VOLUME[0]
+        volume.metadata = {}
+        with mock.patch.object(
+                common.rep_primary, 'get_ldev', return_value=11), \
+            mock.patch.object(
+                common, '_has_rep_pair', return_value=False), \
+            mock.patch.object(
+                common.rep_primary, 'get_volume_extra_specs',
+                return_value={}), \
+            mock.patch.object(
+                hbsd_utils, 'get_qos_specs_from_volume', return_value=None), \
+            mock.patch.object(
+                common.rep_secondary, 'create_ldev', return_value=22), \
+            mock.patch.object(
+                common.rep_secondary, 'initialize_pair_connection'), \
+            mock.patch.object(
+                common.rep_primary, 'initialize_pair_connection'), \
+            mock.patch.object(common.rep_secondary, 'modify_ldev_name'), \
+            mock.patch.object(
+                common, '_group_repl_create_pair'):
+            volume_update = common._group_repl_add_volume(
+                volume, 'CGTEST', False, 'enable replication')
+        self.assertEqual(
+            {'replication_pvol_id': '11',
+             'replication_svol_id': '22',
+             'replication_copy_group': 'CGTEST'},
+            volume_update['metadata'])
+
+    def test_pair_status_skips_journal_read_when_array_reports_usage(self):
+        common = self._common()
+        self.override_config(
+            'hitachi_replication_report_pair_status', True,
+            group=conf.SHARED_CONF_GROUP)
+        grps = [{'copyGroupName': 'CG1'}, {'copyGroupName': 'CG2'}]
+        detail = {'copyGroupName': 'CG1', 'pairStatus': 'PAIR',
+                  'journalUsageRate': 12, 'copyPairs': []}
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                return_value=grps), \
+            mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value=detail), \
+            mock.patch.object(
+                common, '_journals_by_id', return_value={}) as journals:
+            capabilities = common._pair_status_capabilities()
+        journals.assert_not_called()
+        pairs = json.loads(capabilities[hbsd_replication._PAIR_STATUS_KEY])
+        self.assertEqual(12, pairs['CG1']['journal_usage_rate'])
+
+    def test_pair_status_reads_journals_once_for_many_groups(self):
+        common = self._common()
+        self.override_config(
+            'hitachi_replication_report_pair_status', True,
+            group=conf.SHARED_CONF_GROUP)
+        grps = [{'copyGroupName': 'CG%d' % i} for i in range(4)]
+        # No journalUsageRate, so every group falls back to the journal list.
+        detail = {'pairStatus': 'PAIR', 'copyPairs': []}
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                return_value=grps), \
+            mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value=detail), \
+            mock.patch.object(
+                common, '_journals_by_id', return_value={}) as journals:
+            common._pair_status_capabilities()
+        self.assertEqual(1, journals.call_count)
+
+    def _delete_group_with_copy_grps(self, remaining):
+        common = self._common()
+        with mock.patch.object(
+                common, '_resolve_copy_group_name', return_value='CGTEST'), \
+            mock.patch.object(
+                common, '_group_repl_journal_ids', return_value=(0, 1)), \
+            mock.patch.object(
+                common, '_group_repl_delete_group_volume',
+                return_value={'id': TEST_VOLUME[0].id,
+                              'status': 'deleted'}), \
+            mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                return_value=remaining), \
+            mock.patch.object(
+                common, '_delete_journals') as delete_journals:
+            common._group_repl_delete_group(TEST_GROUP[0], [TEST_VOLUME[0]])
+        return delete_journals
+
+    def test_group_repl_delete_group_reclaims_journals_after_last_pair(self):
+        delete_journals = self._delete_group_with_copy_grps([])
+        delete_journals.assert_called_once_with((0, 1))
+
+    def test_group_repl_delete_group_keeps_journals_while_pairs_remain(self):
+        delete_journals = self._delete_group_with_copy_grps(
+            [{'copyGroupName': 'CGTEST'}])
+        delete_journals.assert_not_called()
+
+    def test_group_repl_delete_group_keeps_journals_when_list_fails(self):
+        common = self._common()
+        with mock.patch.object(
+                common, '_resolve_copy_group_name', return_value='CGTEST'), \
+            mock.patch.object(
+                common, '_group_repl_journal_ids', return_value=(0, 1)), \
+            mock.patch.object(
+                common, '_group_repl_delete_group_volume',
+                return_value={'id': TEST_VOLUME[0].id,
+                              'status': 'deleted'}), \
+            mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                side_effect=exception.VolumeDriverException(data='x')), \
+            mock.patch.object(
+                common, '_delete_journals') as delete_journals:
+            common._group_repl_delete_group(TEST_GROUP[0], [TEST_VOLUME[0]])
+        delete_journals.assert_not_called()
+
+    def test_pool_id_for_local_array_resolves_from_the_volume_host(self):
+        common = self._common()
+        common.rep_primary._stats = {'pools': []}
+        volume = TEST_VOLUME[0]
+        with mock.patch.object(
+                common.rep_primary, 'get_pool_id_of_volume',
+                return_value=31) as resolve:
+            self.assertEqual(31, common._pool_id_for(common.rep_primary,
+                                                     volume))
+        resolve.assert_called_once_with(volume)
+
+    def test_pool_id_for_local_array_falls_back_when_host_matches_nothing(
+            self):
+        common = self._common()
+        common.rep_primary.storage_info['pool_id'] = [30, 31]
+        common.rep_primary._stats = {'pools': []}
+        with mock.patch.object(
+                common.rep_primary, 'get_pool_id_of_volume',
+                return_value=None) as resolve:
+            self.assertEqual(
+                30, common._pool_id_for(common.rep_primary, TEST_VOLUME[0]))
+        resolve.assert_called_once()
+
+    def test_pool_id_for_local_array_falls_back_before_the_first_stats_poll(
+            self):
+        common = self._common()
+        common.rep_primary.storage_info['pool_id'] = [30, 31]
+        common.rep_primary._stats = {}
+        self.assertEqual(
+            30, common._pool_id_for(common.rep_primary, TEST_VOLUME[0]))
+
+    def test_pool_id_for_local_array_falls_back_when_never_polled(self):
+        common = self._common()
+        common.rep_primary.storage_info['pool_id'] = [30, 31]
+        if hasattr(common.rep_primary, '_stats'):
+            del common.rep_primary._stats
+        self.assertEqual(
+            30, common._pool_id_for(common.rep_primary, TEST_VOLUME[0]))
+
+    def test_pool_id_for_remote_array_uses_the_configured_pool(self):
+        common = self._common()
+        common.rep_secondary.storage_info['pool_id'] = [40, 41]
+        with mock.patch.object(
+                common.rep_secondary, 'get_pool_id_of_volume') as resolve:
+            self.assertEqual(
+                40, common._pool_id_for(common.rep_secondary, TEST_VOLUME[0]))
+        resolve.assert_not_called()
+
+    def test_group_snapshot_uses_the_local_pool_on_a_target_role_backend(self):
+        common = self._common()
+        self._set_target_role()
+        common.rep_primary.storage_info['pool_id'] = [30, 31]
+        common.rep_primary._stats = {'pools': []}
+        with mock.patch.object(
+                common.rep_primary, 'get_pool_id_of_volume',
+                return_value=31) as resolve:
+            self.assertEqual(
+                31, common._pool_id_for(common._svol_instance(),
+                                        TEST_VOLUME[0]))
+        resolve.assert_called_once()
+
+    @ddt.data('<is> True', '  <is> True  ')
+    def test_pairs_at_create_time_false_for_a_group_replication_type(
+            self, spec):
+        common = self._common()
+        self.assertFalse(common._pairs_at_create_time(
+            TEST_VOLUME[0],
+            {hbsd_replication._GROUP_REPL_VOLUME_SPEC: spec}))
+
+    @ddt.data({}, {hbsd_replication._GROUP_REPL_VOLUME_SPEC: '<is> False'},
+              {'other': 'x'}, None)
+    def test_pairs_at_create_time_true_for_a_plain_replicated_type(
+            self, extra_specs):
+        common = self._common()
+        with mock.patch.object(
+                common.rep_primary, 'get_volume_extra_specs',
+                return_value={}):
+            self.assertTrue(
+                common._pairs_at_create_time(TEST_VOLUME[0], extra_specs))
+
+    def test_pairs_at_create_time_reads_the_type_when_not_given_specs(self):
+        common = self._common()
+        with mock.patch.object(
+                common.rep_primary, 'get_volume_extra_specs',
+                return_value={
+                    hbsd_replication._GROUP_REPL_VOLUME_SPEC: '<is> True'}):
+            self.assertFalse(common._pairs_at_create_time(TEST_VOLUME[0]))
+
+    def test_no_backend_wide_group_only_option(self):
+        self.assertEqual(
+            [], [opt.name for opt in hbsd_replication.COMMON_REPLICATION_OPTS
+                 if 'group_only' in opt.name])
+
+    @mock.patch.object(requests.Session, "request")
+    @mock.patch.object(volume_types, 'get_volume_type_extra_specs')
+    @mock.patch.object(objects.Volume, 'is_replicated')
+    @mock.patch.object(volume_types, 'get_volume_type_qos_specs')
+    def test_create_volume_group_replication_type_does_not_pair(
+            self, get_volume_type_qos_specs, is_replicated,
+            get_volume_type_extra_specs, request):
+        is_replicated.return_value = True
+        get_volume_type_qos_specs.return_value = {'qos_specs': None}
+        get_volume_type_extra_specs.return_value = {
+            'replication_enabled': '<is> True',
+            hbsd_replication._GROUP_REPL_VOLUME_SPEC: '<is> True'}
+        request.return_value = FakeResponse(202, COMPLETED_SUCCEEDED_RESULT)
+        self.driver.common.rep_primary._stats = {
+            'pools': [{'location_info': {'pool_id': 30}}]}
+        self.driver.common.rep_secondary._stats = {
+            'pools': [{'location_info': {'pool_id': 40}}]}
+        ret = self.driver.create_volume(TEST_VOLUME[8])
+        self.assertEqual(
+            {'provider_location': json.dumps({'pldev': 1}),
+             'replication_status': fields.ReplicationStatus.DISABLED},
+            ret)
 
 
 # Shorthand alias
@@ -4453,67 +4852,51 @@ class HBSDGroupReplicationHelperTest(test.TestCase):
                 hbsd_replication._MODE_EMERGENCY,
                 hbsd_replication._failover_mode(group, None))
 
-    def test_has_group_repl_spec_none(self):
-        self.assertFalse(hbsd_replication._has_group_repl_spec(None))
-
-    @ddt.data(*hbsd_replication._GROUP_REPL_SPECS)
-    def test_has_group_repl_spec_true(self, key):
-        def _specs(group_type_id, key=None):
-            return '<is> True' if key == wanted else '<is> False'
-
-        wanted = key
-        with mock.patch.object(hbsd_replication, 'group_types') as types:
-            types.get_group_type_specs.side_effect = _specs
-            self.assertTrue(
-                hbsd_replication._has_group_repl_spec('type-id'))
-
-    @ddt.data('<is> False', 'True', '', None, '<is>True')
-    def test_has_group_repl_spec_false(self, spec):
-        with mock.patch.object(hbsd_replication, 'group_types') as types:
-            types.get_group_type_specs.return_value = spec
-            self.assertFalse(
-                hbsd_replication._has_group_repl_spec('type-id'))
-
-    def test_has_group_repl_spec_group_type_missing(self):
-        with mock.patch.object(hbsd_replication, 'group_types') as types:
-            types.get_group_type_specs.side_effect = (
-                exception.GroupTypeNotFound(group_type_id='gone'))
-            self.assertFalse(
-                hbsd_replication._has_group_repl_spec('gone'))
-
-    def test_is_group_replication_none(self):
-        self.assertFalse(hbsd_replication._is_group_replication(None))
-
-    def test_is_group_replication(self):
-        group = FakeGroup(group_type_id='type-id')
-        with mock.patch.object(hbsd_replication, 'group_types') as types:
-            types.get_group_type_specs.return_value = '<is> True'
-            self.assertTrue(hbsd_replication._is_group_replication(group))
-
-    def test_is_group_snapshot_replication_none(self):
+    def test_has_group_repl_spec_removed(self):
+        self.assertFalse(hasattr(hbsd_replication, '_has_group_repl_spec'))
+        self.assertFalse(hasattr(hbsd_replication, '_GROUP_REPL_SPECS'))
+        self.assertFalse(hasattr(hbsd_replication, '_is_group_replication'))
         self.assertFalse(
-            hbsd_replication._is_group_snapshot_replication(None))
-
-    def test_is_group_snapshot_replication(self):
-        group_snapshot = FakeGroup(group_type_id='type-id')
-        with mock.patch.object(hbsd_replication, 'group_types') as types:
-            types.get_group_type_specs.return_value = '<is> True'
-            self.assertTrue(
-                hbsd_replication._is_group_snapshot_replication(
-                    group_snapshot))
+            hasattr(hbsd_replication, '_is_group_snapshot_replication'))
 
     def test_volume_in_group_replication_no_group(self):
         self.assertFalse(
             hbsd_replication._volume_in_group_replication(FakeVolume()))
 
-    def test_volume_in_group_replication(self):
-        volume = FakeVolume(
-            group_id=GROUP_REPL_GROUP_ID,
-            group=FakeGroup(group_type_id='type-id'))
-        with mock.patch.object(hbsd_replication, 'group_types') as types:
-            types.get_group_type_specs.return_value = '<is> True'
+    @ddt.data('group_replication_enabled',
+              'consistent_group_replication_enabled')
+    def test_volume_in_group_replication(self, key):
+        group = fake_group.fake_group_obj(CTXT, group_type_id='type-id')
+        volume = FakeVolume(group_id=GROUP_REPL_GROUP_ID, group=group)
+        wanted = key
+
+        def _specs(group_type_id, key=None):
+            return '<is> True' if key == wanted else '<is> False'
+
+        with mock.patch.object(group_types, 'get_group_type_specs') as specs:
+            specs.side_effect = _specs
             self.assertTrue(
                 hbsd_replication._volume_in_group_replication(volume))
+
+    def test_volume_in_group_replication_not_replicated(self):
+        group = fake_group.fake_group_obj(CTXT, group_type_id='type-id')
+        volume = FakeVolume(group_id=GROUP_REPL_GROUP_ID, group=group)
+        with mock.patch.object(
+                group_types, 'get_group_type_specs', return_value=False):
+            self.assertFalse(
+                hbsd_replication._volume_in_group_replication(volume))
+
+    def test_volume_in_group_replication_type_missing(self):
+        # Deliberately not swallowed, matching Group.is_replicated.
+        group = fake_group.fake_group_obj(CTXT, group_type_id='gone')
+        volume = FakeVolume(group_id=GROUP_REPL_GROUP_ID, group=group)
+        with mock.patch.object(
+                group_types, 'get_group_type_specs',
+                side_effect=exception.GroupTypeNotFound(
+                    group_type_id='gone')):
+            self.assertRaises(
+                exception.GroupTypeNotFound,
+                hbsd_replication._volume_in_group_replication, volume)
 
     def test_volume_in_group_replication_group_gone(self):
         volume = FakeVolume(
@@ -4521,6 +4904,83 @@ class HBSDGroupReplicationHelperTest(test.TestCase):
             group=exception.GroupNotFound(group_id=GROUP_REPL_GROUP_ID))
         self.assertFalse(
             hbsd_replication._volume_in_group_replication(volume))
+
+    def test_group_snapshot_is_replicated_none(self):
+        self.assertFalse(
+            hbsd_replication._group_snapshot_is_replicated(None))
+
+    def test_group_snapshot_is_replicated_type_id_none(self):
+        group_snapshot = FakeGroup(group_type_id=None)
+        self.assertFalse(
+            hbsd_replication._group_snapshot_is_replicated(group_snapshot))
+
+    @ddt.data('group_replication_enabled',
+              'consistent_group_replication_enabled')
+    def test_group_snapshot_is_replicated_true(self, key):
+        group_snapshot = FakeGroup(group_type_id='type-id')
+        wanted = key
+
+        def _specs(group_type_id, key=None):
+            return '<is> True' if key == wanted else '<is> False'
+
+        with mock.patch.object(group_types, 'get_group_type_specs') as specs:
+            specs.side_effect = _specs
+            self.assertTrue(
+                hbsd_replication._group_snapshot_is_replicated(
+                    group_snapshot))
+
+    @ddt.data('<is> False', 'True', '', None, '<is>True')
+    def test_group_snapshot_is_replicated_false(self, spec):
+        group_snapshot = FakeGroup(group_type_id='type-id')
+        with mock.patch.object(
+                group_types, 'get_group_type_specs', return_value=spec):
+            self.assertFalse(
+                hbsd_replication._group_snapshot_is_replicated(
+                    group_snapshot))
+
+    def test_typed_for_group_replication_reads_the_unscoped_key(self):
+        self.assertEqual('group_replication_enabled',
+                         hbsd_replication._GROUP_REPL_VOLUME_SPEC)
+        self.assertTrue(
+            hbsd_replication._typed_for_group_replication(
+                {'group_replication_enabled': '<is> True'}))
+
+    def test_typed_for_group_replication_ignores_the_old_scoped_key(self):
+        old_key = 'hbsd:' + hbsd_replication._GROUP_REPL_VOLUME_SPEC
+        self.assertFalse(
+            hbsd_replication._typed_for_group_replication(
+                {old_key: '<is> True'}))
+
+    @ddt.data('<is> True', '  <is> True  ')
+    def test_typed_for_group_replication_true(self, spec):
+        self.assertTrue(
+            hbsd_replication._typed_for_group_replication(
+                {hbsd_replication._GROUP_REPL_VOLUME_SPEC: spec}))
+
+    @ddt.data('True', 'true', '<is> true')
+    def test_typed_for_group_replication_false_for_near_miss_values(
+            self, spec):
+        self.assertFalse(
+            hbsd_replication._typed_for_group_replication(
+                {hbsd_replication._GROUP_REPL_VOLUME_SPEC: spec}))
+
+    @ddt.data({hbsd_replication._GROUP_REPL_VOLUME_SPEC: '<is> False'},
+              {hbsd_replication._GROUP_REPL_VOLUME_SPEC: ''},
+              {'other': 'x'}, {}, None)
+    def test_typed_for_group_replication_false(self, extra_specs):
+        self.assertFalse(
+            hbsd_replication._typed_for_group_replication(extra_specs))
+
+    def test_group_snapshot_is_replicated_type_missing(self):
+        group_snapshot = FakeGroup(group_type_id='gone')
+        with mock.patch.object(
+                group_types, 'get_group_type_specs',
+                side_effect=exception.GroupTypeNotFound(
+                    group_type_id='gone')):
+            self.assertRaises(
+                exception.GroupTypeNotFound,
+                hbsd_replication._group_snapshot_is_replicated,
+                group_snapshot)
 
     @ddt.data(None, {}, {'other': 'x'}, {hbsd_replication._MD_COPY_GROUP: ''})
     def test_volume_copy_group_binding_absent(self, metadata):

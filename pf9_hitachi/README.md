@@ -77,7 +77,7 @@ Beyond the eight entry points:
 | Group-name binding by prefix `hbsd-cg:<name>` for adopting an existing array copy group | `_resolve_copy_group_name()` |
 | Journal lifecycle — created on first pair, deleted on `disable_replication()` | `_group_repl_journal_ids()` / `_group_repl_delete_journals()` |
 | Target-role adoption — a DR backend adopts already-promoted S-VOLs instead of creating pairs | `hitachi_replication_role = target` |
-| Per-pair state reported in `update_volume_stats()` capabilities | `_pair_status_capabilities()` |
+| Per-copy-group pair state in `update_volume_stats()` capabilities — **off by default**, see `hitachi_replication_report_pair_status` | `_pair_status_capabilities()` |
 | Graceful vs emergency failover (`split` vs `takeover ... forceSplit`) | `_failover_mode()` |
 
 ---
@@ -122,6 +122,14 @@ the same group-replication behaviour. Use the
 `pf9_hitachi_replication.*` classes when you want the deployment to be
 self-documenting and separately CI-tracked.
 
+> **Not for upstream.** Those two `CI_WIKI_NAME` values are PF9-specific and
+> have no registered third-party CI account behind them, which breaks CI
+> reporting on the OpenStack gerrit site. Upstream, every Hitachi driver uses
+> `utils.CI_WIKI_NAME` (`Hitachi_CI`). Set both to `utils.CI_WIKI_NAME` before
+> the Cinder patch series — at which point these classes override nothing and
+> can be deleted outright, with a `cinder.conf` migration note for anyone
+> pointing at them.
+
 ---
 
 ## ⚙️ Configuration
@@ -160,7 +168,8 @@ hitachi_replication_role = target
 | Option | Default | Notes |
 |--------|---------|-------|
 | `hitachi_replication_role` | `source` | `source` creates volumes and the copy group; `target` adopts promoted S-VOLs |
-| `hitachi_replication_group_only` | `False` | `True` = replicate only once a volume joins a replication group, not at create time |
+| `hitachi_replication_report_pair_status` | `False` | Report each copy group's pair state as the `group_replication_pairs` pool capability. Costs one REST call per copy group on every stats poll, so it is off by default — turn it on only where a consumer reads that capability |
+| `hitachi_replication_report_pair_status_ttl` | `300` | Seconds to cache that report. Only read when the option above is `True` |
 | `hitachi_replication_mun` | `1` | Mirror unit ID (0–3) |
 | `hitachi_replication_journal_size` | *(unset)* | GB, 10–1024. **Required** for UR — the driver errors out without it |
 | `hitachi_replication_journal_overflow_tolerance` | `60` | Seconds before a pair splits on journal-full |
@@ -181,6 +190,82 @@ your client version.
 | `consistent_group_replication_enabled` | `<is> True` | Marks the group as group-replicated |
 | `group_replication_enabled` | `<is> True` | Equivalent alternative |
 | `hbsd:group_replication_failover_mode` | `graceful` | Default failover mode for this group type |
+
+### Volume type specs
+
+| Spec | Values | Effect |
+|------|--------|--------|
+| `replication_enabled` | `<is> True` | Standard Cinder: the volume is replicated |
+| `group_replication_enabled` | `<is> True` | This volume's pair is created by `enable_replication` when it joins a copy group — **not** at create time |
+
+The key is unscoped, so Cinder's `CapabilitiesFilter` matches it against the
+`group_replication_enabled` pool capability. The driver reports that capability
+only on a backend configured for replication. A volume of this type can
+therefore only be scheduled to a backend that can do group replication; on any
+other backend the create fails with `No valid backend`.
+
+`group_replication_enabled` exists because the group type cannot answer
+in time. A volume created *before* its Cinder group exists — the normal order,
+since a protection group is formed from volumes that already exist — has no
+`group_id`, so the driver cannot see that a copy group will claim it. It pairs
+immediately, and `enable_replication` then fails with
+`GROUP_REPLICATION_ALREADY_PAIRED`: the driver pins one mirror unit
+(`hitachi_replication_mun`), and the array rejects a second pair at it.
+
+With this spec set, one backend serves both models. A plain
+`replication_enabled` type still pairs at create, as upstream does; a type
+carrying this spec waits for the copy group.
+
+#### Allowed values
+
+The spec must be exactly `<is> True`, or absent. The scheduler and the driver
+both read the value, and they do not parse it the same way. The scheduler goes
+through `extra_specs_ops.match`, where `<is>` compares with
+`strutils.bool_from_string`. The driver accepts only the literal `<is> True`,
+after trimming surrounding whitespace, which is the rule
+`volume_utils.is_group_a_type` applies to group types.
+
+| Value | Scheduler | Driver | Result |
+|---|---|---|---|
+| `<is> True` | matches | group-replicated | Works |
+| absent | not evaluated | not group-replicated | Pairs at create (intended) |
+| `True`, `true` | no match (compared as a plain string) | not group-replicated | Unschedulable: `No valid backend` |
+| `<is> False`, `<is> false` | requires a backend reporting `False`; none does | not group-replicated | Unschedulable everywhere |
+| `<is> true` | matches | **not** group-replicated | Scheduled, but pairs at create and can never join a copy group |
+
+#### One name, three meanings
+
+`group_replication_enabled` names three different things in this driver. They
+do not collide, because each lives on a different object:
+
+| # | Object | Set by | Read by | Means |
+|---|---|---|---|---|
+| 1 | Pool capability | The driver, in `update_volume_stats()` | Cinder's `CapabilitiesFilter` | This backend *can* do group replication |
+| 2 | Group type `group_specs` | Operator | `Group.is_replicated` (Cinder) | This Cinder **group** is replicated |
+| 3 | Volume type `extra_specs` | Operator | `CapabilitiesFilter`, and `_typed_for_group_replication()` | This **volume** is paired by `enable_replication`, not at create |
+
+(1) and (3) share a name on purpose. That pairing is what `CapabilitiesFilter`
+enforces. (2) is Cinder's own standard group spec, the sibling of
+`consistent_group_replication_enabled`, and is hardcoded in
+`Group.is_replicated`. The driver does not rename it.
+
+### What PSR expects
+
+Platform9 Site Recovery drives **group-level replication only** — it never uses
+the per-volume replication path. A PSR deployment therefore configures:
+
+| | Source site | DR site |
+|---|---|---|
+| `hitachi_replication_role` | `source` | **`target`** |
+| Volume type | `replication_enabled=<is> True` **and** `group_replication_enabled=<is> True` | same |
+| Group type | `consistent_group_replication_enabled=<is> True` | same |
+| `hitachi_replication_report_pair_status` | `True` if psr-dr should read pair state through Cinder rather than calling the array directly; otherwise leave off | same |
+
+The volume-type spec is the only way to stop a volume pairing at create. Without
+it a volume pairs at create and cannot later join a copy group.
+
+The DR site's `hitachi_replication_role = target` cannot be derived — a backend
+that holds S-VOLs looks the same to Cinder as one that holds P-VOLs.
 
 ### Failover semantics
 

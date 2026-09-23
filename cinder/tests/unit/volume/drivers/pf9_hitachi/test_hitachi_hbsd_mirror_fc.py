@@ -44,6 +44,7 @@ from cinder.volume.drivers.pf9_hitachi import hbsd_rest_api
 from cinder.volume.drivers.pf9_hitachi import hbsd_rest_fc
 from cinder.volume.drivers.pf9_hitachi import hbsd_utils
 # PF9 End
+from cinder.volume import group_types
 from cinder.volume import volume_types
 from cinder.volume import volume_utils
 from cinder.zonemanager import utils as fczm_utils
@@ -2086,8 +2087,10 @@ class HBSDMIRRORFCDriverTest(test.TestCase):
         ret = self.driver.create_group(self.ctxt, TEST_GROUP[0])
         self.assertIsNone(ret)
 
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value=False)
     @mock.patch.object(requests.Session, "request")
-    def test_delete_group(self, request):
+    def test_delete_group(self, request, get_group_type_specs):
         request.side_effect = [FakeResponse(200, GET_LDEV_RESULT),
                                FakeResponse(200, GET_LDEV_RESULT),
                                FakeResponse(200, GET_LDEV_RESULT),
@@ -2202,13 +2205,18 @@ class HBSDMIRRORFCDriverTest(test.TestCase):
               'provider_location': '1'}])
         self.assertTupleEqual(actual, ret)
 
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value=False)
     @mock.patch.object(volume_utils, 'is_group_a_cg_snapshot_type')
-    def test_update_group(self, is_group_a_cg_snapshot_type):
+    def test_update_group(self, is_group_a_cg_snapshot_type,
+                          get_group_type_specs):
         is_group_a_cg_snapshot_type.return_value = False
         ret = self.driver.update_group(
             self.ctxt, TEST_GROUP[0], add_volumes=[TEST_VOLUME[0]])
         self.assertTupleEqual((None, None, None), ret)
 
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value=False)
     @mock.patch.object(requests.Session, "request")
     @mock.patch.object(volume_types, 'get_volume_type_extra_specs')
     @mock.patch.object(sqlalchemy_api, 'volume_get', side_effect=_volume_get)
@@ -2216,7 +2224,8 @@ class HBSDMIRRORFCDriverTest(test.TestCase):
     @mock.patch.object(volume_types, 'get_volume_type_qos_specs')
     def test_create_group_snapshot_non_cg(
             self, get_volume_type_qos_specs, is_group_a_cg_snapshot_type,
-            volume_get, get_volume_type_extra_specs, request):
+            volume_get, get_volume_type_extra_specs, request,
+            get_group_type_specs):
         is_group_a_cg_snapshot_type.return_value = False
         extra_specs = {"test1": "aaa"}
         get_volume_type_extra_specs.return_value = extra_specs
@@ -2244,8 +2253,10 @@ class HBSDMIRRORFCDriverTest(test.TestCase):
         )
         self.assertTupleEqual(actual, ret)
 
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value=False)
     @mock.patch.object(requests.Session, "request")
-    def test_delete_group_snapshot(self, request):
+    def test_delete_group_snapshot(self, request, get_group_type_specs):
         request.side_effect = [FakeResponse(200, GET_LDEV_RESULT_PAIR),
                                FakeResponse(200, NOTFOUND_RESULT),
                                FakeResponse(200, GET_SNAPSHOTS_RESULT),

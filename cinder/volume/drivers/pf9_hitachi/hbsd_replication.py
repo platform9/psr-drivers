@@ -50,8 +50,9 @@ _PAIR_STATUS_UPDATED_KEY = 'group_replication_pairs_updated_at'
 _PAIR_STATUS_PEER_KEY = 'group_replication_peer_initialized'
 _PAIR_STATUS_ENUMERATED_KEY = 'group_replication_pairs_enumerated'
 _PAIR_STATUS_MAX_COPY_GROUPS = 64
-_GROUP_REPL_SPECS = ('consistent_group_replication_enabled',
-                     'group_replication_enabled')
+_GROUP_REPL_TYPE_KEYS = ('consistent_group_replication_enabled',
+                         'group_replication_enabled')
+_GROUP_REPL_VOLUME_SPEC = 'group_replication_enabled'
 _GROUP_REPL_MODE_SPEC = 'hbsd:group_replication_failover_mode'
 _MODE_GRACEFUL = 'graceful'
 _MODE_EMERGENCY = 'emergency'
@@ -133,19 +134,12 @@ _REP_OPTS = [
 COMMON_REPLICATION_OPTS = [
     cfg.StrOpt(
         'hitachi_replication_role',
-        default='source',
-        choices=['source', 'target'],
+        default=_ROLE_SOURCE,
+        choices=[_ROLE_SOURCE, _ROLE_TARGET],
         help='This backend\'s role in remote replication. "source" (the '
              'default) creates volumes and the copy group. "target" is a '
              'disaster recovery backend that adopts promoted secondary '
              'volumes. This value cannot be derived automatically.'),
-    cfg.BoolOpt(
-        'hitachi_replication_group_only',
-        default=False,
-        help='Whether replication is enabled only by joining a replication '
-             'group, rather than at volume creation. Set to True to '
-             'enable replication for volumes only after they are added to '
-             'a replication group.'),
     cfg.IntOpt(
         'hitachi_replication_mun',
         default=1, min=0, max=3,
@@ -350,35 +344,38 @@ def _log_step(step, **details):
         {'step': step, 'sec': watch.elapsed(), 'detail': detail})
 
 
-def _has_group_repl_spec(group_type_id):
-    if group_type_id is None:
+def _group_snapshot_is_replicated(group_snapshot):
+    """Group.is_replicated for a group snapshot, which has no Group object."""
+    if group_snapshot is None or group_snapshot.group_type_id is None:
         return False
-    for key in _GROUP_REPL_SPECS:
-        try:
-            spec = group_types.get_group_type_specs(group_type_id, key=key)
-        except exception.GroupTypeNotFound:
-            return False
-        if spec == '<is> True':
-            return True
-    return False
-
-
-def _is_group_replication(group):
-    return group is not None and _has_group_repl_spec(group.group_type_id)
-
-
-def _is_group_snapshot_replication(group_snapshot):
-    return group_snapshot is not None and _has_group_repl_spec(
-        group_snapshot.group_type_id)
+    return any(
+        group_types.get_group_type_specs(
+            group_snapshot.group_type_id, key=key) == '<is> True'
+        for key in _GROUP_REPL_TYPE_KEYS)
 
 
 def _volume_in_group_replication(volume):
     if not volume.group_id:
         return False
     try:
-        return _is_group_replication(volume.group)
+        group = volume.group
     except exception.GroupNotFound:
         return False
+    return group is not None and group.is_replicated
+
+
+def _typed_for_group_replication(extra_specs):
+    """Whether the volume type marks its volumes for group replication.
+
+    Only the literal '<is> True' (whitespace trimmed) enables it, the same
+    rule volume_utils.is_group_a_type applies to group types.
+    """
+    if not extra_specs:
+        return False
+    spec = extra_specs.get(_GROUP_REPL_VOLUME_SPEC)
+    if not spec:
+        return False
+    return spec.strip() == '<is> True'
 
 
 def _volume_copy_group_binding(volume):
@@ -678,10 +675,6 @@ class HBSDREPLICATION(rest.HBSDREST):
             self.ctxt = context
             self._check_param()
             self._setup_replication()
-            utils.output_log(
-                MSG.SET_CONFIG_VALUE,
-                object='hitachi_replication_group_only',
-                value=self.conf.hitachi_replication_group_only)
             if self._active_backend_id:
                 # Failed over: the secondary is the active side, so it is
                 # the only one that has to initialize.
@@ -843,11 +836,17 @@ class HBSDREPLICATION(rest.HBSDREST):
                 site='secondary')
             self.raise_error(msg)
 
-    def _pairs_at_create_time(self, volume):
+    def _pairs_at_create_time(self, volume, extra_specs=None):
         """Whether a replication-enabled volume is paired as it is created."""
         if _volume_in_group_replication(volume):
             return False
-        return not self.conf.hitachi_replication_group_only
+        # enable_replication pairs these; pairing now takes the single mirror
+        # unit and makes that add fail with GROUP_REPLICATION_ALREADY_PAIRED.
+        if extra_specs is None:
+            extra_specs = self.rep_primary.get_volume_extra_specs(volume)
+        if _typed_for_group_replication(extra_specs):
+            return False
+        return True
 
     def _is_target_role(self):
         return self.conf.hitachi_replication_role == _ROLE_TARGET
@@ -882,6 +881,20 @@ class HBSDREPLICATION(rest.HBSDREST):
                 return explicit
         return self._create_group_copy_group_name(group.id)
 
+    def _pool_id_for(self, instance, volume):
+        """The pool id to create `volume`'s LDEV in, on `instance`.
+
+        volume['host'] names a local pool, so only rep_primary with polled
+        stats can resolve it; otherwise the first configured pool is used.
+        """
+        if (instance is self.rep_primary and
+                getattr(instance, '_stats', None) and
+                'pools' in instance._stats):
+            pool_id = instance.get_pool_id_of_volume(volume)
+            if pool_id is not None:
+                return pool_id
+        return instance.storage_info['pool_id'][0]
+
     def _is_mirror_spec(self, extra_specs):
         topology = None
         if not extra_specs:
@@ -901,8 +914,8 @@ class HBSDREPLICATION(rest.HBSDREST):
             self.raise_error(msg)
 
     def _create_rep_ldev(self, volume, extra_specs, rep_type, pvol=None):
-        """Create a primary volume and  a secondary volume."""
-        pool_id = self.rep_secondary.storage_info['pool_id'][0]
+        """Create a primary volume and a secondary volume."""
+        pool_id = self._pool_id_for(self.rep_secondary, volume)
         ldev_range = self.rep_secondary.storage_info['ldev_range']
         qos_specs = utils.get_qos_specs_from_volume(volume)
         thread = self.spawn(
@@ -1024,7 +1037,7 @@ class HBSDREPLICATION(rest.HBSDREST):
         return {key: value for key, value in state.items()
                 if value is not None}
 
-    def _copy_grp_pair_state(self, copy_group_name, journals=None):
+    def _copy_grp_pair_state(self, copy_group_name, journals_fn=None):
         """Read one copy group's state as the storage system reports it."""
         is_secondary = bool(self._active_backend_id or self._is_target_role())
         if is_secondary:
@@ -1048,8 +1061,9 @@ class HBSDREPLICATION(rest.HBSDREST):
                 {pair['svolStatus'] for pair in copy_pairs
                  if pair.get('svolStatus')})
         if state.get('journal_usage_rate') is None:
+            journals = journals_fn() if journals_fn else {}
             state.update(self._journal_state(
-                copy_pairs, journals or {}, is_secondary))
+                copy_pairs, journals, is_secondary))
         return {key: value for key, value in state.items()
                 if value is not None}
 
@@ -1112,14 +1126,23 @@ class HBSDREPLICATION(rest.HBSDREST):
             capabilities[_PAIR_STATUS_ENUMERATED_KEY] = False
         pairs = {}
         failed_groups = []
-        journals = self._journals_by_id(
-            self._svol_instance() if
-            (self._active_backend_id or self._is_target_role())
-            else self.rep_primary)
+        # The copy group list carries names only, so each group is read on its
+        # own. Journals are only a fallback for a missing journalUsageRate, so
+        # they are fetched lazily, at most once.
+        journals_cache = []
+
+        def journals_fn():
+            if not journals_cache:
+                journals_cache.append(self._journals_by_id(
+                    self._svol_instance() if
+                    (self._active_backend_id or self._is_target_role())
+                    else self.rep_primary))
+            return journals_cache[0]
+
         for copy_group_name in copy_group_names:
             try:
                 pairs[copy_group_name] = self._copy_grp_pair_state(
-                    copy_group_name, journals)
+                    copy_group_name, journals_fn)
             except Exception:
                 failed_groups.append(copy_group_name)
         if failed_groups:
@@ -1165,9 +1188,7 @@ class HBSDREPLICATION(rest.HBSDREST):
         instances = self._journal_instances()
         try:
             for instance in instances:
-                pool_id = (self.rep_primary.get_pool_id_of_volume(volume)
-                           if instance == self.rep_primary
-                           else self.rep_secondary.storage_info['pool_id'][0])
+                pool_id = self._pool_id_for(instance, volume)
                 ldev_range = instance.storage_info['ldev_range']
                 ldev = instance.create_ldev(
                     self.conf.hitachi_replication_journal_size, {},
@@ -1421,7 +1442,8 @@ class HBSDREPLICATION(rest.HBSDREST):
             return {
                 'provider_location': provider_location
             }
-        if volume.is_replicated() and self._pairs_at_create_time(volume):
+        if volume.is_replicated() and self._pairs_at_create_time(
+                volume, extra_specs):
             _check_rep_ldev(self, volume, 'create a volume')
             rep_type = _get_rep_type(self, extra_specs)
             pldev, sldev = self._create_rep_ldev_and_pair(
@@ -1725,7 +1747,8 @@ class HBSDREPLICATION(rest.HBSDREST):
             return self._create_rep_volume_from_src(
                 volume, extra_specs, src, src_type, operation,
                 self.driver_info['mirror_attr'])
-        if volume.is_replicated() and self._pairs_at_create_time(volume):
+        if volume.is_replicated() and self._pairs_at_create_time(
+                volume, extra_specs):
             return self._create_rep_volume_from_src(
                 volume, extra_specs, src, src_type, operation,
                 _get_rep_type(self, extra_specs))
@@ -2132,8 +2155,8 @@ class HBSDREPLICATION(rest.HBSDREST):
         LOG.info('Group replication: delete_group %(group)s. (volumes: '
                  '%(n)d, group replication: %(gr)s)',
                  {'group': group.id, 'n': len(volumes),
-                  'gr': _is_group_replication(group)})
-        if _is_group_replication(group):
+                  'gr': group.is_replicated})
+        if group.is_replicated:
             return self._group_repl_delete_group(group, volumes)
         if self.conf.hitachi_mirror_storage_id:
             self._require_rep_primary()
@@ -2152,7 +2175,10 @@ class HBSDREPLICATION(rest.HBSDREST):
                 context, group, volumes, snapshots, source_vols)
         else:
             sources = snapshots or source_vols or []
-            if (not self._active_backend_id and sources and
+            # _group_repl_create_group_from_src clones on rep_secondary, so it
+            # only handles sources that live there.
+            if (group.is_replicated and not self._active_backend_id and
+                    sources and
                     all(_get_ldev_site(src) == _SECONDARY
                         for src in sources)):
                 return self._group_repl_create_group_from_src(
@@ -2174,8 +2200,8 @@ class HBSDREPLICATION(rest.HBSDREST):
                  'remove: %(r)d, group replication: %(gr)s)',
                  {'group': group.id, 'a': len(add_volumes or []),
                   'r': len(remove_volumes or []),
-                  'gr': _is_group_replication(group)})
-        if _is_group_replication(group):
+                  'gr': group.is_replicated})
+        if group.is_replicated:
             return self._group_repl_update_group(
                 group, add_volumes, remove_volumes)
         if self.conf.hitachi_mirror_storage_id:
@@ -2206,8 +2232,8 @@ class HBSDREPLICATION(rest.HBSDREST):
         LOG.info('Group replication: create_group_snapshot %(gs)s. '
                  '(snapshots: %(n)d, group replication: %(gr)s)',
                  {'gs': group_snapshot.id, 'n': len(snapshots),
-                  'gr': _is_group_snapshot_replication(group_snapshot)})
-        if _is_group_snapshot_replication(group_snapshot):
+                  'gr': _group_snapshot_is_replicated(group_snapshot)})
+        if _group_snapshot_is_replicated(group_snapshot):
             return self._group_repl_create_group_snapshot(
                 context, group_snapshot, snapshots)
         if self.conf.hitachi_mirror_storage_id:
@@ -2229,8 +2255,8 @@ class HBSDREPLICATION(rest.HBSDREST):
         LOG.info('Group replication: delete_group_snapshot %(gs)s. '
                  '(snapshots: %(n)d, group replication: %(gr)s)',
                  {'gs': group_snapshot.id, 'n': len(snapshots),
-                  'gr': _is_group_snapshot_replication(group_snapshot)})
-        if _is_group_snapshot_replication(group_snapshot):
+                  'gr': _group_snapshot_is_replicated(group_snapshot)})
+        if _group_snapshot_is_replicated(group_snapshot):
             return self._group_repl_delete_group_snapshot(
                 group_snapshot, snapshots)
         if self.conf.hitachi_mirror_storage_id:
@@ -2348,34 +2374,6 @@ class HBSDREPLICATION(rest.HBSDREST):
                 if created_journal_ids:
                     self._delete_journals(created_journal_ids)
 
-    def _group_repl_confirm_new_pairs(self, copy_group_name,
-                                      volumes_model_update):
-        """Confirm each freshly created pair really reached PAIR."""
-        rep_type = self.driver_info['rep_type_async']
-        for volume_update in volumes_model_update:
-            location = volume_update.get('provider_location')
-            if (volume_update.get('replication_status') !=
-                    fields.ReplicationStatus.ENABLED or not location):
-                continue
-            loc = json.loads(location)
-            pvol, svol = loc.get('pldev'), loc.get('sldev')
-            if pvol is None or svol is None:
-                continue
-            try:
-                with _log_step('confirm replication pair',
-                               copy_group=copy_group_name,
-                               pvol=pvol, svol=svol):
-                    self._wait_pair_status_change(
-                        copy_group_name, pvol, svol, rep_type, _WAIT_PAIR)
-            except exception.VolumeDriverException:
-                self.rep_primary.output_log(
-                    MSG.GROUP_REPLICATION_PAIR_CREATE_FAILED,
-                    volume=volume_update['id'],
-                    copy_group=copy_group_name)
-                volume_update['replication_status'] = (
-                    fields.ReplicationStatus.ERROR)
-        return volumes_model_update
-
     def _group_repl_add_volume(self, volume, copy_group_name,
                                is_new_copy_grp, operation):
         """Create the S-VOL and its pair for one group replication member."""
@@ -2399,7 +2397,7 @@ class HBSDREPLICATION(rest.HBSDREST):
             with _log_step('create secondary volume', volume=volume.id):
                 svol = self.rep_secondary.create_ldev(
                     volume.size, extra_specs,
-                    self.rep_secondary.storage_info['pool_id'][0],
+                    self._pool_id_for(self.rep_secondary, volume),
                     self.rep_secondary.storage_info['ldev_range'],
                     qos_specs=utils.get_qos_specs_from_volume(volume))
             try:
@@ -2788,7 +2786,7 @@ class HBSDREPLICATION(rest.HBSDREST):
                     snapshot.volume)
                 svol = secondary.create_ldev(
                     snapshot.volume_size, extra_specs,
-                    secondary.storage_info['pool_id'][0],
+                    self._pool_id_for(secondary, snapshot.volume),
                     secondary.storage_info['ldev_range'],
                     qos_specs=utils.get_qos_specs_from_volume(snapshot))
                 secondary.modify_ldev_name(svol, snapshot.id.replace('-', ''))
@@ -3246,6 +3244,8 @@ class HBSDREPLICATION(rest.HBSDREST):
     def enable_replication(self, context, group, volumes):
         LOG.info('Group replication: enable_replication %(group)s. '
                  '(volumes: %(n)d)', {'group': group.id, 'n': len(volumes)})
+        if not group.is_replicated:
+            raise NotImplementedError()
         copy_group_name = self._resolve_copy_group_name(
             group, volumes)
         if self._group_repl_adopted_members(volumes):
@@ -3297,6 +3297,8 @@ class HBSDREPLICATION(rest.HBSDREST):
     def disable_replication(self, context, group, volumes):
         LOG.info('Group replication: disable_replication %(group)s. '
                  '(volumes: %(n)d)', {'group': group.id, 'n': len(volumes)})
+        if not group.is_replicated:
+            raise NotImplementedError()
         self._require_rep_primary()
         self._require_rep_secondary()
         copy_group_name = self._resolve_copy_group_name(
@@ -3317,6 +3319,8 @@ class HBSDREPLICATION(rest.HBSDREST):
 
     def failover_replication(self, context, group, volumes,
                              secondary_backend_id=None):
+        if not group.is_replicated:
+            raise NotImplementedError()
         self._require_rep_primary()
         self._require_svol_instance()
         copy_group_name = self._resolve_copy_group_name(

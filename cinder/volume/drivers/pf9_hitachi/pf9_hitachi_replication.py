@@ -17,6 +17,9 @@ from cinder import interface
 from cinder.volume.drivers.pf9_hitachi import hbsd_fc
 from cinder.volume.drivers.pf9_hitachi import hbsd_iscsi
 
+# PF9 TEMPORARY: the CI_WIKI_NAME overrides below only label the PF9 lab
+# backends; set both to utils.CI_WIKI_NAME before upstream.
+
 
 @interface.volumedriver
 class HBSDGroupReplicationFCDriver(hbsd_fc.HBSDFCDriver):
