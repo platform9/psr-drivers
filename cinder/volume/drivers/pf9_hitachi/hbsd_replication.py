@@ -182,6 +182,19 @@ COMMON_REPLICATION_OPTS = [
         default=5, min=0, max=60,
         help='Delay in minutes before a volume pair is split after path '
         'failure occurs'),
+    cfg.BoolOpt(
+        'hitachi_replication_report_pair_status',
+        default=False,
+        help='Report per-copy-group replication pair state as a pool '
+             'capability. This costs one REST call per copy group on '
+             'every stats poll, so it is off by default; enable it only '
+             'where a consumer reads group_replication_pairs.'),
+    cfg.IntOpt(
+        'hitachi_replication_report_pair_status_ttl',
+        default=300, min=0,
+        help='Seconds to cache the per-copy-group pair status report '
+             'before recomputing it. Only used when '
+             'hitachi_replication_report_pair_status is enabled.'),
 ]
 
 _REPLICATION_DEVICE_KEY_NAMES = [
@@ -575,6 +588,9 @@ class HBSDREPLICATION(rest.HBSDREST):
         # Copy groups this process has seen. Once failed over they cannot be
         # listed, but each remembered name can still be read.
         self._known_copy_groups = set()
+        # The last _pair_status_capabilities() result, for the TTL cache
+        # and to serve a stale-but-stamped value if the array is down.
+        self._pair_status_cache = None
         self._active_backend_id = active_backend_id
         self._LDEV_NAME = self.driver_info['driver_prefix'] + '-LDEV-%d-%d'
 
@@ -1038,10 +1054,25 @@ class HBSDREPLICATION(rest.HBSDREST):
                 if value is not None}
 
     def _pair_status_capabilities(self):
-        """Per-copy-group pair state and the inputs an RPO check needs."""
+        """Per-copy-group pair state and the inputs an RPO check needs.
+
+        Cached for hitachi_replication_report_pair_status_ttl seconds: this
+        costs one REST call per copy group, so re-reading it every stats
+        poll is not free. On an array error, the last good value is served
+        with its original timestamp rather than dropped, so a consumer can
+        judge staleness itself instead of losing the field.
+        """
         capabilities = {
             _PAIR_STATUS_PEER_KEY: self.rep_secondary is not None}
         if self.rep_secondary is None:
+            return capabilities
+        if not self.conf.hitachi_replication_report_pair_status:
+            return capabilities
+        cached = self._pair_status_cache
+        if cached is not None and not timeutils.is_older_than(
+                cached['time'],
+                self.conf.hitachi_replication_report_pair_status_ttl):
+            capabilities.update(cached['data'])
             return capabilities
         enumerated = True
         if self._active_backend_id or self._is_target_role():
@@ -1055,6 +1086,9 @@ class HBSDREPLICATION(rest.HBSDREST):
                 LOG.warning(
                     'Could not enumerate copy groups for the pool '
                     'capabilities.', exc_info=True)
+                if cached is not None:
+                    capabilities.update(cached['data'])
+                    return capabilities
                 capabilities[_PAIR_STATUS_ENUMERATED_KEY] = False
                 return capabilities
             copy_group_names = [grp['copyGroupName'] for grp in copy_grps
@@ -1065,15 +1099,19 @@ class HBSDREPLICATION(rest.HBSDREST):
             capabilities[_PAIR_STATUS_KEY] = json.dumps({})
             capabilities[_PAIR_STATUS_UPDATED_KEY] = (
                 timeutils.utcnow().isoformat())
+            self._pair_status_cache = {
+                'time': timeutils.utcnow(), 'data': dict(capabilities)}
             return capabilities
         if len(copy_group_names) > _PAIR_STATUS_MAX_COPY_GROUPS:
-            LOG.debug(
+            LOG.warning(
                 'Reporting pair state for %(max)d of %(found)d copy groups; '
                 'raise _PAIR_STATUS_MAX_COPY_GROUPS to report more.',
                 {'max': _PAIR_STATUS_MAX_COPY_GROUPS,
                  'found': len(copy_group_names)})
             copy_group_names = copy_group_names[:_PAIR_STATUS_MAX_COPY_GROUPS]
+            capabilities[_PAIR_STATUS_ENUMERATED_KEY] = False
         pairs = {}
+        failed_groups = []
         journals = self._journals_by_id(
             self._svol_instance() if
             (self._active_backend_id or self._is_target_role())
@@ -1083,12 +1121,18 @@ class HBSDREPLICATION(rest.HBSDREST):
                 pairs[copy_group_name] = self._copy_grp_pair_state(
                     copy_group_name, journals)
             except Exception:
-                LOG.warning(
-                    'Could not read copy group %s for the pool '
-                    'capabilities.', copy_group_name, exc_info=True)
+                failed_groups.append(copy_group_name)
+        if failed_groups:
+            LOG.warning(
+                'Could not read %(count)d copy group(s) for the pool '
+                'capabilities: %(names)s.',
+                {'count': len(failed_groups),
+                 'names': ', '.join(failed_groups[:5])})
         capabilities[_PAIR_STATUS_KEY] = json.dumps(pairs, sort_keys=True)
         capabilities[_PAIR_STATUS_UPDATED_KEY] = (
             timeutils.utcnow().isoformat())
+        self._pair_status_cache = {
+            'time': timeutils.utcnow(), 'data': dict(capabilities)}
         return capabilities
 
     def _delete_journals(self, journal_ids):
@@ -1573,8 +1617,8 @@ class HBSDREPLICATION(rest.HBSDREST):
         self._require_rep_primary()
         if (not self._active_backend_id and
                 _get_ldev_site(volume) == _SECONDARY):
-            self._require_rep_secondary()
-            self.rep_secondary.delete_volume(volume)
+            self._require_svol_instance()
+            self._svol_instance().delete_volume(volume)
             return
         self._verify_ldev(volume, 'delete a volume')
         ldev = self._get_active_backend().get_ldev(volume)
@@ -2495,6 +2539,11 @@ class HBSDREPLICATION(rest.HBSDREST):
         for volume in candidates:
             pvol = self.rep_primary.get_ldev(volume)
             if pvol not in status_of:
+                # This volume's metadata claims an S-VOL, but the copy
+                # group has no pair for it (partial disable, or manual
+                # array cleanup). Adding it fresh would allocate a new
+                # S-VOL and orphan the old one, so report it instead.
+                wrong_state.append((volume, 'no pair in copy group'))
                 continue
             status = status_of[pvol]
             if status in _PAIR_REPLICATING:
@@ -2699,7 +2748,7 @@ class HBSDREPLICATION(rest.HBSDREST):
             thread = None
             if svol is not None:
                 thread = self.spawn(
-                    self.rep_secondary.delete_volume, volume)
+                    self._svol_instance().delete_volume, volume)
             try:
                 if pvol is not None:
                     self.rep_primary.delete_volume(volume)
@@ -2723,7 +2772,7 @@ class HBSDREPLICATION(rest.HBSDREST):
             self, context, group_snapshot, snapshots):
         """Create one crash-consistent Thin Image group on the secondary."""
         self._require_rep_secondary()
-        secondary = self.rep_secondary
+        secondary = self._svol_instance()
         snapshot_group_name = self._create_group_snapshot_group_name(
             group_snapshot.id)
         pairs = []
@@ -2778,7 +2827,7 @@ class HBSDREPLICATION(rest.HBSDREST):
             with _log_step('delete group snapshot',
                            group_snapshot=group_snapshot.id,
                            snapshots=len(snapshots)):
-                return self.rep_secondary._delete_group(
+                return self._svol_instance()._delete_group(
                     group_snapshot, snapshots, True)
         except Exception:
             with excutils.save_and_reraise_exception():
@@ -2932,9 +2981,7 @@ class HBSDREPLICATION(rest.HBSDREST):
                     fields.ReplicationStatus.ERROR):
                 is_new_copy_grp = False
             added_updates.append(volume_model_update)
-        add_volumes_update.extend(
-            self._group_repl_confirm_new_pairs(
-                copy_group_name, added_updates))
+        add_volumes_update.extend(added_updates)
         remove_volumes_update = [
             self._group_repl_delete_volume(
                 volume, copy_group_name,
@@ -2955,7 +3002,10 @@ class HBSDREPLICATION(rest.HBSDREST):
         sldev = (_svol_of(volume) if
                  _get_ldev_site(volume) in (_SECONDARY, _PRIMARY_SECONDARY)
                  else None)
-        if pldev is None or sldev is None:
+        # On a target-role backend the local LDEV IS the S-VOL; a missing
+        # P-VOL there is expected (it lives on the remote source array),
+        # not an error.
+        if sldev is None or (pldev is None and not self._is_target_role()):
             instance = (self.rep_primary if pldev is None else
                         self._svol_instance())
             instance.output_log(
@@ -3238,9 +3288,7 @@ class HBSDREPLICATION(rest.HBSDREST):
                     fields.ReplicationStatus.ERROR):
                 is_new_copy_grp = False
             added_updates.append(volume_model_update)
-        volumes_model_update.extend(
-            self._group_repl_confirm_new_pairs(
-                copy_group_name, added_updates))
+        volumes_model_update.extend(added_updates)
         model_update = {
             'replication_status': self._group_repl_aggregate_status(
                 volumes_model_update, fields.ReplicationStatus.ENABLED)}
@@ -3330,7 +3378,10 @@ class HBSDREPLICATION(rest.HBSDREST):
         for volume in volumes:
             pvol, svol = self._get_ldevs(volume, is_failback=is_failback)
             volume_status = fields.ReplicationStatus.ERROR
-            if pvol is not None and svol is not None:
+            # On a target-role backend an S-VOL alone is a complete,
+            # promotable volume; the P-VOL lives on the remote source array.
+            if svol is not None and (
+                    pvol is not None or self._is_target_role()):
                 try:
                     self._wait_pair_status_change(
                         copy_group_name, pvol, svol, rep_type, wait_type,

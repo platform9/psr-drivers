@@ -15,6 +15,7 @@
 #
 """Unit tests for Hitachi HBSD Driver."""
 
+from datetime import timedelta
 import json
 import types as pytypes
 from unittest import mock
@@ -1453,7 +1454,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         stats = self.driver.get_volume_stats(True)
         self.assertEqual('Hitachi', stats['vendor_name'])
         self.assertTrue(stats["pools"][0]['multiattach'])
-        self.assertEqual(2, request.call_count)
+        # B1: hitachi_replication_report_pair_status defaults to False, so
+        # this no longer makes the extra get_remote_copy_grps call - just
+        # the one GET_POOLS_RESULT request.
+        self.assertEqual(1, request.call_count)
         self.assertEqual(1, get_filter_function.call_count)
         self.assertEqual(1, get_goodness_function.call_count)
         self.assertTrue(stats['consistent_group_replication_enabled'])
@@ -1462,8 +1466,11 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertTrue(pool['consistent_group_replication_enabled'])
         self.assertTrue(pool['group_replication_enabled'])
         self.assertTrue(pool[hbsd_replication._PAIR_STATUS_PEER_KEY])
-        self.assertEqual(
-            {}, json.loads(pool[hbsd_replication._PAIR_STATUS_KEY]))
+        # B1: group_replication_pairs itself is only populated when
+        # hitachi_replication_report_pair_status is enabled (see
+        # test_update_volume_stats_pair_status_when_enabled and the
+        # _pair_status_capabilities cache tests).
+        self.assertNotIn(hbsd_replication._PAIR_STATUS_KEY, pool)
 
     @mock.patch.object(requests.Session, "request")
     @mock.patch.object(volume_types, 'get_volume_type_extra_specs')
@@ -3258,6 +3265,25 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
     def _common(self):
         return self.driver.common
 
+    def _set_target_role(self):
+        """Make the fixture's backend a DR (target-role) backend.
+
+        Flips the same two REST-client instances _setup_driver already
+        built; _svol_instance() starts resolving to rep_primary instead of
+        rep_secondary, matching a real hitachi_replication_role='target'
+        deployment.
+        """
+        self.override_config(
+            'hitachi_replication_role', 'target',
+            group=conf.SHARED_CONF_GROUP)
+
+    def _svol_only_volume(self, sldev,
+                          volume_id='00000000-0000-0000-0000-000000000099'):
+        """An adopted S-VOL: provider_location has sldev but no pldev."""
+        return fake_volume.fake_volume_obj(
+            CTXT, id=volume_id,
+            provider_location=json.dumps({'sldev': sldev}))
+
     def test_create_group_copy_group_name(self):
         common = self._common()
         name = common._create_group_copy_group_name(TEST_GROUP[0].id)
@@ -3543,10 +3569,12 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                     'id': volume.id,
                     'replication_status': enabled}) as add_volume, \
             mock.patch.object(
-                common, '_group_repl_confirm_new_pairs',
-                side_effect=lambda cg, updates: updates):
+                common, '_group_repl_confirm_new_pairs') as confirm:
             model_update, volumes_update = common.enable_replication(
                 self.ctxt, TEST_GROUP[0], volumes)
+        # B5: enable_replication reports ENABLED on pair creation alone and
+        # no longer blocks on _WAIT_PAIR via _group_repl_confirm_new_pairs.
+        confirm.assert_not_called()
         self.assertEqual({'replication_status': enabled}, model_update)
         self.assertEqual(2, add_volume.call_count)
         # Only the first add may create the copy group.
@@ -3601,9 +3629,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                 return_value=[{'id': volumes[0].id,
                                'replication_status': enabled}]) as resync, \
             mock.patch.object(
-                common, '_group_repl_add_volume') as add_volume, \
-            mock.patch.object(
-                common, '_group_repl_confirm_new_pairs', return_value=[]):
+                common, '_group_repl_add_volume') as add_volume:
             model_update, volumes_update = common.enable_replication(
                 self.ctxt, TEST_GROUP[0], volumes)
         resync.assert_called_once()
@@ -3796,6 +3822,348 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             common.failover_replication(
                 self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]])
         self.assertIn(copy_group_name, common._known_copy_groups)
+
+    # ------------------------------------------------------------------
+    # A2: rep_secondary vs _svol_instance() on a target-role backend.
+    # _svol_instance() returns rep_primary when hitachi_replication_role
+    # is 'target', so a site that hardcodes rep_secondary sends the
+    # request to the wrong (remote) array.
+    # ------------------------------------------------------------------
+
+    def test_delete_volume_target_role_uses_svol_instance(self):
+        common = self._common()
+        self._set_target_role()
+        volume = self._svol_only_volume(9)
+        with mock.patch.object(
+                common.rep_primary, 'delete_volume') as local_delete, \
+            mock.patch.object(
+                common.rep_secondary, 'delete_volume') as remote_delete:
+            common.delete_volume(volume)
+        local_delete.assert_called_once_with(volume)
+        remote_delete.assert_not_called()
+
+    def test_delete_volume_source_role_still_uses_rep_secondary(self):
+        """Regression check: source role (the default) is unaffected."""
+        common = self._common()
+        volume = self._svol_only_volume(9)
+        with mock.patch.object(
+                common.rep_primary, 'delete_volume') as local_delete, \
+            mock.patch.object(
+                common.rep_secondary, 'delete_volume') as remote_delete:
+            common.delete_volume(volume)
+        remote_delete.assert_called_once_with(volume)
+        local_delete.assert_not_called()
+
+    def test_group_repl_delete_group_volume_target_role(self):
+        common = self._common()
+        self._set_target_role()
+        volume = TEST_VOLUME[0]
+        # No local P-VOL to resolve (it lives on the remote source array);
+        # only the S-VOL side is deleted, isolating the assertion to it.
+        with mock.patch.object(
+                common.rep_primary, 'get_ldev', return_value=None), \
+            mock.patch.object(
+                common.rep_secondary, 'get_ldev', return_value=20), \
+            mock.patch.object(
+                common.rep_primary, 'delete_volume') as local_delete, \
+            mock.patch.object(
+                common.rep_secondary, 'delete_volume') as remote_delete:
+            common._group_repl_delete_group_volume(
+                TEST_GROUP[0], volume, 'CGTEST')
+        local_delete.assert_called_once_with(volume)
+        remote_delete.assert_not_called()
+
+    @mock.patch.object(sqlalchemy_api, 'volume_get', side_effect=_volume_get)
+    def test_group_repl_create_group_snapshot_target_role(
+            self, mock_volume_get):
+        common = self._common()
+        self._set_target_role()
+        group_snapshot = TEST_GROUP_SNAP[0]
+        snapshot = TEST_SNAPSHOT[0]
+        with mock.patch.object(
+                common.rep_primary, 'get_ldev', return_value=11), \
+            mock.patch.object(
+                common.rep_primary, 'get_volume_extra_specs',
+                return_value={}), \
+            mock.patch.object(
+                volume_types, 'get_volume_type_qos_specs',
+                return_value={'qos_specs': None}), \
+            mock.patch.object(
+                common.rep_primary, 'create_ldev',
+                return_value=22) as local_create_ldev, \
+            mock.patch.object(
+                common.rep_secondary, 'create_ldev') as remote_create_ldev, \
+            mock.patch.object(common.rep_primary, 'modify_ldev_name'), \
+            mock.patch.object(
+                common.rep_primary, '_create_ctg_snap_pair'):
+            common._group_repl_create_group_snapshot(
+                self.ctxt, group_snapshot, [snapshot])
+        local_create_ldev.assert_called_once()
+        remote_create_ldev.assert_not_called()
+
+    def test_group_repl_delete_group_snapshot_target_role(self):
+        common = self._common()
+        self._set_target_role()
+        with mock.patch.object(
+                common.rep_primary, '_delete_group',
+                return_value=(None, [])) as local_delete_group, \
+            mock.patch.object(
+                common.rep_secondary, '_delete_group') as \
+                remote_delete_group:
+            common._group_repl_delete_group_snapshot(
+                TEST_GROUP_SNAP[0], [TEST_SNAPSHOT[0]])
+        local_delete_group.assert_called_once_with(
+            TEST_GROUP_SNAP[0], [TEST_SNAPSHOT[0]], True)
+        remote_delete_group.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # A3: an adopted S-VOL ({"sldev": N}, no pldev) on a target-role
+    # backend must be promotable, not stuck in ERROR.
+    # ------------------------------------------------------------------
+
+    def test_get_ldevs_target_role_missing_pvol_is_not_a_warning(self):
+        common = self._common()
+        self._set_target_role()
+        volume = self._svol_only_volume(30)
+        with mock.patch.object(
+                common.rep_primary, 'output_log') as primary_log, \
+            mock.patch.object(
+                common.rep_secondary, 'output_log') as secondary_log:
+            pldev, sldev = common._get_ldevs(volume)
+        self.assertIsNone(pldev)
+        self.assertEqual(30, sldev)
+        primary_log.assert_not_called()
+        secondary_log.assert_not_called()
+
+    def test_get_ldevs_source_role_missing_pvol_still_warns(self):
+        """Regression check: source role (host failover) keeps the warning."""
+        common = self._common()
+        volume = self._svol_only_volume(30)
+        with mock.patch.object(
+                common.rep_primary, 'output_log') as primary_log:
+            common._get_ldevs(volume)
+        primary_log.assert_called_once()
+
+    def test_get_ldevs_missing_svol_still_warns_on_target_role(self):
+        """A genuinely missing S-VOL is still a real problem either way."""
+        common = self._common()
+        self._set_target_role()
+        volume = TEST_VOLUME[3]  # provider_location is None
+        with mock.patch.object(
+                common.rep_primary, 'output_log') as primary_log:
+            common._get_ldevs(volume)
+        primary_log.assert_called_once()
+
+    def test_failover_replication_target_role_promotes_svol_only(self):
+        common = self._common()
+        self._set_target_role()
+        volumes = [TEST_VOLUME[0]]
+        with self._failover_patches(common) as patches, \
+            mock.patch.object(
+                common.rep_primary.client,
+                'takeover_remote_copy_grp') as takeover:
+            patches['_get_ldevs'].return_value = (None, 40)
+            model_update, volumes_update = common.failover_replication(
+                self.ctxt, TEST_GROUP[0], volumes)
+        takeover.assert_called_once()
+        self.assertEqual(
+            {'replication_status': fields.ReplicationStatus.FAILED_OVER},
+            model_update)
+        self.assertEqual(
+            fields.ReplicationStatus.FAILED_OVER,
+            volumes_update[0]['replication_status'])
+
+    def test_failover_replication_source_role_svol_only_still_errors(self):
+        """Regression check: source role still requires both LDEVs."""
+        common = self._common()
+        with self._failover_patches(common) as patches, \
+            mock.patch.object(
+                common.rep_secondary.client, 'takeover_remote_copy_grp'):
+            patches['_get_ldevs'].return_value = (None, 40)
+            model_update, volumes_update = common.failover_replication(
+                self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]])
+        self.assertEqual(
+            {'replication_status': fields.ReplicationStatus.ERROR},
+            model_update)
+        self.assertEqual(
+            fields.ReplicationStatus.ERROR,
+            volumes_update[0]['replication_status'])
+
+    # ------------------------------------------------------------------
+    # B4: an S-VOL with no matching pair in the copy group must not be
+    # silently re-paired (which orphans the old LDEV) - it belongs in
+    # wrong_state so the operator sees ERROR.
+    # ------------------------------------------------------------------
+
+    def test_group_repl_classify_members_orphaned_svol_is_wrong_state(self):
+        common = self._common()
+        volume = TEST_VOLUME[4]  # pldev=4, sldev=4: _PRIMARY_SECONDARY site
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value={'copyPairs': []}), \
+            mock.patch.object(
+                common.rep_primary, 'get_ldev', return_value=4):
+            suspended, replicating, wrong_state = (
+                common._group_repl_classify_members('CG', [volume]))
+        self.assertEqual([], suspended)
+        self.assertEqual([], replicating)
+        self.assertEqual(1, len(wrong_state))
+        self.assertEqual(volume, wrong_state[0][0])
+
+    # ------------------------------------------------------------------
+    # B5: enable_replication / _group_repl_update_group report ENABLED on
+    # pair creation and no longer block on _WAIT_PAIR.
+    # ------------------------------------------------------------------
+
+    def test_group_repl_update_group_does_not_wait_for_pair(self):
+        common = self._common()
+        volume = TEST_VOLUME[0]
+        enabled = fields.ReplicationStatus.ENABLED
+        with mock.patch.object(
+                common, '_resolve_copy_group_name', return_value='CG'), \
+            mock.patch.object(
+                common, '_group_repl_copy_grp_exists', return_value=False), \
+            mock.patch.object(
+                common, '_group_repl_add_volume',
+                return_value={'id': volume.id,
+                              'replication_status': enabled}), \
+            mock.patch.object(
+                common, '_group_repl_confirm_new_pairs') as confirm:
+            model_update, add_update, remove_update = (
+                common._group_repl_update_group(TEST_GROUP[0], [volume], []))
+        confirm.assert_not_called()
+        self.assertEqual(
+            [enabled], [u['replication_status'] for u in add_update])
+
+    # ------------------------------------------------------------------
+    # B1: per-copy-group pair status reporting is opt-in and, once on,
+    # cached with a TTL rather than read from the array on every poll.
+    # ------------------------------------------------------------------
+
+    def test_update_volume_stats_pair_status_off_by_default(self):
+        common = self._common()
+        with mock.patch.object(
+                common.rep_primary.client,
+                'get_remote_copy_grps') as list_grps, \
+            mock.patch.object(
+                common.rep_primary, 'update_volume_stats',
+                return_value={'pools': [{'location_info': {}}]}):
+            stats = common.update_volume_stats()
+        list_grps.assert_not_called()
+        self.assertTrue(
+            stats['pools'][0][hbsd_replication._PAIR_STATUS_PEER_KEY])
+
+    def test_update_volume_stats_pair_status_when_enabled(self):
+        common = self._common()
+        self.override_config(
+            'hitachi_replication_report_pair_status', True,
+            group=conf.SHARED_CONF_GROUP)
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                return_value=[]) as list_grps, \
+            mock.patch.object(
+                common.rep_primary, 'update_volume_stats',
+                return_value={'pools': [{'location_info': {}}]}):
+            common.update_volume_stats()
+        list_grps.assert_called_once()
+
+    def test_pair_status_capabilities_caches_within_ttl(self):
+        common = self._common()
+        self.override_config(
+            'hitachi_replication_report_pair_status', True,
+            group=conf.SHARED_CONF_GROUP)
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                return_value=[]) as list_grps:
+            common._pair_status_capabilities()
+            common._pair_status_capabilities()
+        self.assertEqual(1, list_grps.call_count)
+
+    def test_pair_status_capabilities_refreshes_after_ttl(self):
+        common = self._common()
+        self.override_config(
+            'hitachi_replication_report_pair_status', True,
+            group=conf.SHARED_CONF_GROUP)
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                return_value=[]) as list_grps:
+            common._pair_status_capabilities()
+            common._pair_status_cache['time'] = (
+                common._pair_status_cache['time'] - timedelta(hours=1))
+            common._pair_status_capabilities()
+        self.assertEqual(2, list_grps.call_count)
+
+    def test_pair_status_capabilities_serves_stale_on_array_error(self):
+        common = self._common()
+        self.override_config(
+            'hitachi_replication_report_pair_status', True,
+            group=conf.SHARED_CONF_GROUP)
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                return_value=[]):
+            first = common._pair_status_capabilities()
+        common._pair_status_cache['time'] = (
+            common._pair_status_cache['time'] - timedelta(hours=1))
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                side_effect=exception.VolumeDriverException(data='down')):
+            second = common._pair_status_capabilities()
+        self.assertEqual(
+            first[hbsd_replication._PAIR_STATUS_UPDATED_KEY],
+            second[hbsd_replication._PAIR_STATUS_UPDATED_KEY])
+        self.assertEqual(
+            first[hbsd_replication._PAIR_STATUS_KEY],
+            second[hbsd_replication._PAIR_STATUS_KEY])
+
+    # ------------------------------------------------------------------
+    # B2: truncation past the copy-group cap is operator-visible and
+    # marks the report as not fully enumerated.
+    # ------------------------------------------------------------------
+
+    def test_pair_status_capabilities_truncation_marks_not_enumerated(self):
+        common = self._common()
+        self.override_config(
+            'hitachi_replication_report_pair_status', True,
+            group=conf.SHARED_CONF_GROUP)
+        names = ['CG%d' % i for i in
+                 range(hbsd_replication._PAIR_STATUS_MAX_COPY_GROUPS + 1)]
+        grps = [{'copyGroupName': n} for n in names]
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                return_value=grps), \
+            mock.patch.object(
+                common, '_journals_by_id', return_value={}), \
+            mock.patch.object(
+                common, '_copy_grp_pair_state', return_value={}), \
+            mock.patch.object(
+                hbsd_replication.LOG, 'warning') as warn:
+            capabilities = common._pair_status_capabilities()
+        self.assertFalse(
+            capabilities[hbsd_replication._PAIR_STATUS_ENUMERATED_KEY])
+        warn.assert_called()
+
+    # ------------------------------------------------------------------
+    # B3: per-group read failures are reported once, not once per group.
+    # ------------------------------------------------------------------
+
+    def test_pair_status_capabilities_batches_group_read_failures(self):
+        common = self._common()
+        self.override_config(
+            'hitachi_replication_report_pair_status', True,
+            group=conf.SHARED_CONF_GROUP)
+        grps = [{'copyGroupName': 'CG1'}, {'copyGroupName': 'CG2'}]
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                return_value=grps), \
+            mock.patch.object(
+                common, '_journals_by_id', return_value={}), \
+            mock.patch.object(
+                common, '_copy_grp_pair_state',
+                side_effect=exception.VolumeDriverException(data='x')), \
+            mock.patch.object(
+                hbsd_replication.LOG, 'warning') as warn:
+            common._pair_status_capabilities()
+        self.assertEqual(1, warn.call_count)
 
 
 # Shorthand alias
