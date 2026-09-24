@@ -18,9 +18,7 @@ import ddt
 
 from cinder import exception
 from cinder.tests.unit import test
-# PF9 Start
-from cinder.volume.drivers.pf9_hitachi import hbsd_utils
-# PF9 End
+from cinder.volume.drivers.hitachi import hbsd_utils
 
 SEARCHER_STORAGEID = '12345'
 
@@ -1020,3 +1018,56 @@ class HBSDUtilsTest(test.TestCase):
         self.assertEqual(expected,
                          hbsd_utils.get_csv_and_drs(ctx, extra_specs,
                                                     specs_only=True))
+
+
+@ddt.ddt
+class HBSDGroupReplicationMessageTest(test.TestCase):
+    """Unit test class for the group replication message catalogue."""
+
+    def test_msg_ids_are_unique(self):
+        seen = {}
+        duplicates = []
+        for msg in hbsd_utils.HBSDMsg:
+            msg_id = msg.value['msg_id']
+            if msg_id in seen:
+                duplicates.append((msg_id, seen[msg_id], msg.name))
+            seen[msg_id] = msg.name
+        self.assertEqual([], duplicates)
+
+    @ddt.data(
+        'GROUP_REPLICATION_PAIR_CREATED',
+        'GROUP_REPLICATION_PAIR_DELETED',
+        'GROUP_REPLICATION_TAKEOVER_STARTED',
+        'GROUP_REPLICATION_VOLUME_UNMANAGED',
+        'GROUP_REPLICATION_UNSUPPORTED_OPERATION',
+        'GROUP_REPLICATION_NICKNAME_CLEANUP_FAILED',
+        'GROUP_REPLICATION_FAILOVER_FAILED',
+        'GROUP_REPLICATION_FAILBACK_FAILED',
+        'GROUP_REPLICATION_TARGETS_QUERY_FAILED',
+        'GROUP_REPLICATION_MANAGE_FAILED',
+        'GROUP_REPLICATION_SNAPSHOT_FAILED',
+        'GROUP_REPLICATION_SNAPSHOT_DELETE_FAILED',
+        'GROUP_REPLICATION_RESYNC_FAILED',
+        'GROUP_REPLICATION_BINDING_CONFLICT',
+        'GROUP_REPLICATION_ADOPT_FAILED',
+        'GROUP_REPLICATION_PAIR_CREATE_FAILED',
+        'GROUP_REPLICATION_PAIR_DELETE_FAILED',
+        'GROUP_REPLICATION_ALREADY_PAIRED',
+        'GROUP_REPLICATION_PAIR_WRONG_STATE',
+        'GROUP_REPLICATION_NOT_CONFIGURED',
+        'GROUP_REPLICATION_SIDE_UNKNOWN',
+        'GROUP_REPLICATION_SVOL_UNRESOLVED',
+    )
+    def test_group_replication_message_defined(self, name):
+        self.assertTrue(hasattr(hbsd_utils.HBSDMsg, name))
+
+    def test_already_paired_remedy_names_the_volume_type_spec(self):
+        msg = hbsd_utils.HBSDMsg.GROUP_REPLICATION_ALREADY_PAIRED.value
+        self.assertEqual(788, msg['msg_id'])
+        self.assertIn("group_replication_enabled='<is> True'", msg['msg'])
+        self.assertNotIn('group_only', msg['msg'])
+
+    def test_rest_api_error_message_reports_detail_code(self):
+        self.assertIn(
+            '%(detailCode)s',
+            hbsd_utils.HBSDMsg.REST_API_FAILED.value['msg'])

@@ -1,0 +1,61 @@
+---
+features:
+  - |
+    Hitachi driver: added volume group replication. A generic volume group
+    whose group type sets ``consistent_group_replication_enabled`` or
+    ``group_replication_enabled`` to ``<is> True`` is replicated as one
+    Universal Replicator copy group. ``enable_replication``,
+    ``disable_replication``, ``failover_replication`` and
+    ``list_replication_targets`` act on the copy group as a whole, so a
+    failover preserves write ordering across every member.
+  - |
+    Hitachi driver: added the ``group_replication_enabled`` volume type
+    extra spec. A volume whose type carries ``<is> True`` for it is not paired
+    when it is created; its pair is created by ``enable_replication`` when the
+    volume joins a group's copy group. One backend can now serve both models
+    at once -- a plain ``replication_enabled`` volume type still pairs at
+    create time, unchanged.
+
+    Without this signal a replicated volume created before its Cinder group
+    exists is paired immediately, and the later
+    ``enable_replication`` fails: the driver pins one mirror unit
+    (``hitachi_replication_mun``) and the storage system rejects a second pair
+    at it. The group type could not answer the question, because a volume with
+    no ``group_id`` yet has no group type to consult.
+
+    The key is unscoped, so the scheduler matches it against the
+    ``group_replication_enabled`` pool capability, which the driver reports
+    only on a backend configured for replication. A volume of this type cannot
+    be placed on a backend that cannot do group replication. The value must be
+    exactly ``<is> True``: ``True`` and ``true`` make the type unschedulable,
+    ``<is> False`` makes it unschedulable on every backend, and ``<is> true``
+    is scheduled but not treated as group-replicated.
+  - |
+    Hitachi driver: added ``hitachi_replication_report_pair_status``
+    (default ``False``) and ``hitachi_replication_report_pair_status_ttl``
+    (default ``300`` seconds). When the first is enabled, each copy group's
+    replication pair state is reported as the ``group_replication_pairs`` pool
+    capability, so a consumer can read pair state from the scheduler stats
+    instead of calling the storage system directly.
+    ``group_replication_pairs_enumerated`` is ``False`` when the driver could
+    not ask the storage system for every copy group. The
+    ``group_replication_peer_initialized`` capability is always reported.
+  - |
+    Hitachi driver: for each copy group, the driver asks the storage systems
+    which one holds the secondary side, starting with its own, which answers
+    without the peer. A volume that has only a secondary volume is found on
+    the storage system whose LDEV carries the volume's label, so one backend
+    can hold copy groups in both directions.
+  - |
+    Hitachi driver: a secondary volume in a replicated group, or bound to a
+    copy group by its metadata, is adopted with ``manage_existing`` on the
+    storage system that holds the secondary side of its copy group. Adoption
+    fails with ``ManageExistingInvalidReference`` when neither storage system
+    holds that copy group. Deleting an adopted volume, deleting a group or
+    group snapshot that contains one, taking a group snapshot of adopted
+    volumes and creating a group from them all act on the storage system that
+    holds each volume. An adopted volume can be attached and detached on the
+    backend whose storage system holds it. Attaching needs the copy group
+    taken over, which leaves the secondary volume in SSWS, or the pair
+    deleted; while the pair still replicates, the attach fails with
+    MSGID0766.

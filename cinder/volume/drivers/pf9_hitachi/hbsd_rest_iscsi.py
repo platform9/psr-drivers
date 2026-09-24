@@ -15,12 +15,15 @@
 #
 """REST interface iSCSI module for Hitachi HBSD Driver."""
 
+# PF9 Start
+# PF9 TEMPORARY: drop before upstream.
+from __future__ import annotations
+# PF9 End
+
 from oslo_log import log as logging
 
-# PF9 Start
-from cinder.volume.drivers.pf9_hitachi import hbsd_rest as rest
-from cinder.volume.drivers.pf9_hitachi import hbsd_utils as utils
-# PF9 End
+from cinder.volume.drivers.hitachi import hbsd_rest as rest
+from cinder.volume.drivers.hitachi import hbsd_utils as utils
 
 _ISCSI_HMO_REPORT_FULL_PORTAL = 83
 _ISCSI_HMO_DISABLE_IO = 91

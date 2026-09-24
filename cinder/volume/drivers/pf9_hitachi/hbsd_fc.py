@@ -21,13 +21,11 @@ from oslo_utils import excutils
 
 from cinder import interface
 from cinder.volume import driver
-# PF9 Start
-from cinder.volume.drivers.pf9_hitachi import hbsd_common as common
-from cinder.volume.drivers.pf9_hitachi import hbsd_replication as replication
-from cinder.volume.drivers.pf9_hitachi import hbsd_rest as rest
-from cinder.volume.drivers.pf9_hitachi import hbsd_rest_fc as rest_fc
-from cinder.volume.drivers.pf9_hitachi import hbsd_utils as utils
-# PF9 End
+from cinder.volume.drivers.hitachi import hbsd_common as common
+from cinder.volume.drivers.hitachi import hbsd_replication as replication
+from cinder.volume.drivers.hitachi import hbsd_rest as rest
+from cinder.volume.drivers.hitachi import hbsd_rest_fc as rest_fc
+from cinder.volume.drivers.hitachi import hbsd_utils as utils
 from cinder.volume import volume_utils
 
 MSG = utils.HBSDMsg
@@ -103,6 +101,7 @@ class HBSDFCDriver(driver.FibreChannelDriver):
         2.8.3 - Fix zombie issue with vClone parents on VSP One Block when
                 volumes are quickly created and destroyed.
         2.8.4 - Add support for 'compression' capacity saving setting.
+        2.9.0 - Add volume group replication support.
 
     """
 
@@ -340,10 +339,10 @@ class HBSDFCDriver(driver.FibreChannelDriver):
     def update_group(
             self, context, group, add_volumes=None, remove_volumes=None):
         try:
-            return self.common.update_group(group, add_volumes)
+            return self.common.update_group(group, add_volumes, remove_volumes)
         except Exception:
             with excutils.save_and_reraise_exception():
-                for remove_volume in remove_volumes:
+                for remove_volume in remove_volumes or []:
                     utils.cleanup_cg_in_volume(remove_volume)
 
     @volume_utils.trace
@@ -366,3 +365,21 @@ class HBSDFCDriver(driver.FibreChannelDriver):
     @volume_utils.trace
     def failover_completed(self, context, active_backend_id=None):
         return self.common.failover_completed(active_backend_id)
+
+    @volume_utils.trace
+    def enable_replication(self, context, group, volumes):
+        return self.common.enable_replication(context, group, volumes)
+
+    @volume_utils.trace
+    def disable_replication(self, context, group, volumes):
+        return self.common.disable_replication(context, group, volumes)
+
+    @volume_utils.trace
+    def failover_replication(self, context, group, volumes,
+                             secondary_backend_id=None):
+        return self.common.failover_replication(
+            context, group, volumes, secondary_backend_id)
+
+    @volume_utils.trace
+    def list_replication_targets(self, context, group):
+        return self.common.list_replication_targets(context, group)
