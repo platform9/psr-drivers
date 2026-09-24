@@ -28,11 +28,9 @@ from oslo_utils import timeutils
 from cinder import exception
 from cinder.objects import fields
 from cinder.objects import volume as cinder_volume
-# PF9 Start
-from cinder.volume.drivers.pf9_hitachi import hbsd_common as common
-from cinder.volume.drivers.pf9_hitachi import hbsd_rest as rest
-from cinder.volume.drivers.pf9_hitachi import hbsd_utils as utils
-# PF9 End
+from cinder.volume.drivers.hitachi import hbsd_common as common
+from cinder.volume.drivers.hitachi import hbsd_rest as rest
+from cinder.volume.drivers.hitachi import hbsd_utils as utils
 from cinder.volume import group_types
 from cinder.volume import manager
 from cinder.zonemanager import utils as fczm_utils

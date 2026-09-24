@@ -26,11 +26,9 @@ from oslo_utils import excutils
 
 from cinder import exception
 from cinder.volume import configuration
-# PF9 Start
-from cinder.volume.drivers.pf9_hitachi import hbsd_rest as rest
-from cinder.volume.drivers.pf9_hitachi import hbsd_rest_api as rest_api
-from cinder.volume.drivers.pf9_hitachi import hbsd_utils as utils
-# PF9 End
+from cinder.volume.drivers.hitachi import hbsd_rest as rest
+from cinder.volume.drivers.hitachi import hbsd_rest_api as rest_api
+from cinder.volume.drivers.hitachi import hbsd_utils as utils
 from cinder.zonemanager import utils as fczm_utils
 
 FC_VOLUME_OPTS = [

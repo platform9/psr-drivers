@@ -33,14 +33,12 @@ from cinder.tests.unit import fake_volume
 from cinder.tests.unit import test
 from cinder.volume import configuration as conf
 from cinder.volume import driver
-# PF9 Start
-from cinder.volume.drivers.pf9_hitachi import hbsd_common
-from cinder.volume.drivers.pf9_hitachi import hbsd_iscsi
-from cinder.volume.drivers.pf9_hitachi import hbsd_replication
-from cinder.volume.drivers.pf9_hitachi import hbsd_rest
-from cinder.volume.drivers.pf9_hitachi import hbsd_rest_api
-from cinder.volume.drivers.pf9_hitachi import hbsd_rest_fc
-# PF9 End
+from cinder.volume.drivers.hitachi import hbsd_common
+from cinder.volume.drivers.hitachi import hbsd_iscsi
+from cinder.volume.drivers.hitachi import hbsd_replication
+from cinder.volume.drivers.hitachi import hbsd_rest
+from cinder.volume.drivers.hitachi import hbsd_rest_api
+from cinder.volume.drivers.hitachi import hbsd_rest_fc
 from cinder.volume import volume_types
 from cinder.volume import volume_utils
 
@@ -386,7 +384,7 @@ class HBSDRESTISCSIDriverTest(test.TestCase):
                              group=conf.SHARED_CONF_GROUP)
         self.override_config(
             'volume_driver',
-            "cinder.volume.drivers.pf9_hitachi.hbsd_iscsi.HBSDISCSIDriver",
+            "cinder.volume.drivers.hitachi.hbsd_iscsi.HBSDISCSIDriver",
             group=conf.SHARED_CONF_GROUP)
         self.override_config('reserved_percentage', "0",
                              group=conf.SHARED_CONF_GROUP)

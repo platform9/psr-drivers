@@ -4,6 +4,11 @@ Platform9 fork of the upstream OpenStack Cinder Hitachi VSP driver, extended to
 close 8 gaps that block a full disaster-recovery workflow on Universal
 Replicator (UR) consistency groups.
 
+The modules are a drop-in replacement for upstream
+`cinder/volume/drivers/hitachi/`. They import `cinder.volume.drivers.hitachi.*`,
+so they only take effect when installed there; a copy anywhere else runs the
+stock upstream code.
+
 Driver version: **2.9.0** (`hbsd_utils.VERSION`) — upstream 2.8.4 plus
 `2.9.0 - Add volume group replication support`.
 
@@ -11,11 +16,10 @@ Driver version: **2.9.0** (`hbsd_utils.VERSION`) — upstream 2.8.4 plus
 
 ## 📦 What's Included
 
-### Driver modules — `cinder/volume/drivers/pf9_hitachi/`
+### Driver modules — `cinder/volume/drivers/pf9_hitachi/` (installed as `cinder/volume/drivers/hitachi/`)
 
 | File | Purpose |
 |------|---------|
-| `pf9_hitachi_replication.py` | Entry-point classes registered as `volume_driver` ([see below](#-architecture)) |
 | `hbsd_replication.py` | `HBSDREPLICATION` — remote replication (GAD/UR) **and all 8 gap implementations** [See implemented gaps](#-implemented-gaps-h1h8) |
 | `hbsd_common.py` | `HBSDCommon` — shared logic for FC and iSCSI; also holds the non-replicating stubs that reject group-replication calls |
 | `hbsd_rest.py` | `HBSDREST` — REST-backed implementation of the common interface |
@@ -25,10 +29,6 @@ Driver version: **2.9.0** (`hbsd_utils.VERSION`) — upstream 2.8.4 plus
 | `hbsd_rest_fc.py` | FC-specific REST operations |
 | `hbsd_rest_iscsi.py` | iSCSI-specific REST operations |
 | `hbsd_utils.py` | `HBSDMsg` message catalogue, `Config`, connector caching, shared constants |
-
-> `pf9_allocator.py` (secondary LDEV allocator) was **removed** in
-> `64c4834`. Secondary LDEVs are now allocated by the array when the
-> remote-copy pair is created, so the driver no longer picks IDs itself.
 
 ### Unit tests — `cinder/tests/unit/volume/drivers/pf9_hitachi/`
 
@@ -84,19 +84,9 @@ Beyond the eight entry points:
 
 ## 🏗️ Architecture
 
-There is **no mixin**. `pf9_hitachi_replication.py` contains two thin
-subclasses whose only job is to carry distinct `CI_WIKI_NAME` values for
-third-party CI:
-
-```
-hbsd_fc.HBSDFCDriver
-└── pf9_hitachi_replication.HBSDGroupReplicationFCDriver
-        CI_WIKI_NAME = Hitachi_VSP_Extended_Replication_FC
-
-hbsd_iscsi.HBSDISCSIDriver
-└── pf9_hitachi_replication.HBSDGroupReplicationISCSIDriver
-        CI_WIKI_NAME = Hitachi_VSP_Extended_Replication_ISCSI
-```
+`volume_driver` points at the upstream `hbsd_fc.HBSDFCDriver` or
+`hbsd_iscsi.HBSDISCSIDriver`, which keep upstream's `CI_WIKI_NAME`
+(`utils.CI_WIKI_NAME`, `Hitachi_CI`).
 
 The replication logic is reached by **composition, not inheritance**. Both
 `HBSDFCDriver.__init__` and `HBSDISCSIDriver.__init__` choose their `common`
@@ -117,19 +107,6 @@ hbsd_common.HBSDCommon
         └── hbsd_replication.HBSDREPLICATION (GAD + UR + group replication)
 ```
 
-**Consequence:** pointing `volume_driver` at `hbsd_fc.HBSDFCDriver` gives you
-the same group-replication behaviour. Use the
-`pf9_hitachi_replication.*` classes when you want the deployment to be
-self-documenting and separately CI-tracked.
-
-> **Not for upstream.** Those two `CI_WIKI_NAME` values are PF9-specific and
-> have no registered third-party CI account behind them, which breaks CI
-> reporting on the OpenStack gerrit site. Upstream, every Hitachi driver uses
-> `utils.CI_WIKI_NAME` (`Hitachi_CI`). Set both to `utils.CI_WIKI_NAME` before
-> the Cinder patch series — at which point these classes override nothing and
-> can be deleted outright, with a `cinder.conf` migration note for anyone
-> pointing at them.
-
 ---
 
 ## ⚙️ Configuration
@@ -138,7 +115,7 @@ self-documenting and separately CI-tracked.
 
 ```ini
 [hitachi_vsp_fc]
-volume_driver = cinder.volume.drivers.pf9_hitachi.pf9_hitachi_replication.HBSDGroupReplicationFCDriver
+volume_driver = cinder.volume.drivers.hitachi.hbsd_fc.HBSDFCDriver
 volume_backend_name = hitachi_vsp_fc
 san_ip = <primary-cm-ip>
 san_login = <user>
@@ -150,7 +127,7 @@ hitachi_replication_journal_size = 100
 replication_device = backend_id:<label>,san_ip:<secondary-cm-ip>,san_login:<user>,san_password:<password>,storage_id:<secondary-serial>,pool:<pool>
 ```
 
-For iSCSI, swap in `HBSDGroupReplicationISCSIDriver`; `use_chap_auth`,
+For iSCSI, use `cinder.volume.drivers.hitachi.hbsd_iscsi.HBSDISCSIDriver`; `use_chap_auth`,
 `chap_username` and `chap_password` are accepted both in the backend section
 and inside `replication_device`.
 
@@ -290,13 +267,14 @@ and no group-type spec will force-split the pair.
 ## 🧪 Running the unit tests
 
 The tests are written against the Cinder test harness, so they need a Cinder
-checkout to run in:
+checkout to run in. The driver modules overwrite upstream's
+`cinder/volume/drivers/hitachi/`, which is what the tests import:
 
 ```bash
 # from a cinder checkout
 rsync -a --exclude __pycache__ \
   psr-drivers/cinder/volume/drivers/pf9_hitachi/ \
-  cinder/cinder/volume/drivers/pf9_hitachi/
+  cinder/cinder/volume/drivers/hitachi/
 rsync -a --exclude __pycache__ \
   psr-drivers/cinder/tests/unit/volume/drivers/pf9_hitachi/ \
   cinder/cinder/tests/unit/volume/drivers/pf9_hitachi/
@@ -354,6 +332,8 @@ tox -e pep8
 ## 📚 Next Steps
 
 1. **Read:** [DEPLOYMENT.md](/psr-drivers/DEPLOYMENT.md) (installation details)
-2. **Run:** `./deploy.sh <user@host> pf9_hitachi`
+2. **Deploy:** copy the modules over `cinder/volume/drivers/hitachi/` on the
+   host. `./deploy.sh <user@host> pf9_hitachi` does not do this yet: it
+   installs to `drivers/pf9_hitachi/`, where the modules are never loaded.
 3. **Verify:** Check logs for errors
 4. **Test:** Create volumes with replication enabled
