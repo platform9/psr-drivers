@@ -1,0 +1,33 @@
+---
+upgrade:
+  - |
+    Hitachi driver: the ``hitachi_replication_role`` option has been removed.
+    For each copy group, the driver now asks the storage systems which one
+    holds the secondary side, starting with its own, which answers without
+    the peer. A volume that has only a secondary volume is found on the
+    storage system whose LDEV carries the volume's label. A line that still
+    sets the option in ``cinder.conf`` is ignored and can be deleted.
+    Existing volumes need no database migration.
+  - |
+    Hitachi driver: with ``hitachi_replication_report_pair_status`` enabled,
+    a backend that holds the secondary side of its copy groups now reports
+    every copy group, with ``group_replication_pairs_enumerated`` set to
+    ``True``, whenever its peer can list them. Before, it reported only the
+    copy groups it had failed over, and always ``False``.
+  - |
+    Hitachi driver: ``list_replication_targets`` now raises when the
+    backend's own storage system cannot be asked about the copy group, where
+    a disaster recovery backend used to return no targets. Adopting a volume
+    bound to a copy group, by its metadata or its group, now fails with
+    ``ManageExistingInvalidReference`` when neither storage system holds
+    that copy group. Adopt such a volume without that binding.
+fixes:
+  - |
+    Hitachi driver: on a backend holding the secondary side of a copy group,
+    deleting an adopted volume, deleting a group that contains one, and
+    deleting a group snapshot of such volumes now delete their LDEVs on the
+    storage system that holds them. Before, these deletes did nothing and
+    left the LDEVs behind. A group snapshot of adopted volumes, which used to
+    fail, now succeeds. Creating a group from adopted volumes now clones them
+    where they live. Before, it cloned the LDEV with the same number on the
+    peer storage system, which can belong to another volume.

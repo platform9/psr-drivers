@@ -76,7 +76,7 @@ Beyond the eight entry points:
 | Copy-group binding recorded in volume metadata (`replication_copy_group`), so a volume added to a CG later still resolves to the right copy group | `_resolve_copy_group_name()` |
 | Group-name binding by prefix `hbsd-cg:<name>` for adopting an existing array copy group | `_resolve_copy_group_name()` |
 | Journal lifecycle — created on first pair, deleted on `disable_replication()` | `_group_repl_journal_ids()` / `_group_repl_delete_journals()` |
-| Target-role adoption — a DR backend adopts already-promoted S-VOLs instead of creating pairs | `hitachi_replication_role = target` |
+| S side found per copy group — adoption, failover, pair status and target listing find which array holds each copy group's S side; a volume with only an S-VOL is found on the array whose LDEV carries its label | `_copy_group_svol_side()` / `_resolve_sldev_owner()` |
 | Per-copy-group pair state in `update_volume_stats()` capabilities — **off by default**, see `hitachi_replication_report_pair_status` | `_pair_status_capabilities()` |
 | Graceful vs emergency failover (`split` vs `takeover ... forceSplit`) | `_failover_mode()` |
 
@@ -122,7 +122,6 @@ san_login = <user>
 san_password = <password>
 hitachi_storage_id = <primary-serial>
 hitachi_pools = <pool>
-hitachi_replication_role = source
 hitachi_replication_journal_size = 100
 replication_device = backend_id:<label>,san_ip:<secondary-cm-ip>,san_login:<user>,san_password:<password>,storage_id:<secondary-serial>,pool:<pool>
 ```
@@ -131,20 +130,20 @@ For iSCSI, use `cinder.volume.drivers.hitachi.hbsd_iscsi.HBSDISCSIDriver`; `use_
 `chap_username` and `chap_password` are accepted both in the backend section
 and inside `replication_device`.
 
-### cinder.conf — DR (target) site
+### cinder.conf — DR site
 
-The disaster-recovery backend adopts promoted S-VOLs rather than creating
-pairs. This cannot be derived automatically:
+A DR backend is configured the same way: its own array in the backend section,
+the source array in `replication_device`. There is no role to set.
 
-```ini
-hitachi_replication_role = target
-```
+For each copy group, the driver asks the arrays which one holds the S side,
+starting with its own array, which answers without the peer. A volume that has
+only an S-VOL (`{"sldev": N}`) is found on the array whose LDEV N carries the
+volume's label. One backend can therefore hold copy groups in both directions.
 
 ### Replication options
 
 | Option | Default | Notes |
 |--------|---------|-------|
-| `hitachi_replication_role` | `source` | `source` creates volumes and the copy group; `target` adopts promoted S-VOLs |
 | `hitachi_replication_report_pair_status` | `False` | Report each copy group's pair state as the `group_replication_pairs` pool capability. Costs one REST call per copy group on every stats poll, so it is off by default — turn it on only where a consumer reads that capability |
 | `hitachi_replication_report_pair_status_ttl` | `300` | Seconds to cache that report. Only read when the option above is `True` |
 | `hitachi_replication_mun` | `1` | Mirror unit ID (0–3) |
@@ -233,7 +232,6 @@ the per-volume replication path. A PSR deployment therefore configures:
 
 | | Source site | DR site |
 |---|---|---|
-| `hitachi_replication_role` | `source` | **`target`** |
 | Volume type | `replication_enabled=<is> True` **and** `group_replication_enabled=<is> True` | same |
 | Group type | `consistent_group_replication_enabled=<is> True` | same |
 | `hitachi_replication_report_pair_status` | `True` if psr-dr should read pair state through Cinder rather than calling the array directly; otherwise leave off | same |
@@ -241,8 +239,9 @@ the per-volume replication path. A PSR deployment therefore configures:
 The volume-type spec is the only way to stop a volume pairing at create. Without
 it a volume pairs at create and cannot later join a copy group.
 
-The DR site's `hitachi_replication_role = target` cannot be derived — a backend
-that holds S-VOLs looks the same to Cinder as one that holds P-VOLs.
+Neither site sets a replication role. A DR backend learns that it holds a copy
+group's S side by reading the group from its own array, so it still works when
+the source array is down.
 
 ### Failover semantics
 

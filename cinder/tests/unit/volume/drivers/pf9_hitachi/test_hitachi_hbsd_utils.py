@@ -1055,6 +1055,8 @@ class HBSDGroupReplicationMessageTest(test.TestCase):
         'GROUP_REPLICATION_ALREADY_PAIRED',
         'GROUP_REPLICATION_PAIR_WRONG_STATE',
         'GROUP_REPLICATION_NOT_CONFIGURED',
+        'GROUP_REPLICATION_SIDE_UNKNOWN',
+        'GROUP_REPLICATION_SVOL_UNRESOLVED',
     )
     def test_group_replication_message_defined(self, name):
         self.assertTrue(hasattr(hbsd_utils.HBSDMsg, name))

@@ -1022,6 +1022,22 @@ class HBSDMsg(enum.Enum):
                'replication group. (group: %(group)s)',
         'suffix': ERROR_SUFFIX,
     }
+    GROUP_REPLICATION_SIDE_UNKNOWN = {
+        'msg_id': 791,
+        'loglevel': base_logging.ERROR,
+        'msg': 'Neither storage system confirmed that it holds the '
+               'secondary side of the copy group, so nothing was done to '
+               'it. (copy group: %(copy_group)s)',
+        'suffix': ERROR_SUFFIX,
+    }
+    GROUP_REPLICATION_SVOL_UNRESOLVED = {
+        'msg_id': 792,
+        'loglevel': base_logging.ERROR,
+        'msg': 'Could not tell which storage system holds the LDEV, so it '
+               'was changed on neither. (%(obj)s: %(obj_id)s, LDEV: '
+               '%(ldev)s, storage systems holding it: %(holders)s)',
+        'suffix': ERROR_SUFFIX,
+    }
 
     def __init__(self, error_info):
         """Initialize Enum attributes."""

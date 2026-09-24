@@ -17,6 +17,8 @@
 
 from datetime import timedelta
 import json
+import os
+import tempfile
 import types as pytypes
 from unittest import mock
 
@@ -3355,24 +3357,73 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
     def _common(self):
         return self.driver.common
 
-    def _set_target_role(self):
-        """Make the fixture's backend a DR (target-role) backend.
-
-        Flips the same two REST-client instances _setup_driver already
-        built; _svol_instance() starts resolving to rep_primary instead of
-        rep_secondary, matching a real hitachi_replication_role='target'
-        deployment.
-        """
-        self.override_config(
-            'hitachi_replication_role', 'target',
-            group=conf.SHARED_CONF_GROUP)
-
     def _svol_only_volume(self, sldev,
                           volume_id='00000000-0000-0000-0000-000000000099'):
         """An adopted S-VOL: provider_location has sldev but no pldev."""
         return fake_volume.fake_volume_obj(
             CTXT, id=volume_id,
             provider_location=json.dumps({'sldev': sldev}))
+
+    @staticmethod
+    def _svol_copy_grp(copy_group_name, copy_pairs=None):
+        """A copy group as read from the site holding its S side."""
+        return {'copyGroupName': copy_group_name,
+                'copyPairs': list(copy_pairs or [])}
+
+    @staticmethod
+    def _svol_side_not_here():
+        """The reply of a site that does not hold a group's S side."""
+        return {'messageId':
+                hbsd_rest_api.MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST}
+
+    @staticmethod
+    def _message_text(msg):
+        """The fixed part of a catalogue message, before its details."""
+        return msg.value['msg'].split(' (')[0]
+
+    @staticmethod
+    def _label_of(obj):
+        return (obj.name_id if hasattr(obj, 'name_id') else
+                obj.id).replace('-', '')
+
+    @staticmethod
+    def _label_stub(site, answer):
+        """Give site's LDEV the label answer, or make reading it raise.
+
+        None stands for an LDEV labelled for some other object.
+        """
+        if isinstance(answer, Exception):
+            return mock.patch.object(
+                site, 'get_ldev_info', side_effect=answer)
+        return mock.patch.object(
+            site, 'get_ldev_info',
+            return_value=dict(GET_LDEV_RESULT, label=answer or 'f' * 32))
+
+    @staticmethod
+    def _snapshot_of(volume, sldev=None,
+                     snapshot_id='10000000-0000-0000-0000-000000000099'):
+        """A snapshot of volume whose own LDEV, if given, is sldev."""
+        snapshot = fake_snapshot.fake_snapshot_obj(
+            CTXT, id=snapshot_id, volume_id=volume.id, volume_size=128,
+            provider_location=(None if sldev is None else
+                               json.dumps({'sldev': sldev})))
+        snapshot.volume = volume
+        return snapshot
+
+    @staticmethod
+    def _bound_volume(sldev=None, copy_group_name='CGBOUND',
+                      volume_id='00000000-0000-0000-0000-000000000097'):
+        """A volume bound to a copy group by its metadata.
+
+        fake_volume_obj reads metadata from volume_metadata only; a
+        metadata= argument is silently dropped.
+        """
+        return fake_volume.fake_volume_obj(
+            CTXT, id=volume_id,
+            provider_location=(None if sldev is None else
+                               json.dumps({'sldev': sldev})),
+            volume_metadata=[{'key': hbsd_replication._MD_COPY_GROUP,
+                              'value': copy_group_name}])
 
     def test_create_group_copy_group_name(self):
         common = self._common()
@@ -3440,7 +3491,8 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     def _adopt_svol_instance(self, common, pair_targets=None,
                              pair_target_name='HBSD-pair00'):
-        instance = common._svol_instance()
+        # The site _check_adopted_svol_manageability checks by default.
+        instance = common.rep_secondary
         instance._pair_targets = (
             [(CONFIG_MAP['port_id'], 5)] if pair_targets is None
             else pair_targets)
@@ -3608,11 +3660,17 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             common._group_repl_aggregate_status(
                 [], fields.ReplicationStatus.DISABLED))
 
+    def _svol_side_on_peer(self, common):
+        """rep_primary does not hold the S side, so listing decides."""
+        return mock.patch.object(
+            common.rep_primary.client, 'get_remote_copy_grp',
+            return_value=self._svol_side_not_here())
+
     def test_list_replication_targets_found(self):
         common = self._common()
         copy_group_name = common._create_group_copy_group_name(
             TEST_GROUP[0].id)
-        with mock.patch.object(
+        with self._svol_side_on_peer(common), mock.patch.object(
                 common.rep_primary.client, 'get_remote_copy_grps',
                 return_value=[{'copyGroupName': copy_group_name}]):
             ret = common.list_replication_targets(self.ctxt, TEST_GROUP[0])
@@ -3622,7 +3680,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     def test_list_replication_targets_not_found(self):
         common = self._common()
-        with mock.patch.object(
+        with self._svol_side_on_peer(common), mock.patch.object(
                 common.rep_primary.client, 'get_remote_copy_grps',
                 return_value=[{'copyGroupName': 'SOMEOTHERCG'}]):
             ret = common.list_replication_targets(self.ctxt, TEST_GROUP[0])
@@ -3630,7 +3688,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     def test_list_replication_targets_empty_response(self):
         common = self._common()
-        with mock.patch.object(
+        with self._svol_side_on_peer(common), mock.patch.object(
                 common.rep_primary.client, 'get_remote_copy_grps',
                 return_value=None):
             ret = common.list_replication_targets(self.ctxt, TEST_GROUP[0])
@@ -3638,7 +3696,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     def test_list_replication_targets_query_failure(self):
         common = self._common()
-        with mock.patch.object(
+        with self._svol_side_on_peer(common), mock.patch.object(
                 common.rep_primary.client, 'get_remote_copy_grps',
                 side_effect=exception.VolumeDriverException(data='x')):
             self.assertRaises(
@@ -3740,7 +3798,6 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         adopted = [{'id': volumes[0].id, 'replication_status': enabled}]
         with mock.patch.object(
                 common, '_group_repl_adopted_members', return_value=True), \
-            mock.patch.object(common, '_require_svol_instance'), \
             mock.patch.object(
                 common, '_group_repl_adopt_members',
                 return_value=adopted) as adopt, \
@@ -3827,10 +3884,13 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         request.assert_not_called()
 
     def _failover_patches(self, common):
+        # The S side is the peer, as for a backend that made the pairs.
         return mock.patch.multiple(
             common,
             _wait_pair_status_change=mock.DEFAULT,
-            _get_ldevs=mock.DEFAULT)
+            _get_ldevs=mock.DEFAULT,
+            _copy_group_svol_side=mock.Mock(
+                return_value=(common.rep_secondary, None)))
 
     @mock.patch.object(group_types, 'get_group_type_specs',
                        return_value='<is> True')
@@ -3978,29 +4038,33 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         request.assert_not_called()
 
     # ------------------------------------------------------------------
-    # A2: rep_secondary vs _svol_instance() on a target-role backend.
-    # _svol_instance() returns rep_primary when hitachi_replication_role
-    # is 'target', so a site that hardcodes rep_secondary sends the
-    # request to the wrong (remote) array.
+    # An sldev-only volume or snapshot lives on the site whose LDEV carries
+    # its label. rep_primary's own methods read the pldev key and find
+    # nothing, so these assert on the LDEV-level calls.
     # ------------------------------------------------------------------
 
-    def test_delete_volume_target_role_uses_svol_instance(self):
+    def test_ac12_delete_volume_deletes_a_local_svol_on_the_local_array(
+            self):
+        """rep_primary.delete_volume stays real: it would delete nothing."""
         common = self._common()
-        self._set_target_role()
         volume = self._svol_only_volume(9)
-        with mock.patch.object(
-                common.rep_primary, 'delete_volume') as local_delete, \
-            mock.patch.object(
-                common.rep_secondary, 'delete_volume') as remote_delete:
+        with self._label_stub(common.rep_primary, self._label_of(volume)), \
+                self._label_stub(common.rep_secondary, None), \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev') as local_delete, \
+                mock.patch.object(
+                    common.rep_secondary, 'delete_ldev') as remote_delete:
             common.delete_volume(volume)
-        local_delete.assert_called_once_with(volume)
+        local_delete.assert_called_once_with(9, mock.ANY)
         remote_delete.assert_not_called()
 
     def test_delete_volume_source_role_still_uses_rep_secondary(self):
-        """Regression check: source role (the default) is unaffected."""
+        """An sldev-only volume labelled on rep_secondary is deleted there."""
         common = self._common()
         volume = self._svol_only_volume(9)
-        with mock.patch.object(
+        with self._label_stub(common.rep_primary, None), \
+            self._label_stub(common.rep_secondary, self._label_of(volume)), \
+            mock.patch.object(
                 common.rep_primary, 'delete_volume') as local_delete, \
             mock.patch.object(
                 common.rep_secondary, 'delete_volume') as remote_delete:
@@ -4008,89 +4072,123 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         remote_delete.assert_called_once_with(volume)
         local_delete.assert_not_called()
 
-    def test_group_repl_delete_group_volume_target_role(self):
+    def test_ac13_group_delete_removes_a_local_svol_member_locally(self):
+        """get_ldev stays real: with no pldev, no pair is deleted.
+
+        The member's sldev is found on rep_primary by its label.
+        """
         common = self._common()
-        self._set_target_role()
-        volume = TEST_VOLUME[0]
-        # No local P-VOL to resolve (it lives on the remote source array);
-        # only the S-VOL side is deleted, isolating the assertion to it.
-        with mock.patch.object(
-                common.rep_primary, 'get_ldev', return_value=None), \
-            mock.patch.object(
-                common.rep_secondary, 'get_ldev', return_value=20), \
-            mock.patch.object(
-                common.rep_primary, 'delete_volume') as local_delete, \
-            mock.patch.object(
-                common.rep_secondary, 'delete_volume') as remote_delete:
-            common._group_repl_delete_group_volume(
+        volume = self._svol_only_volume(20)
+        with self._label_stub(common.rep_primary, self._label_of(volume)), \
+                self._label_stub(common.rep_secondary, None), \
+                mock.patch.object(
+                    common.rep_primary.client,
+                    'delete_remote_copypair') as delete_pair, \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev') as local_delete, \
+                mock.patch.object(
+                    common.rep_secondary, 'delete_ldev') as remote_delete:
+            update = common._group_repl_delete_group_volume(
                 TEST_GROUP[0], volume, 'CGTEST')
-        local_delete.assert_called_once_with(volume)
+        self.assertEqual({'id': volume.id, 'status': 'deleted'}, update)
+        delete_pair.assert_not_called()
+        local_delete.assert_called_once_with(20, mock.ANY)
         remote_delete.assert_not_called()
 
-    @mock.patch.object(sqlalchemy_api, 'volume_get', side_effect=_volume_get)
-    def test_group_repl_create_group_snapshot_target_role(
-            self, mock_volume_get):
-        common = self._common()
-        self._set_target_role()
-        group_snapshot = TEST_GROUP_SNAP[0]
-        snapshot = TEST_SNAPSHOT[0]
-        with mock.patch.object(
-                common.rep_primary, 'get_ldev', return_value=11), \
-            mock.patch.object(
-                common.rep_primary, 'get_volume_extra_specs',
-                return_value={}), \
-            mock.patch.object(
-                volume_types, 'get_volume_type_qos_specs',
-                return_value={'qos_specs': None}), \
-            mock.patch.object(
-                common.rep_primary, 'create_ldev',
-                return_value=22) as local_create_ldev, \
-            mock.patch.object(
-                common.rep_secondary, 'create_ldev') as remote_create_ldev, \
-            mock.patch.object(common.rep_primary, 'modify_ldev_name'), \
-            mock.patch.object(
-                common.rep_primary, '_create_ctg_snap_pair'):
-            common._group_repl_create_group_snapshot(
-                self.ctxt, group_snapshot, [snapshot])
-        local_create_ldev.assert_called_once()
-        remote_create_ldev.assert_not_called()
+    def _snapshot_peer_patches(self, common):
+        return mock.patch.multiple(
+            common.rep_secondary, create_ldev=mock.DEFAULT,
+            get_volume_extra_specs=mock.DEFAULT,
+            modify_ldev_name=mock.DEFAULT,
+            _create_ctg_snap_pair=mock.DEFAULT)
 
-    def test_group_repl_delete_group_snapshot_target_role(self):
+    def test_ac14_group_snapshot_snaps_local_svols_on_the_local_array(self):
+        """get_ldev stays real: on rep_primary it reads the pldev key.
+
+        It would reject the member as having no LDEV.
+        """
         common = self._common()
-        self._set_target_role()
-        with mock.patch.object(
-                common.rep_primary, '_delete_group',
-                return_value=(None, [])) as local_delete_group, \
-            mock.patch.object(
-                common.rep_secondary, '_delete_group') as \
-                remote_delete_group:
-            common._group_repl_delete_group_snapshot(
-                TEST_GROUP_SNAP[0], [TEST_SNAPSHOT[0]])
-        local_delete_group.assert_called_once_with(
-            TEST_GROUP_SNAP[0], [TEST_SNAPSHOT[0]], True)
-        remote_delete_group.assert_not_called()
+        member = self._svol_only_volume(11)
+        snapshot = self._snapshot_of(member)
+        with self._label_stub(common.rep_primary, self._label_of(member)), \
+                self._label_stub(common.rep_secondary, None), \
+                mock.patch.object(
+                    common.rep_primary, 'get_volume_extra_specs',
+                    return_value={}), \
+                mock.patch.object(
+                    hbsd_utils, 'get_qos_specs_from_volume',
+                    return_value=None), \
+                mock.patch.object(
+                    common.rep_primary, 'create_ldev',
+                    return_value=22) as local_create, \
+                mock.patch.object(common.rep_primary, 'modify_ldev_name'), \
+                mock.patch.object(
+                    common.rep_primary, '_create_ctg_snap_pair') as snap, \
+                self._snapshot_peer_patches(common) as peer:
+            peer['create_ldev'].return_value = 99
+            model_update, snapshots_update = (
+                common._group_repl_create_group_snapshot(
+                    self.ctxt, TEST_GROUP_SNAP[0], [snapshot]))
+        for method in peer.values():
+            method.assert_not_called()
+        self.assertIsNone(model_update)
+        local_create.assert_called_once()
+        self.assertEqual(
+            [{'snapshot': snapshot, 'pvol': 11, 'svol': 22}],
+            snap.call_args[0][0])
+        self.assertEqual(
+            [{'id': snapshot.id, 'status': fields.SnapshotStatus.AVAILABLE,
+              'provider_location': json.dumps({'sldev': 22})}],
+            snapshots_update)
+
+    def test_ac15_delete_group_snapshot_removes_local_svols_locally(self):
+        """rep_primary._delete_group stays real: it would delete nothing.
+
+        Its delete_snapshot reads the pldev key.
+        """
+        common = self._common()
+        snapshot = self._snapshot_of(TEST_VOLUME[0], sldev=33)
+        with self._label_stub(
+                common.rep_primary, self._label_of(snapshot)), \
+                self._label_stub(common.rep_secondary, None), \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev') as local_delete, \
+                mock.patch.multiple(
+                    common.rep_secondary, delete_ldev=mock.DEFAULT,
+                    _delete_group=mock.DEFAULT) as peer:
+            peer['_delete_group'].return_value = (None, [])
+            model_update, snapshots_update = (
+                common._group_repl_delete_group_snapshot(
+                    TEST_GROUP_SNAP[0], [snapshot]))
+        for method in peer.values():
+            method.assert_not_called()
+        local_delete.assert_called_once_with(33, mock.ANY)
+        self.assertEqual(
+            {'status': TEST_GROUP_SNAP[0].status}, model_update)
+        self.assertEqual(
+            [{'id': snapshot.id, 'status': 'deleted'}], snapshots_update)
 
     # ------------------------------------------------------------------
-    # A3: an adopted S-VOL ({"sldev": N}, no pldev) on a target-role
-    # backend must be promotable, not stuck in ERROR.
+    # A3: an adopted S-VOL ({"sldev": N}, no pldev) whose copy group's S
+    # side is local must be promotable, not stuck in ERROR.
     # ------------------------------------------------------------------
 
-    def test_get_ldevs_target_role_missing_pvol_is_not_a_warning(self):
+    def test_ac10_get_ldevs_missing_pvol_is_expected_for_a_local_svol(self):
         common = self._common()
-        self._set_target_role()
         volume = self._svol_only_volume(30)
         with mock.patch.object(
                 common.rep_primary, 'output_log') as primary_log, \
             mock.patch.object(
                 common.rep_secondary, 'output_log') as secondary_log:
-            pldev, sldev = common._get_ldevs(volume)
+            pldev, sldev = common._get_ldevs(
+                volume, svol_site=common.rep_primary)
         self.assertIsNone(pldev)
         self.assertEqual(30, sldev)
         primary_log.assert_not_called()
         secondary_log.assert_not_called()
 
     def test_get_ldevs_source_role_missing_pvol_still_warns(self):
-        """Regression check: source role (host failover) keeps the warning."""
+        """Without svol_site, as in host failover, a missing P-VOL warns."""
         common = self._common()
         volume = self._svol_only_volume(30)
         with mock.patch.object(
@@ -4098,31 +4196,57 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             common._get_ldevs(volume)
         primary_log.assert_called_once()
 
-    def test_get_ldevs_missing_svol_still_warns_on_target_role(self):
-        """A genuinely missing S-VOL is still a real problem either way."""
+    def test_ac10_get_ldevs_missing_svol_still_warns_for_a_local_svol_side(
+            self):
         common = self._common()
-        self._set_target_role()
         volume = TEST_VOLUME[3]  # provider_location is None
         with mock.patch.object(
                 common.rep_primary, 'output_log') as primary_log:
-            common._get_ldevs(volume)
+            common._get_ldevs(volume, svol_site=common.rep_primary)
         primary_log.assert_called_once()
+
+    @staticmethod
+    def _peer_unreachable(common, *names):
+        """Patch the named rep_secondary client calls; callers make them fail.
+
+        The mocks are yielded so a test can assert none was reached.
+        """
+        return mock.patch.multiple(
+            common.rep_secondary.client,
+            **{name: mock.DEFAULT for name in names})
 
     @mock.patch.object(group_types, 'get_group_type_specs',
                        return_value='<is> True')
-    def test_failover_replication_target_role_promotes_svol_only(
+    def test_ac4_failover_replication_takes_over_a_local_svol_side_locally(
             self, get_group_type_specs):
+        """rep_secondary is down for the whole failover."""
         common = self._common()
-        self._set_target_role()
-        volumes = [TEST_VOLUME[0]]
-        with self._failover_patches(common) as patches, \
-            mock.patch.object(
-                common.rep_primary.client,
-                'takeover_remote_copy_grp') as takeover:
-            patches['_get_ldevs'].return_value = (None, 40)
+        volume = self._svol_only_volume(40)
+        copy_group_name = common._create_group_copy_group_name(
+            TEST_GROUP[0].id)
+        ssws = dict(GET_REMOTE_MIRROR_COPYPAIR_RESULT_SSWS, svolLdevId=40)
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value=self._svol_copy_grp(copy_group_name)), \
+                mock.patch.object(
+                    common.rep_primary.client,
+                    'takeover_remote_copy_grp') as takeover, \
+                mock.patch.object(
+                    common.rep_primary.client, 'get_remote_copypair',
+                    return_value=ssws) as poll, \
+                self._peer_unreachable(
+                    common, 'get_remote_copy_grp', 'get_remote_copypair',
+                    'takeover_remote_copy_grp') as peer:
+            for method in peer.values():
+                method.side_effect = exception.VolumeDriverException(
+                    data='peer down')
             model_update, volumes_update = common.failover_replication(
-                self.ctxt, TEST_GROUP[0], volumes)
-        takeover.assert_called_once()
+                self.ctxt, TEST_GROUP[0], [volume])
+        for method in peer.values():
+            method.assert_not_called()
+        takeover.assert_called_once_with(None, copy_group_name)
+        poll.assert_called_once_with(
+            None, copy_group_name, None, 40, is_secondary=True)
         self.assertEqual(
             {'replication_status': fields.ReplicationStatus.FAILED_OVER},
             model_update)
@@ -4134,7 +4258,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                        return_value='<is> True')
     def test_failover_replication_source_role_svol_only_still_errors(
             self, get_group_type_specs):
-        """Regression check: source role still requires both LDEVs."""
+        """With the S side on the peer, a member still needs both LDEVs."""
         common = self._common()
         with self._failover_patches(common) as patches, \
             mock.patch.object(
@@ -4494,18 +4618,34 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                 40, common._pool_id_for(common.rep_secondary, TEST_VOLUME[0]))
         resolve.assert_not_called()
 
-    def test_group_snapshot_uses_the_local_pool_on_a_target_role_backend(self):
+    def test_ac14_group_snapshot_uses_the_local_pool_for_a_local_svol(self):
         common = self._common()
-        self._set_target_role()
+        member = self._svol_only_volume(11)
         common.rep_primary.storage_info['pool_id'] = [30, 31]
         common.rep_primary._stats = {'pools': []}
-        with mock.patch.object(
-                common.rep_primary, 'get_pool_id_of_volume',
-                return_value=31) as resolve:
-            self.assertEqual(
-                31, common._pool_id_for(common._svol_instance(),
-                                        TEST_VOLUME[0]))
-        resolve.assert_called_once()
+        with self._label_stub(common.rep_primary, self._label_of(member)), \
+                self._label_stub(common.rep_secondary, None), \
+                mock.patch.object(
+                    common.rep_primary, 'get_volume_extra_specs',
+                    return_value={}), \
+                mock.patch.object(
+                    hbsd_utils, 'get_qos_specs_from_volume',
+                    return_value=None), \
+                mock.patch.object(
+                    common.rep_primary, 'get_pool_id_of_volume',
+                    return_value=31), \
+                mock.patch.object(
+                    common.rep_primary, 'create_ldev',
+                    return_value=22) as local_create, \
+                mock.patch.object(common.rep_primary, 'modify_ldev_name'), \
+                mock.patch.object(
+                    common.rep_primary, '_create_ctg_snap_pair'), \
+                self._snapshot_peer_patches(common) as peer:
+            peer['create_ldev'].return_value = 99
+            common._group_repl_create_group_snapshot(
+                self.ctxt, TEST_GROUP_SNAP[0], [self._snapshot_of(member)])
+        local_create.assert_called_once()
+        self.assertEqual(31, local_create.call_args[0][2])
 
     @ddt.data('<is> True', '  <is> True  ')
     def test_pairs_at_create_time_false_for_a_group_replication_type(
@@ -4561,6 +4701,1272 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             {'provider_location': json.dumps({'pldev': 1}),
              'replication_status': fields.ReplicationStatus.DISABLED},
             ret)
+
+    # ------------------------------------------------------------------
+    # hitachi_replication_role is gone. Which site holds a copy group's S
+    # side, and which holds an sldev-only object, is read from the
+    # storage systems when it is needed.
+    # ------------------------------------------------------------------
+
+    def test_ac1_no_replication_role_option_or_role_helpers(self):
+        self.assertEqual(
+            [], [opt.name for opt in hbsd_replication.COMMON_REPLICATION_OPTS
+                 if opt.name == 'hitachi_replication_role'])
+        common = self._common()
+        for name in ('_is_target_role', '_svol_instance',
+                     '_require_svol_instance'):
+            self.assertFalse(hasattr(common, name), name)
+
+    def test_ac2_leftover_role_line_in_cinder_conf_is_ignored(self):
+        fd, path = tempfile.mkstemp(suffix='.conf')
+        self.addCleanup(os.remove, path)
+        with os.fdopen(fd, 'w') as conf_file:
+            conf_file.write('[hitachi_dr]\n'
+                            'hitachi_replication_role = target\n'
+                            'hitachi_replication_mun = 2\n')
+        parsed = cfg.ConfigOpts()
+        parsed.register_opts(
+            hbsd_replication.COMMON_REPLICATION_OPTS, group='hitachi_dr')
+        parsed(args=[], default_config_files=[path])
+        self.assertEqual(2, parsed.hitachi_dr.hitachi_replication_mun)
+        self.assertRaises(
+            cfg.NoSuchOptError, getattr, parsed.hitachi_dr,
+            'hitachi_replication_role')
+
+    def test_ac3_svol_side_is_local_when_rep_primary_holds_it(self):
+        common = self._common()
+        grp = self._svol_copy_grp('CGL')
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value=grp) as local, \
+                mock.patch.object(
+                    common.rep_secondary.client,
+                    'get_remote_copy_grp') as peer:
+            self.assertEqual(
+                (common.rep_primary, grp),
+                common._copy_group_svol_side('CGL'))
+        local.assert_called_once_with(
+            None, 'CGL', is_secondary=True,
+            ignore_message_id=[
+                hbsd_replication._MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST])
+        peer.assert_not_called()
+
+    def test_ac3_svol_side_not_on_rep_primary_is_the_peer_unasked(self):
+        common = self._common()
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value=self._svol_side_not_here()) as local, \
+                mock.patch.object(
+                    common.rep_secondary.client,
+                    'get_remote_copy_grp') as peer:
+            self.assertEqual(
+                (common.rep_secondary, None),
+                common._copy_group_svol_side('CGP'))
+        local.assert_called_once()
+        peer.assert_not_called()
+
+    def test_ac3_svol_side_asks_the_peer_when_rep_primary_errors(self):
+        common = self._common()
+        grp = self._svol_copy_grp('CGP')
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                side_effect=exception.VolumeDriverException(data='x')), \
+                mock.patch.object(
+                    common.rep_secondary.client, 'get_remote_copy_grp',
+                    return_value=grp) as peer:
+            self.assertEqual(
+                (common.rep_secondary, grp),
+                common._copy_group_svol_side('CGP'))
+        peer.assert_called_once_with(None, 'CGP', is_secondary=True)
+
+    def test_ac3_svol_side_is_unknown_when_neither_site_confirms(self):
+        common = self._common()
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                side_effect=exception.VolumeDriverException(data='x')), \
+                mock.patch.object(
+                    common.rep_secondary.client, 'get_remote_copy_grp',
+                    side_effect=exception.VolumeDriverException(data='y')):
+            exc = self.assertRaises(
+                exception.VolumeDriverException,
+                common._copy_group_svol_side, 'CG')
+        self.assertIn(
+            self._message_text(
+                hbsd_utils.HBSDMsg.GROUP_REPLICATION_SIDE_UNKNOWN),
+            str(exc))
+
+    def test_ac3_svol_side_is_unknown_when_the_peer_is_not_initialized(self):
+        common = self._common()
+        common.rep_secondary = None
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                side_effect=exception.VolumeDriverException(data='x')):
+            self.assertRaises(
+                exception.VolumeDriverException,
+                common._copy_group_svol_side, 'CG')
+
+    def test_ac3_svol_side_of_a_failed_over_backend_is_the_peer(self):
+        common = self._common()
+        common._active_backend_id = common.rep_secondary.backend_id
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp') as local, \
+                mock.patch.object(
+                    common.rep_secondary.client,
+                    'get_remote_copy_grp') as peer:
+            self.assertEqual(
+                (common.rep_secondary, None),
+                common._copy_group_svol_side('CG'))
+        local.assert_not_called()
+        peer.assert_not_called()
+
+    @mock.patch.object(requests.Session, "request")
+    def test_ac3_not_found_reply_is_returned_not_raised(self, request):
+        """The REST client hands KART30013-E back rather than raising it."""
+        request.return_value = FakeResponse(404, dict(
+            ERROR_RESULT,
+            messageId=hbsd_rest_api.MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST))
+        common = self._common()
+        self.assertEqual(
+            (common.rep_secondary, None),
+            common._copy_group_svol_side('CG'))
+        self.assertEqual(1, request.call_count)
+        self.assertIn('/remote-mirror-copygroups/', request.call_args[0][1])
+
+    def test_ac3_not_found_message_id_matches_the_rest_client(self):
+        self.assertEqual(
+            hbsd_rest_api.MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST,
+            hbsd_replication._MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST)
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_ac5_failover_replication_takes_over_the_peer_with_local_down(
+            self, get_group_type_specs):
+        common = self._common()
+        copy_group_name = common._create_group_copy_group_name(
+            TEST_GROUP[0].id)
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                side_effect=exception.VolumeDriverException(data='down')), \
+                mock.patch.object(
+                    common.rep_secondary.client, 'get_remote_copy_grp',
+                    return_value=self._svol_copy_grp(copy_group_name)), \
+                mock.patch.object(
+                    common.rep_secondary.client,
+                    'takeover_remote_copy_grp') as takeover, \
+                mock.patch.object(
+                    common, '_wait_pair_status_change') as wait:
+            model_update, _ = common.failover_replication(
+                self.ctxt, TEST_GROUP[0], [TEST_VOLUME[4]])
+        takeover.assert_called_once_with(None, copy_group_name)
+        self.assertIs(common.rep_secondary, wait.call_args[1]['instance'])
+        self.assertEqual(
+            {'replication_status': fields.ReplicationStatus.FAILED_OVER},
+            model_update)
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_ac20_failover_replication_raises_when_the_side_is_unknown(
+            self, get_group_type_specs):
+        common = self._common()
+        down = exception.VolumeDriverException(data='down')
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                side_effect=down), \
+                mock.patch.object(
+                    common.rep_primary.client,
+                    'takeover_remote_copy_grp') as local_takeover, \
+                self._peer_unreachable(
+                    common, 'get_remote_copy_grp',
+                    'takeover_remote_copy_grp') as peer:
+            for method in peer.values():
+                method.side_effect = down
+            self.assertRaises(
+                exception.UnableToFailOver, common.failover_replication,
+                self.ctxt, TEST_GROUP[0], [TEST_VOLUME[4]])
+        local_takeover.assert_not_called()
+        peer['takeover_remote_copy_grp'].assert_not_called()
+
+    def test_ac6_list_replication_targets_reads_a_local_svol_side(self):
+        common = self._common()
+        copy_group_name = common._create_group_copy_group_name(
+            TEST_GROUP[0].id)
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value=self._svol_copy_grp(copy_group_name)), \
+                mock.patch.object(
+                    common.rep_primary.client,
+                    'get_remote_copy_grps') as list_grps:
+            ret = common.list_replication_targets(self.ctxt, TEST_GROUP[0])
+        list_grps.assert_not_called()
+        self.assertEqual(
+            {'replication_targets': [
+                {'backend_id': common.rep_secondary_backend_id}]}, ret)
+
+    def test_ac6_list_replication_targets_lists_via_the_peer_otherwise(self):
+        common = self._common()
+        copy_group_name = common._create_group_copy_group_name(
+            TEST_GROUP[0].id)
+        listing = [{'copyGroupName': copy_group_name}]
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value=self._svol_side_not_here()), \
+                mock.patch.object(
+                    common.rep_primary.client, 'get_remote_copy_grps',
+                    return_value=listing) as list_grps:
+            ret = common.list_replication_targets(self.ctxt, TEST_GROUP[0])
+        list_grps.assert_called_once_with(common.rep_secondary.client)
+        self.assertEqual(
+            {'replication_targets': [
+                {'backend_id': common.rep_secondary_backend_id}]}, ret)
+
+    def test_ac6_list_replication_targets_raises_when_the_lookup_errors(
+            self):
+        common = self._common()
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                side_effect=exception.VolumeDriverException(data='x')), \
+                mock.patch.object(
+                    common.rep_primary.client,
+                    'get_remote_copy_grps') as list_grps:
+            exc = self.assertRaises(
+                exception.VolumeDriverException,
+                common.list_replication_targets, self.ctxt, TEST_GROUP[0])
+        list_grps.assert_not_called()
+        self.assertIn(
+            self._message_text(
+                hbsd_utils.HBSDMsg.GROUP_REPLICATION_TARGETS_QUERY_FAILED),
+            str(exc))
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_ac7_enable_replication_adopts_from_a_local_svol_side(
+            self, get_group_type_specs):
+        common = self._common()
+        volume = self._svol_only_volume(40)
+        copy_group_name = common._create_group_copy_group_name(
+            TEST_GROUP[0].id)
+        enabled = fields.ReplicationStatus.ENABLED
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value=self._svol_copy_grp(
+                    copy_group_name, [{'svolLdevId': 40}])) as local, \
+                mock.patch.object(
+                    common.rep_secondary.client,
+                    'get_remote_copy_grp') as peer, \
+                mock.patch.object(
+                    common, '_group_repl_add_volume') as add_volume:
+            model_update, volumes_update = common.enable_replication(
+                self.ctxt, TEST_GROUP[0], [volume])
+        peer.assert_not_called()
+        # One read tells both which site it is and what it pairs.
+        local.assert_called_once()
+        add_volume.assert_not_called()
+        self.assertEqual({'replication_status': enabled}, model_update)
+        self.assertEqual(
+            [{'id': volume.id, 'replication_status': enabled}],
+            volumes_update)
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_ac7_enable_replication_adopts_from_a_peer_svol_side(
+            self, get_group_type_specs):
+        common = self._common()
+        volume = self._svol_only_volume(40)
+        copy_group_name = common._create_group_copy_group_name(
+            TEST_GROUP[0].id)
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value=self._svol_side_not_here()), \
+                mock.patch.object(
+                    common.rep_secondary.client, 'get_remote_copy_grp',
+                    return_value=self._svol_copy_grp(
+                        copy_group_name, [{'svolLdevId': 40}])) as peer:
+            model_update, _ = common.enable_replication(
+                self.ctxt, TEST_GROUP[0], [volume])
+        peer.assert_called_once_with(None, copy_group_name, is_secondary=True)
+        self.assertEqual(
+            {'replication_status': fields.ReplicationStatus.ENABLED},
+            model_update)
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_ac20_enable_replication_adopt_marks_members_error_if_unknown(
+            self, get_group_type_specs):
+        common = self._common()
+        volume = self._svol_only_volume(40)
+        down = exception.VolumeDriverException(data='down')
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                side_effect=down), \
+                mock.patch.object(
+                    common.rep_secondary.client, 'get_remote_copy_grp',
+                    side_effect=down):
+            model_update, volumes_update = common.enable_replication(
+                self.ctxt, TEST_GROUP[0], [volume])
+        error = fields.ReplicationStatus.ERROR
+        self.assertEqual({'replication_status': error}, model_update)
+        self.assertEqual(
+            [{'id': volume.id, 'replication_status': error}],
+            volumes_update)
+
+    def _pair_status_on(self):
+        self.override_config(
+            'hitachi_replication_report_pair_status', True,
+            group=conf.SHARED_CONF_GROUP)
+
+    def test_ac8_pair_status_reads_each_group_from_its_listed_side(self):
+        """One listing holds copy groups in both directions."""
+        common = self._common()
+        self._pair_status_on()
+        rows = [{'copyGroupName': 'CGP', 'localDeviceGroupName': 'CGPP'},
+                {'copyGroupName': 'CGS', 'localDeviceGroupName': 'CGSS'}]
+        detail = {'pairStatus': 'PAIR', 'journalUsageRate': 1,
+                  'copyPairs': []}
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                return_value=rows), \
+                mock.patch.object(
+                    common.rep_primary.client, 'get_remote_copy_grp',
+                    return_value=detail) as read, \
+                mock.patch.object(
+                    common.rep_secondary.client,
+                    'get_remote_copy_grp') as peer_read:
+            capabilities = common._pair_status_capabilities()
+        self.assertEqual(
+            [mock.call(common.rep_secondary.client, 'CGP'),
+             mock.call(None, 'CGS', is_secondary=True)],
+            read.call_args_list)
+        peer_read.assert_not_called()
+        self.assertTrue(
+            capabilities[hbsd_replication._PAIR_STATUS_ENUMERATED_KEY])
+        self.assertEqual(
+            {'CGP', 'CGS'},
+            set(json.loads(capabilities[hbsd_replication._PAIR_STATUS_KEY])))
+
+    def test_ac8_pair_status_journal_side_follows_the_group_side(self):
+        common = self._common()
+        self._pair_status_on()
+        rows = [{'copyGroupName': 'CGS', 'localDeviceGroupName': 'CGSS'}]
+        detail = {'pairStatus': 'PAIR',
+                  'copyPairs': [{'pvolJournalId': 1, 'svolJournalId': 2}]}
+        journals = {1: {'journalId': 1}, 2: {'journalId': 2}}
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                return_value=rows), \
+                mock.patch.object(
+                    common.rep_primary.client, 'get_remote_copy_grp',
+                    return_value=detail), \
+                mock.patch.object(
+                    common, '_journals_by_id',
+                    return_value=journals) as journals_by_id:
+            capabilities = common._pair_status_capabilities()
+        journals_by_id.assert_called_once_with(common.rep_primary)
+        state = json.loads(
+            capabilities[hbsd_replication._PAIR_STATUS_KEY])['CGS']
+        self.assertEqual(2, state['journal_id'])
+        self.assertEqual(hbsd_utils.SECONDARY_STR, state['journal_side'])
+
+    def test_ac8_pair_status_reads_local_svol_groups_when_listing_fails(
+            self):
+        common = self._common()
+        self._pair_status_on()
+        rows = [{'copyGroupName': 'CGS', 'localDeviceGroupName': 'CGSS'}]
+        detail = {'pairStatus': 'SSWS', 'journalUsageRate': 0,
+                  'copyPairs': []}
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                return_value=rows), \
+                mock.patch.object(
+                    common.rep_primary.client, 'get_remote_copy_grp',
+                    return_value=detail):
+            common._pair_status_capabilities()
+        common._pair_status_cache['time'] = (
+            common._pair_status_cache['time'] - timedelta(hours=1))
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                side_effect=exception.VolumeDriverException(data='down')), \
+                mock.patch.object(
+                    common.rep_primary.client, 'get_remote_copy_grp',
+                    return_value=detail) as read:
+            capabilities = common._pair_status_capabilities()
+        read.assert_called_once_with(None, 'CGS', is_secondary=True)
+        self.assertFalse(
+            capabilities[hbsd_replication._PAIR_STATUS_ENUMERATED_KEY])
+        self.assertEqual(
+            'SSWS',
+            json.loads(capabilities[hbsd_replication._PAIR_STATUS_KEY])[
+                'CGS']['pair_status'])
+
+    def test_ac8_pair_status_of_a_failed_over_backend_reads_the_peer(self):
+        """A failed-over backend reads only the copy groups it knows."""
+        common = self._common()
+        self._pair_status_on()
+        common._active_backend_id = common.rep_secondary.backend_id
+        common._known_copy_groups.add('CG1')
+        detail = {'pairStatus': 'SSWS', 'journalUsageRate': 0,
+                  'copyPairs': []}
+        with mock.patch.object(
+                common.rep_primary.client,
+                'get_remote_copy_grps') as list_grps, \
+                mock.patch.object(
+                    common.rep_secondary.client, 'get_remote_copy_grp',
+                    return_value=detail) as read:
+            capabilities = common._pair_status_capabilities()
+        list_grps.assert_not_called()
+        read.assert_called_once_with(None, 'CG1', is_secondary=True)
+        self.assertFalse(
+            capabilities[hbsd_replication._PAIR_STATUS_ENUMERATED_KEY])
+
+    def test_ac22_pair_status_never_raises_when_a_local_read_fails(self):
+        common = self._common()
+        self._pair_status_on()
+        common._known_copy_groups.add('CGS')
+        common._local_svol_copy_groups.add('CGS')
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                side_effect=exception.VolumeDriverException(data='peer')), \
+                mock.patch.object(
+                    common.rep_primary.client, 'get_remote_copy_grp',
+                    side_effect=exception.VolumeDriverException(data='me')):
+            capabilities = common._pair_status_capabilities()
+        self.assertFalse(
+            capabilities[hbsd_replication._PAIR_STATUS_ENUMERATED_KEY])
+        self.assertEqual(
+            {}, json.loads(capabilities[hbsd_replication._PAIR_STATUS_KEY]))
+
+    def test_ac9_ssws_wait_polls_the_site_it_is_given(self):
+        common = self._common()
+        common.rep_secondary = None
+        params = common._get_wait_pair_status_change_params(
+            hbsd_replication._WAIT_SSWS, common.rep_primary)
+        self.assertIs(common.rep_primary, params['instance'])
+        self.assertIsNone(params['remote_client'])
+
+    def test_ac9_ssws_wait_defaults_to_the_peer(self):
+        """Per-volume failover relies on this default."""
+        common = self._common()
+        params = common._get_wait_pair_status_change_params(
+            hbsd_replication._WAIT_SSWS)
+        self.assertIs(common.rep_secondary, params['instance'])
+
+    @ddt.data(True, False)
+    def test_ac11_sldev_owner_is_the_site_carrying_its_label(self, local):
+        common = self._common()
+        volume = self._svol_only_volume(9)
+        label = self._label_of(volume)
+        with self._label_stub(
+                common.rep_primary, label if local else None) as local_info, \
+                self._label_stub(
+                    common.rep_secondary, None if local else label):
+            site, ldev_info = common._resolve_sldev_owner(volume)
+        self.assertIs(
+            common.rep_primary if local else common.rep_secondary, site)
+        self.assertEqual(label, ldev_info['label'])
+        local_info.assert_called_once_with(None, 9)
+
+    def test_ac11_sldev_owner_of_a_paired_volume_reads_no_label(self):
+        common = self._common()
+        with mock.patch.object(
+                common.rep_primary, 'get_ldev_info') as local_info, \
+                mock.patch.object(
+                    common.rep_secondary, 'get_ldev_info') as peer_info:
+            self.assertEqual(
+                (common.rep_secondary, None),
+                common._resolve_sldev_owner(TEST_VOLUME[4]))
+        local_info.assert_not_called()
+        peer_info.assert_not_called()
+
+    def test_ac11_sldev_owner_of_a_snapshot_matches_the_snapshot_id(self):
+        common = self._common()
+        snapshot = self._snapshot_of(TEST_VOLUME[0], sldev=5)
+        with self._label_stub(
+                common.rep_primary, self._label_of(snapshot)), \
+                self._label_stub(
+                    common.rep_secondary, self._label_of(TEST_VOLUME[0])):
+            site, _ = common._resolve_sldev_owner(snapshot)
+        self.assertIs(common.rep_primary, site)
+
+    def test_ac11_sldev_owner_takes_a_match_when_the_other_site_is_down(
+            self):
+        """The disaster case: the peer is gone, the adopted S-VOL is here."""
+        common = self._common()
+        volume = self._svol_only_volume(9)
+        with self._label_stub(common.rep_primary, self._label_of(volume)), \
+                self._label_stub(
+                    common.rep_secondary,
+                    exception.VolumeDriverException(data='down')):
+            site, _ = common._resolve_sldev_owner(volume)
+        self.assertIs(common.rep_primary, site)
+
+    def test_ac12_delete_volume_busy_local_svol_raises_volume_is_busy(self):
+        common = self._common()
+        volume = self._svol_only_volume(9)
+        with self._label_stub(common.rep_primary, self._label_of(volume)), \
+                self._label_stub(common.rep_secondary, None), \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev',
+                    side_effect=exception.VolumeDriverException(
+                        hbsd_utils.BUSY_MESSAGE)):
+            self.assertRaises(
+                exception.VolumeIsBusy, common.delete_volume, volume)
+
+    def _delete_patches(self, common):
+        return mock.patch.multiple(
+            common.rep_secondary, delete_ldev=mock.DEFAULT,
+            delete_volume=mock.DEFAULT)
+
+    def test_ac19_delete_volume_on_neither_site_skips_every_time(self):
+        common = self._common()
+        volume = self._svol_only_volume(9)
+        with self._label_stub(common.rep_primary, None), \
+                self._label_stub(common.rep_secondary, None), \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev') as local_delete, \
+                self._delete_patches(common) as peer:
+            common.delete_volume(volume)
+            common.delete_volume(volume)
+        local_delete.assert_not_called()
+        for method in peer.values():
+            method.assert_not_called()
+
+    def test_ac20_delete_volume_raises_and_writes_nothing_if_unknown(self):
+        common = self._common()
+        volume = self._svol_only_volume(9)
+        with self._label_stub(
+                common.rep_primary,
+                exception.VolumeDriverException(data='down')), \
+                self._label_stub(common.rep_secondary, None), \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev') as local_delete, \
+                self._delete_patches(common) as peer:
+            exc = self.assertRaises(
+                exception.VolumeDriverException, common.delete_volume,
+                volume)
+        self.assertIn(
+            self._message_text(
+                hbsd_utils.HBSDMsg.GROUP_REPLICATION_SVOL_UNRESOLVED),
+            str(exc))
+        local_delete.assert_not_called()
+        for method in peer.values():
+            method.assert_not_called()
+
+    def test_ac21_delete_volume_raises_when_both_sites_claim_the_ldev(self):
+        common = self._common()
+        volume = self._svol_only_volume(9)
+        label = self._label_of(volume)
+        with self._label_stub(common.rep_primary, label), \
+                self._label_stub(common.rep_secondary, label), \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev') as local_delete, \
+                self._delete_patches(common) as peer:
+            exc = self.assertRaises(
+                exception.VolumeDriverException, common.delete_volume,
+                volume)
+        self.assertIn(
+            self._message_text(
+                hbsd_utils.HBSDMsg.GROUP_REPLICATION_SVOL_UNRESOLVED),
+            str(exc))
+        local_delete.assert_not_called()
+        for method in peer.values():
+            method.assert_not_called()
+
+    def test_ac20_group_delete_marks_an_unresolvable_member_error(self):
+        common = self._common()
+        volume = self._svol_only_volume(20)
+        down = exception.VolumeDriverException(data='down')
+        with self._label_stub(common.rep_primary, down), \
+                self._label_stub(common.rep_secondary, down), \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev') as local_delete, \
+                mock.patch.object(
+                    common.rep_secondary, 'delete_ldev') as remote_delete:
+            update = common._group_repl_delete_group_volume(
+                TEST_GROUP[0], volume, 'CGTEST')
+        self.assertEqual({'id': volume.id, 'status': 'error'}, update)
+        local_delete.assert_not_called()
+        remote_delete.assert_not_called()
+
+    def test_ac14_group_snapshot_member_on_neither_site_is_an_error(self):
+        common = self._common()
+        member = self._svol_only_volume(11)
+        snapshot = self._snapshot_of(member)
+        with self._label_stub(common.rep_primary, None), \
+                self._label_stub(common.rep_secondary, None), \
+                mock.patch.object(
+                    common.rep_primary, 'create_ldev') as local_create, \
+                self._snapshot_peer_patches(common) as peer:
+            model_update, snapshots_update = (
+                common._group_repl_create_group_snapshot(
+                    self.ctxt, TEST_GROUP_SNAP[0], [snapshot]))
+        for method in peer.values():
+            method.assert_not_called()
+        local_create.assert_not_called()
+        self.assertEqual(
+            {'status': fields.GroupSnapshotStatus.ERROR}, model_update)
+        self.assertEqual(
+            [{'id': snapshot.id, 'status': fields.SnapshotStatus.ERROR}],
+            snapshots_update)
+
+    def test_ac15_delete_group_snapshot_on_the_peer_uses_its_delete_group(
+            self):
+        common = self._common()
+        snapshot = self._snapshot_of(TEST_VOLUME[0], sldev=33)
+        expected = ({'status': TEST_GROUP_SNAP[0].status},
+                    [{'id': snapshot.id, 'status': 'deleted'}])
+        with self._label_stub(common.rep_primary, None), \
+                self._label_stub(
+                    common.rep_secondary, self._label_of(snapshot)), \
+                mock.patch.object(
+                    common.rep_secondary, '_delete_group',
+                    return_value=expected) as remote_delete_group, \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev') as local_delete:
+            self.assertEqual(
+                expected, common._group_repl_delete_group_snapshot(
+                    TEST_GROUP_SNAP[0], [snapshot]))
+        remote_delete_group.assert_called_once_with(
+            TEST_GROUP_SNAP[0], [snapshot], True)
+        local_delete.assert_not_called()
+
+    def test_ac20_delete_group_snapshot_marks_an_unknown_member_error(self):
+        common = self._common()
+        snapshot = self._snapshot_of(TEST_VOLUME[0], sldev=33)
+        down = exception.VolumeDriverException(data='down')
+        with self._label_stub(common.rep_primary, down), \
+                self._label_stub(common.rep_secondary, down), \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev') as local_delete, \
+                mock.patch.multiple(
+                    common.rep_secondary, delete_ldev=mock.DEFAULT,
+                    _delete_group=mock.DEFAULT) as peer:
+            peer['_delete_group'].return_value = (None, [])
+            model_update, snapshots_update = (
+                common._group_repl_delete_group_snapshot(
+                    TEST_GROUP_SNAP[0], [snapshot]))
+        for method in peer.values():
+            method.assert_not_called()
+        local_delete.assert_not_called()
+        self.assertEqual({'status': 'error'}, model_update)
+        self.assertEqual(
+            [{'id': snapshot.id, 'status': 'error'}], snapshots_update)
+
+    def _clone_peer_patches(self, common):
+        return mock.patch.multiple(
+            common.rep_secondary, create_cloned_volume=mock.DEFAULT,
+            create_volume_from_snapshot=mock.DEFAULT,
+            copy_on_storage=mock.DEFAULT, modify_ldev_name=mock.DEFAULT)
+
+    def test_ac16_create_group_from_src_clones_a_local_source_locally(self):
+        """rep_secondary's LDEV with the source's number is another object's.
+
+        Only its label is read; cloning it would copy the other's data.
+        """
+        common = self._common()
+        source = self._svol_only_volume(10)
+        volume = TEST_VOLUME[1]
+        with self._label_stub(common.rep_primary, self._label_of(source)), \
+                self._label_stub(common.rep_secondary, None) as peer_info, \
+                mock.patch.object(
+                    common.rep_primary, 'get_volume_extra_specs',
+                    return_value={}), \
+                mock.patch.object(
+                    hbsd_utils, 'get_qos_specs_from_volume',
+                    return_value=None), \
+                mock.patch.object(
+                    common.rep_primary, 'copy_on_storage',
+                    return_value=50) as local_copy, \
+                mock.patch.object(
+                    common.rep_primary, 'modify_ldev_name') as local_label, \
+                self._clone_peer_patches(common) as peer:
+            model_update, volumes_update = (
+                common._group_repl_create_group_from_src(
+                    self.ctxt, TEST_GROUP[0], [volume], None, [source]))
+        for method in peer.values():
+            method.assert_not_called()
+        peer_info.assert_called_once_with(None, 10)
+        local_copy.assert_called_once()
+        self.assertEqual(10, local_copy.call_args[0][0])
+        local_label.assert_called_once_with(50, volume.id.replace('-', ''))
+        self.assertIsNone(model_update)
+        self.assertEqual(
+            [{'id': volume.id,
+              'provider_location': json.dumps({'sldev': 50}),
+              'replication_status': fields.ReplicationStatus.DISABLED}],
+            volumes_update)
+
+    def test_ac16_create_group_from_src_clones_a_peer_source_as_today(self):
+        common = self._common()
+        source = self._svol_only_volume(10)
+        volume = TEST_VOLUME[1]
+        with self._label_stub(common.rep_primary, None), \
+                self._label_stub(
+                    common.rep_secondary, self._label_of(source)), \
+                mock.patch.object(
+                    common.rep_primary, 'copy_on_storage') as local_copy, \
+                mock.patch.object(
+                    common.rep_secondary, 'create_cloned_volume',
+                    return_value={'provider_location': '51'}) as clone:
+            _, volumes_update = common._group_repl_create_group_from_src(
+                self.ctxt, TEST_GROUP[0], [volume], None, [source])
+        clone.assert_called_once_with(volume, source)
+        local_copy.assert_not_called()
+        self.assertEqual(
+            json.dumps({'sldev': 51}), volumes_update[0]['provider_location'])
+
+    def test_ac16_create_group_from_src_source_on_neither_site_raises(self):
+        common = self._common()
+        source = self._svol_only_volume(10)
+        with self._label_stub(common.rep_primary, None), \
+                self._label_stub(common.rep_secondary, None), \
+                mock.patch.object(
+                    common.rep_primary, 'copy_on_storage') as local_copy, \
+                self._clone_peer_patches(common) as peer:
+            self.assertRaises(
+                exception.VolumeDriverException,
+                common._group_repl_create_group_from_src,
+                self.ctxt, TEST_GROUP[0], [TEST_VOLUME[1]], None, [source])
+        local_copy.assert_not_called()
+        for method in peer.values():
+            method.assert_not_called()
+
+    def _manageable_on(self, site):
+        """Make site report an LDEV that the adoption checks accept."""
+        site._pair_targets = [(CONFIG_MAP['port_id'], 5)]
+        site._PAIR_TARGET_NAME = 'HBSD-pair00'
+        return mock.patch.object(
+            site, 'get_ldev_info',
+            return_value=self._adopt_ldev_info(ports=[self._port()]))
+
+    def _manage_peer_patches(self, common):
+        return mock.patch.multiple(
+            common.rep_secondary, get_ldev_by_name=mock.DEFAULT,
+            get_ldev_info=mock.DEFAULT, modify_ldev_name=mock.DEFAULT,
+            get_ldev_size_in_gigabyte=mock.DEFAULT)
+
+    def test_ac17_group_manage_adopts_from_a_local_svol_side(self):
+        common = self._common()
+        volume = self._bound_volume()
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value=self._svol_copy_grp('CGBOUND')), \
+                mock.patch.object(
+                    common.rep_secondary.client,
+                    'get_remote_copy_grp') as peer_read, \
+                mock.patch.object(
+                    common.rep_primary, 'get_ldev_by_name',
+                    return_value=7) as by_name, \
+                self._manageable_on(common.rep_primary), \
+                mock.patch.object(
+                    common.rep_primary, 'modify_ldev_name') as relabel, \
+                mock.patch.object(
+                    common.rep_primary, 'get_qos_specs_from_ldev',
+                    return_value=None), \
+                mock.patch.object(
+                    hbsd_utils, 'get_qos_specs_from_volume',
+                    return_value=None), \
+                self._manage_peer_patches(common) as peer:
+            model_update = common.manage_existing(
+                volume, self.test_existing_ref_name)
+        for method in peer.values():
+            method.assert_not_called()
+        peer_read.assert_not_called()
+        by_name.assert_called_once_with(
+            self.test_existing_ref_name['source-name'].replace('-', ''))
+        relabel.assert_called_once_with(7, volume.id.replace('-', ''))
+        self.assertEqual(
+            json.dumps({'sldev': 7}), model_update['provider_location'])
+
+    def test_ac17_group_manage_adopts_from_a_confirmed_peer_svol_side(self):
+        common = self._common()
+        volume = self._bound_volume()
+        peer_grp = self._svol_copy_grp('CGBOUND')
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value=self._svol_side_not_here()), \
+                mock.patch.object(
+                    common.rep_secondary.client, 'get_remote_copy_grp',
+                    return_value=peer_grp) as peer_read, \
+                mock.patch.object(
+                    common.rep_secondary, 'get_ldev_by_name',
+                    return_value=7), \
+                self._manageable_on(common.rep_secondary), \
+                mock.patch.object(
+                    common.rep_secondary, 'modify_ldev_name') as relabel, \
+                mock.patch.object(
+                    common.rep_secondary, 'get_qos_specs_from_ldev',
+                    return_value=None), \
+                mock.patch.object(
+                    hbsd_utils, 'get_qos_specs_from_volume',
+                    return_value=None), \
+                mock.patch.object(
+                    common.rep_primary, 'modify_ldev_name') as local_relabel:
+            common.manage_existing(volume, self.test_existing_ref_name)
+        peer_read.assert_called_once_with(
+            None, 'CGBOUND', is_secondary=True)
+        relabel.assert_called_once_with(7, volume.id.replace('-', ''))
+        local_relabel.assert_not_called()
+
+    @ddt.data(
+        exception.VolumeDriverException(data='not on this array'),
+        None)
+    def test_ac17_group_manage_raises_unless_a_site_holds_the_copy_group(
+            self, rep_primary_error):
+        """Found on neither array (None), or neither array answers."""
+        common = self._common()
+        volume = self._bound_volume()
+        local = (mock.patch.object(
+            common.rep_primary.client, 'get_remote_copy_grp',
+            side_effect=rep_primary_error) if rep_primary_error else
+            mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value=self._svol_side_not_here()))
+        with local, \
+                mock.patch.object(
+                    common.rep_secondary.client, 'get_remote_copy_grp',
+                    side_effect=exception.VolumeDriverException(
+                        data='not here')), \
+                mock.patch.object(
+                    common.rep_primary, 'modify_ldev_name') as local_relabel, \
+                self._manage_peer_patches(common) as peer:
+            self.assertRaises(
+                exception.ManageExistingInvalidReference,
+                common.manage_existing, volume, self.test_existing_ref_name)
+        for method in peer.values():
+            method.assert_not_called()
+        local_relabel.assert_not_called()
+
+    def test_ac17_group_manage_get_size_reads_the_local_svol_side(self):
+        common = self._common()
+        volume = self._bound_volume()
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value=self._svol_copy_grp('CGBOUND')), \
+                mock.patch.object(
+                    common.rep_primary, 'get_ldev_by_name', return_value=7), \
+                mock.patch.object(
+                    common.rep_primary, 'get_ldev_size_in_gigabyte',
+                    return_value=10) as size, \
+                self._manage_peer_patches(common) as peer:
+            self.assertEqual(
+                10, common.manage_existing_get_size(
+                    volume, self.test_existing_ref_name))
+        for method in peer.values():
+            method.assert_not_called()
+        size.assert_called_once_with(7, self.test_existing_ref_name)
+
+    def _unmanage_patches(self, common):
+        return (
+            mock.patch.object(common.rep_primary, 'modify_ldev_name'),
+            mock.patch.object(common.rep_secondary, 'modify_ldev_name'))
+
+    def test_ac18_group_unmanage_clears_a_local_svol_nickname_locally(self):
+        common = self._common()
+        volume = self._bound_volume(sldev=8)
+        local_patch, peer_patch = self._unmanage_patches(common)
+        with self._label_stub(common.rep_primary, self._label_of(volume)), \
+                self._label_stub(common.rep_secondary, None), \
+                local_patch as local_clear, peer_patch as remote_clear:
+            common.unmanage(volume)
+        local_clear.assert_called_once_with(8, '')
+        remote_clear.assert_not_called()
+
+    def test_ac19_group_unmanage_on_neither_site_skips_the_clear(self):
+        common = self._common()
+        volume = self._bound_volume(sldev=8)
+        local_patch, peer_patch = self._unmanage_patches(common)
+        with self._label_stub(common.rep_primary, None), \
+                self._label_stub(common.rep_secondary, None), \
+                local_patch as local_clear, peer_patch as remote_clear:
+            common.unmanage(volume)
+        local_clear.assert_not_called()
+        remote_clear.assert_not_called()
+
+    def test_ac20_group_unmanage_raises_when_the_lookup_errors(self):
+        common = self._common()
+        volume = self._bound_volume(sldev=8)
+        down = exception.VolumeDriverException(data='down')
+        local_patch, peer_patch = self._unmanage_patches(common)
+        with self._label_stub(common.rep_primary, down), \
+                self._label_stub(common.rep_secondary, down), \
+                local_patch as local_clear, peer_patch as remote_clear:
+            self.assertRaises(
+                exception.VolumeDriverException, common.unmanage, volume)
+        local_clear.assert_not_called()
+        remote_clear.assert_not_called()
+
+    def test_ac18_group_unmanage_failed_clear_is_logged_not_raised(self):
+        common = self._common()
+        volume = self._bound_volume(sldev=8)
+        with self._label_stub(common.rep_primary, self._label_of(volume)), \
+                self._label_stub(common.rep_secondary, None), \
+                mock.patch.object(
+                    common.rep_primary, 'modify_ldev_name',
+                    side_effect=exception.VolumeDriverException(
+                        data='x')) as local_clear, \
+                mock.patch.object(
+                    common.rep_secondary, 'modify_ldev_name') as remote_clear:
+            common.unmanage(volume)
+        local_clear.assert_called_once_with(8, '')
+        remote_clear.assert_not_called()
+
+    def test_ac25_psr_dr_contract_is_unchanged(self):
+        self.assertEqual(
+            'group_replication_pairs', hbsd_replication._PAIR_STATUS_KEY)
+        self.assertEqual(
+            'group_replication_pairs_updated_at',
+            hbsd_replication._PAIR_STATUS_UPDATED_KEY)
+        self.assertEqual(
+            'group_replication_peer_initialized',
+            hbsd_replication._PAIR_STATUS_PEER_KEY)
+        self.assertEqual(
+            'group_replication_pairs_enumerated',
+            hbsd_replication._PAIR_STATUS_ENUMERATED_KEY)
+        for mode in ('graceful', 'emergency'):
+            self.assertEqual(
+                ('backend2', mode),
+                hbsd_replication._parse_failover_target('backend2:' + mode))
+        self.assertEqual(
+            (hbsd_replication._REP_FAILBACK, None),
+            hbsd_replication._parse_failover_target(
+                hbsd_replication._REP_FAILBACK))
+
+    def test_ac26_attaching_a_local_svol_still_raises_other_site_error(self):
+        """Known gap: attaching a local S-VOL fails.
+
+        Pinned so that fixing it is deliberate.
+        """
+        common = self._common()
+        exc = self.assertRaises(
+            exception.VolumeDriverException, common.initialize_connection,
+            self._svol_only_volume(9), DEFAULT_CONNECTOR)
+        self.assertIn('exists in the other site', str(exc))
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_ac26_failback_still_resyncs_through_rep_secondary(
+            self, get_group_type_specs):
+        """Known gap: failback always resyncs through rep_secondary."""
+        common = self._common()
+        copy_group_name = common._create_group_copy_group_name(
+            TEST_GROUP[0].id)
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value=self._svol_copy_grp(copy_group_name)), \
+                mock.patch.object(
+                    common.rep_secondary.client,
+                    'resync_remote_copy_grp') as resync, \
+                mock.patch.object(common, '_wait_pair_status_change'):
+            model_update, _ = common.failover_replication(
+                self.ctxt, TEST_GROUP[0], [TEST_VOLUME[4]],
+                secondary_backend_id=hbsd_replication._REP_FAILBACK)
+        resync.assert_called_once_with(
+            common.rep_primary.client, copy_group_name,
+            common.driver_info['rep_type_async'], swap=True,
+            is_secondary=True)
+        self.assertEqual(
+            {'replication_status': fields.ReplicationStatus.ENABLED},
+            model_update)
+
+    def _both_directions(self, common):
+        """TEST_GROUP[0], whose S side is local, and a group of the peer's.
+
+        TEST_GROUP[1] cannot be the second group: copy group names keep
+        only the head of a group id, and its id differs from [0] in the
+        tail.
+        """
+        peer_group = fake_group.fake_group_obj(
+            CTXT, id='21000000-0000-0000-0000-000000000001',
+            status='available')
+        local_cg = common._create_group_copy_group_name(TEST_GROUP[0].id)
+        peer_cg = common._create_group_copy_group_name(peer_group.id)
+
+        def svol_side(remote_client, copy_group_name, is_secondary=False,
+                      **kwargs):
+            if copy_group_name == local_cg:
+                return self._svol_copy_grp(copy_group_name)
+            return self._svol_side_not_here()
+        return peer_group, local_cg, peer_cg, mock.patch.object(
+            common.rep_primary.client, 'get_remote_copy_grp',
+            side_effect=svol_side)
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_ac28_failover_replication_serves_both_directions(
+            self, get_group_type_specs):
+        common = self._common()
+        peer_group, local_cg, peer_cg, svol_side = self._both_directions(
+            common)
+        with svol_side, \
+                mock.patch.object(
+                    common.rep_primary.client,
+                    'takeover_remote_copy_grp') as local_takeover, \
+                mock.patch.object(
+                    common.rep_secondary.client,
+                    'takeover_remote_copy_grp') as peer_takeover, \
+                mock.patch.object(common, '_wait_pair_status_change'):
+            local_update, _ = common.failover_replication(
+                self.ctxt, TEST_GROUP[0], [self._svol_only_volume(40)])
+            peer_update, _ = common.failover_replication(
+                self.ctxt, peer_group, [TEST_VOLUME[4]])
+        local_takeover.assert_called_once_with(None, local_cg)
+        peer_takeover.assert_called_once_with(None, peer_cg)
+        failed_over = {
+            'replication_status': fields.ReplicationStatus.FAILED_OVER}
+        self.assertEqual(failed_over, local_update)
+        self.assertEqual(failed_over, peer_update)
+
+    def test_ac28_list_replication_targets_serves_both_directions(self):
+        common = self._common()
+        peer_group, local_cg, peer_cg, svol_side = self._both_directions(
+            common)
+        with svol_side, \
+                mock.patch.object(
+                    common.rep_primary.client, 'get_remote_copy_grps',
+                    return_value=[{'copyGroupName': peer_cg}]) as list_grps:
+            local_ret = common.list_replication_targets(
+                self.ctxt, TEST_GROUP[0])
+            peer_ret = common.list_replication_targets(
+                self.ctxt, peer_group)
+        targets = {'replication_targets': [
+            {'backend_id': common.rep_secondary_backend_id}]}
+        self.assertEqual(targets, local_ret)
+        self.assertEqual(targets, peer_ret)
+        list_grps.assert_called_once_with(common.rep_secondary.client)
+
+    def test_ac28_group_delete_removes_each_member_where_it_lives(self):
+        """An adopted local member and a paired member on one backend."""
+        common = self._common()
+        adopted = self._svol_only_volume(20)
+        with self._label_stub(common.rep_primary, self._label_of(adopted)), \
+                self._label_stub(common.rep_secondary, None), \
+                mock.patch.object(
+                    common.rep_primary.client,
+                    'delete_remote_copypair') as delete_pair, \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev') as local_delete, \
+                mock.patch.object(
+                    common.rep_primary, 'delete_volume') as local_volume, \
+                mock.patch.object(
+                    common.rep_secondary, 'delete_volume') as remote_volume:
+            adopted_update = common._group_repl_delete_group_volume(
+                TEST_GROUP[0], adopted, 'CGL')
+            paired_update = common._group_repl_delete_group_volume(
+                TEST_GROUP[1], TEST_VOLUME[4], 'CGP')
+        local_delete.assert_called_once_with(20, mock.ANY)
+        delete_pair.assert_called_once_with(
+            common.rep_secondary.client, 'CGP', 4, 4)
+        remote_volume.assert_called_once_with(TEST_VOLUME[4])
+        local_volume.assert_called_once_with(TEST_VOLUME[4])
+        self.assertEqual('deleted', adopted_update['status'])
+        self.assertEqual('deleted', paired_update['status'])
+
+    # ------------------------------------------------------------------
+    # Error and edge paths of the two lookups.
+    # ------------------------------------------------------------------
+
+    def test_ac11_sldev_owner_found_locally_without_a_peer(self):
+        """The peer never initialized; the adopted S-VOL is still here."""
+        common = self._common()
+        volume = self._svol_only_volume(9)
+        common.rep_secondary = None
+        with self._label_stub(common.rep_primary, self._label_of(volume)):
+            site, _ = common._resolve_sldev_owner(volume)
+        self.assertIs(common.rep_primary, site)
+
+    def test_ac20_delete_volume_reraises_a_local_delete_error(self):
+        common = self._common()
+        volume = self._svol_only_volume(9)
+        with self._label_stub(common.rep_primary, self._label_of(volume)), \
+                self._label_stub(common.rep_secondary, None), \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev',
+                    side_effect=exception.VolumeDriverException(
+                        data='array error')):
+            self.assertRaises(
+                exception.VolumeDriverException, common.delete_volume,
+                volume)
+
+    def test_ac15_delete_group_snapshot_splits_mixed_owners(self):
+        """One S-VOL here, one on the peer: each is deleted where it is."""
+        common = self._common()
+        local = self._snapshot_of(TEST_VOLUME[0], sldev=33)
+        remote = self._snapshot_of(
+            TEST_VOLUME[1], sldev=34,
+            snapshot_id='10000000-0000-0000-0000-000000000098')
+
+        def ldev_info(site_label):
+            def answer(keys, ldev):
+                return dict(GET_LDEV_RESULT, label=site_label.get(
+                    ldev, 'f' * 32))
+            return answer
+        with mock.patch.object(
+                common.rep_primary, 'get_ldev_info',
+                side_effect=ldev_info({33: self._label_of(local)})), \
+                mock.patch.object(
+                    common.rep_secondary, 'get_ldev_info',
+                    side_effect=ldev_info({34: self._label_of(remote)})), \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev') as local_delete, \
+                mock.patch.object(
+                    common.rep_secondary,
+                    'delete_snapshot') as remote_delete, \
+                mock.patch.object(
+                    common.rep_secondary, '_delete_group') as remote_group:
+            model_update, snapshots_update = (
+                common._group_repl_delete_group_snapshot(
+                    TEST_GROUP_SNAP[0], [local, remote]))
+        local_delete.assert_called_once_with(33, mock.ANY)
+        remote_delete.assert_called_once_with(remote)
+        remote_group.assert_not_called()
+        self.assertEqual(
+            {'status': TEST_GROUP_SNAP[0].status}, model_update)
+        self.assertEqual(
+            [{'id': local.id, 'status': 'deleted'},
+             {'id': remote.id, 'status': 'deleted'}], snapshots_update)
+
+    def test_ac15_delete_group_snapshot_reports_a_busy_local_svol(self):
+        common = self._common()
+        snapshot = self._snapshot_of(TEST_VOLUME[0], sldev=33)
+        with self._label_stub(
+                common.rep_primary, self._label_of(snapshot)), \
+                self._label_stub(common.rep_secondary, None), \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev',
+                    side_effect=exception.VolumeDriverException(
+                        hbsd_utils.BUSY_MESSAGE)):
+            model_update, snapshots_update = (
+                common._group_repl_delete_group_snapshot(
+                    TEST_GROUP_SNAP[0], [snapshot]))
+        self.assertEqual({'status': 'error'}, model_update)
+        self.assertEqual(
+            [{'id': snapshot.id, 'status': 'available'}], snapshots_update)
+
+    def test_ac8_first_poll_with_the_listing_down_reports_nothing(self):
+        """No cache and no local S side leaves enumerated false."""
+        common = self._common()
+        self._pair_status_on()
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grps',
+                side_effect=exception.VolumeDriverException(data='down')):
+            capabilities = common._pair_status_capabilities()
+        self.assertEqual(
+            {hbsd_replication._PAIR_STATUS_PEER_KEY: True,
+             hbsd_replication._PAIR_STATUS_ENUMERATED_KEY: False},
+            capabilities)
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_ac20_enable_replication_adopt_errors_when_the_peer_fails(
+            self, get_group_type_specs):
+        """rep_primary says no; the peer then cannot be read."""
+        common = self._common()
+        volume = self._svol_only_volume(40)
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value=self._svol_side_not_here()), \
+                mock.patch.object(
+                    common.rep_secondary.client, 'get_remote_copy_grp',
+                    side_effect=exception.VolumeDriverException(data='x')):
+            _, volumes_update = common.enable_replication(
+                self.ctxt, TEST_GROUP[0], [volume])
+        self.assertEqual(
+            [{'id': volume.id,
+              'replication_status': fields.ReplicationStatus.ERROR}],
+            volumes_update)
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_ac7_enable_replication_errors_a_member_not_in_the_group(
+            self, get_group_type_specs):
+        common = self._common()
+        volume = self._svol_only_volume(40)
+        copy_group_name = common._create_group_copy_group_name(
+            TEST_GROUP[0].id)
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value=self._svol_copy_grp(
+                    copy_group_name, [{'svolLdevId': 41}])):
+            model_update, volumes_update = common.enable_replication(
+                self.ctxt, TEST_GROUP[0], [volume])
+        error = fields.ReplicationStatus.ERROR
+        self.assertEqual({'replication_status': error}, model_update)
+        self.assertEqual(
+            [{'id': volume.id, 'replication_status': error}],
+            volumes_update)
+
+    def test_ac16_create_group_from_src_removes_its_clones_on_failure(self):
+        """A failed second clone takes the first one back off its site.
+
+        The cleanup's own failure is logged; the clone error propagates.
+        """
+        common = self._common()
+        sources = [self._svol_only_volume(10), self._svol_only_volume(
+            11, volume_id='00000000-0000-0000-0000-000000000098')]
+
+        def ldev_info(keys, ldev):
+            source = sources[ldev - 10]
+            return dict(GET_LDEV_RESULT, label=self._label_of(source))
+        with mock.patch.object(
+                common.rep_primary, 'get_ldev_info', side_effect=ldev_info), \
+                self._label_stub(common.rep_secondary, None), \
+                mock.patch.object(
+                    common.rep_primary, 'get_volume_extra_specs',
+                    return_value={}), \
+                mock.patch.object(
+                    hbsd_utils, 'get_qos_specs_from_volume',
+                    return_value=None), \
+                mock.patch.object(
+                    common.rep_primary, 'copy_on_storage',
+                    side_effect=[50, exception.VolumeDriverException(
+                        'copy failed')]), \
+                mock.patch.object(common.rep_primary, 'modify_ldev_name'), \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev',
+                    side_effect=exception.VolumeDriverException(
+                        'cleanup failed')) as cleanup:
+            exc = self.assertRaises(
+                exception.VolumeDriverException,
+                common._group_repl_create_group_from_src,
+                self.ctxt, TEST_GROUP[0], [TEST_VOLUME[1], TEST_VOLUME[2]],
+                None, sources)
+        cleanup.assert_called_once_with(50)
+        self.assertIn('copy failed', str(exc))
+
+    def test_ac19_group_unmanage_of_a_volume_without_svol_asks_nobody(self):
+        """No S-VOL, so no site is asked and nothing is raised."""
+        common = self._common()
+        volume = self._bound_volume()
+        with mock.patch.object(
+                common.rep_primary, 'get_ldev_info') as local_info, \
+                mock.patch.object(
+                    common.rep_secondary, 'get_ldev_info') as peer_info:
+            common.unmanage(volume)
+        local_info.assert_not_called()
+        peer_info.assert_not_called()
+
+    @ddt.data(True, False)
+    def test_ac6_list_replication_targets_of_a_failed_over_backend(
+            self, found):
+        """A failed-over backend reads the peer's S side."""
+        common = self._common()
+        common._active_backend_id = common.rep_secondary.backend_id
+        copy_group_name = common._create_group_copy_group_name(
+            TEST_GROUP[0].id)
+        answer = ({'return_value': self._svol_copy_grp(copy_group_name)}
+                  if found else
+                  {'side_effect': exception.VolumeDriverException(data='x')})
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp') as local, \
+                mock.patch.object(
+                    common.rep_secondary.client, 'get_remote_copy_grp',
+                    **answer) as peer:
+            ret = common.list_replication_targets(self.ctxt, TEST_GROUP[0])
+        local.assert_not_called()
+        peer.assert_called_once_with(None, copy_group_name, is_secondary=True)
+        self.assertEqual(
+            {'replication_targets': (
+                [{'backend_id': common.rep_secondary_backend_id}] if found
+                else [])}, ret)
 
 
 # Shorthand alias
