@@ -79,6 +79,7 @@ Beyond the eight entry points:
 | S side found per copy group — adoption, failover, pair status and target listing find which array holds each copy group's S side; a volume with only an S-VOL is found on the array whose LDEV carries its label | `_copy_group_svol_side()` / `_resolve_sldev_owner()` |
 | Per-copy-group pair state in `update_volume_stats()` capabilities — **off by default**, see `hitachi_replication_report_pair_status` | `_pair_status_capabilities()` |
 | Graceful vs emergency failover (`split` vs `takeover ... forceSplit`) | `_failover_mode()` |
+| Attach and detach of an adopted S-VOL on the array holding it; attach needs its copy group taken over (SSWS) or its pair gone | `_local_adopted_svol()` / `_check_adopted_svol_writable()` |
 
 ---
 

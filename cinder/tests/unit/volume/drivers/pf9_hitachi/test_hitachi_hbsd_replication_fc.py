@@ -5630,16 +5630,80 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             hbsd_replication._parse_failover_target(
                 hbsd_replication._REP_FAILBACK))
 
-    def test_ac26_attaching_a_local_svol_still_raises_other_site_error(self):
-        """Known gap: attaching a local S-VOL fails.
+    def _adopted_here(self, common, volume, paired=False):
+        """Label volume's LDEV on rep_primary only, in a pair if paired."""
+        attributes = GET_LDEV_RESULT['attributes'] + (
+            [hbsd_rest.REP_ATTR] if paired else [])
+        return (
+            mock.patch.object(
+                common.rep_primary, 'get_ldev_info',
+                return_value=dict(GET_LDEV_RESULT, attributes=attributes,
+                                  label=self._label_of(volume))),
+            self._label_stub(common.rep_secondary, None))
 
-        Pinned so that fixing it is deliberate.
-        """
+    def _local_pair(self, common, svol_status):
+        return mock.patch.object(
+            common.rep_primary.client, 'get_remote_copy_grp',
+            return_value=self._svol_copy_grp(
+                'CGBOUND', [{'svolLdevId': 9, 'svolStatus': svol_status}]))
+
+    def test_attaching_a_local_svol_maps_its_ldev_here(self):
         common = self._common()
-        exc = self.assertRaises(
-            exception.VolumeDriverException, common.initialize_connection,
-            self._svol_only_volume(9), DEFAULT_CONNECTOR)
+        volume = self._bound_volume(sldev=9)
+        here, peer = self._adopted_here(common, volume)
+        with here, peer, mock.patch.object(
+                common.rep_primary, 'initialize_connection',
+                return_value='conn_info') as attach:
+            self.assertEqual(
+                'conn_info',
+                common.initialize_connection(volume, DEFAULT_CONNECTOR))
+        self.assertEqual(
+            9, common.rep_primary.get_ldev(attach.call_args[0][0]))
+        self.assertEqual(json.dumps({'sldev': 9}), volume.provider_location)
+
+    def test_attaching_a_taken_over_local_svol_maps_it_here(self):
+        common = self._common()
+        volume = self._bound_volume(sldev=9)
+        here, peer = self._adopted_here(common, volume, paired=True)
+        with here, peer, self._local_pair(common, 'SSWS'), \
+                mock.patch.object(
+                    common.rep_primary, 'initialize_connection') as attach:
+            common.initialize_connection(volume, DEFAULT_CONNECTOR)
+        attach.assert_called_once()
+
+    def test_attaching_a_still_paired_local_svol_raises(self):
+        common = self._common()
+        volume = self._bound_volume(sldev=9)
+        here, peer = self._adopted_here(common, volume, paired=True)
+        with here, peer, self._local_pair(common, 'PAIR'), \
+                mock.patch.object(
+                    common.rep_primary, 'initialize_connection') as attach:
+            exc = self.assertRaises(
+                exception.VolumeDriverException,
+                common.initialize_connection, volume, DEFAULT_CONNECTOR)
+        self.assertIn('is in a remote replication pair', str(exc))
+        attach.assert_not_called()
+
+    def test_attaching_an_svol_on_the_peer_raises_other_site_error(self):
+        common = self._common()
+        volume = self._svol_only_volume(9)
+        with self._label_stub(common.rep_primary, None), \
+                self._label_stub(common.rep_secondary,
+                                 self._label_of(volume)):
+            exc = self.assertRaises(
+                exception.VolumeDriverException, common.initialize_connection,
+                volume, DEFAULT_CONNECTOR)
         self.assertIn('exists in the other site', str(exc))
+
+    def test_detaching_a_paired_local_svol_unmaps_it_here(self):
+        common = self._common()
+        volume = self._bound_volume(sldev=9)
+        here, peer = self._adopted_here(common, volume, paired=True)
+        with here, peer, mock.patch.object(
+                common.rep_primary, 'terminate_connection') as detach:
+            common.terminate_connection(volume, DEFAULT_CONNECTOR)
+        self.assertEqual(
+            9, common.rep_primary.get_ldev(detach.call_args[0][0]))
 
     @mock.patch.object(group_types, 'get_group_type_specs',
                        return_value='<is> True')

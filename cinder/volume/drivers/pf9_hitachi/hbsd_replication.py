@@ -520,6 +520,16 @@ def _svol_of(obj):
     return int(loc['sldev'])
 
 
+def _as_local_ldev(volume, ldev):
+    """An unsaved copy of volume whose provider_location names ldev as local.
+
+    The base connection code finds a volume's LDEV only by the pldev key.
+    """
+    local = volume.obj_clone()
+    local.provider_location = _pack_rep_provider_location(pldev=ldev)
+    return local
+
+
 def _get_failover_volume_update(volumes, failover_success_volumes):
     volume_updates = []
     for volume in volumes:
@@ -1613,6 +1623,42 @@ class HBSDREPLICATION(rest.HBSDREST):
                 obj_id=obj.id, ldev=ldev)
             self.raise_error(msg)
 
+    def _local_adopted_svol(self, volume):
+        """Return (ldev, ldev_info) if volume is an S-VOL adopted here.
+
+        Its provider_location matches a clone of a peer S-VOL, so only the
+        LDEV label tells them apart; anything else returns (None, None).
+        """
+        if (self._active_backend_id or
+                not isinstance(volume, cinder_volume.Volume) or
+                _get_ldev_site(volume) != _SECONDARY):
+            return None, None
+        site, ldev_info = self._resolve_sldev_owner(volume)
+        if site is not self.rep_primary:
+            return None, None
+        return _svol_of(volume), ldev_info
+
+    def _check_adopted_svol_writable(self, volume, ldev, ldev_info,
+                                     operation):
+        """Raise unless hosts can write to the adopted S-VOL ldev.
+
+        While its pair exists, only a taken-over (SSWS) S-VOL accepts writes.
+        """
+        if not self._has_rep_pair(
+                ldev, instance=self.rep_primary, ldev_info=ldev_info):
+            return
+        copy_group_name = _volume_copy_group_binding(volume)
+        grp = (self._read_local_svol_copy_grp(copy_group_name)
+               if copy_group_name else None)
+        if any(pair.get('svolLdevId') == ldev and
+               pair.get('svolStatus') == 'SSWS'
+               for pair in (grp or {}).get('copyPairs') or []):
+            return
+        msg = self.rep_primary.output_log(
+            MSG.REPLICATION_PAIR_ERROR, operation=operation,
+            volume=volume.id, snapshot_info='', ldev=ldev)
+        self.raise_error(msg)
+
     def _has_rep_pair(self, ldev, instance=None, ldev_info=None):
         """Return if the specified LDEV has a replication pair.
 
@@ -1991,6 +2037,12 @@ class HBSDREPLICATION(rest.HBSDREST):
             return conn_info
         else:
             self._require_rep_primary()
+            ldev, ldev_info = self._local_adopted_svol(volume)
+            if ldev is not None:
+                self._check_adopted_svol_writable(
+                    volume, ldev, ldev_info, 'initialize volume connection')
+                return self.rep_primary.initialize_connection(
+                    _as_local_ldev(volume, ldev), connector)
             self._verify_ldev(volume, 'initialize volume connection')
             return self._get_active_backend().initialize_connection(
                 volume, connector, is_snapshot=is_snapshot)
@@ -2040,6 +2092,10 @@ class HBSDREPLICATION(rest.HBSDREST):
             return conn_info
         else:
             self._require_rep_primary()
+            ldev, _ = self._local_adopted_svol(volume)
+            if ldev is not None:
+                return self.rep_primary.terminate_connection(
+                    _as_local_ldev(volume, ldev), connector)
             self._verify_ldev(volume, 'terminate volume connection')
             return self._get_active_backend().terminate_connection(
                 volume, connector)
