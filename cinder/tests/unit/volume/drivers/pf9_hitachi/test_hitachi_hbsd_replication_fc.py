@@ -1455,9 +1455,9 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         stats = self.driver.get_volume_stats(True)
         self.assertEqual('Hitachi', stats['vendor_name'])
         self.assertTrue(stats["pools"][0]['multiattach'])
-        # B1: hitachi_replication_report_pair_status defaults to False, so
-        # this no longer makes the extra get_remote_copy_grps call - just
-        # the one GET_POOLS_RESULT request.
+        # hitachi_replication_report_pair_status defaults to False, so
+        # get_remote_copy_grps is not called; the pool query is the only
+        # request.
         self.assertEqual(1, request.call_count)
         self.assertEqual(1, get_filter_function.call_count)
         self.assertEqual(1, get_goodness_function.call_count)
@@ -1467,7 +1467,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertTrue(pool['consistent_group_replication_enabled'])
         self.assertTrue(pool['group_replication_enabled'])
         self.assertTrue(pool[hbsd_replication._PAIR_STATUS_PEER_KEY])
-        # B1: group_replication_pairs itself is only populated when
+        # group_replication_pairs itself is only populated when
         # hitachi_replication_report_pair_status is enabled (see
         # test_update_volume_stats_pair_status_when_enabled and the
         # _pair_status_capabilities cache tests).
@@ -4043,7 +4043,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
     # nothing, so these assert on the LDEV-level calls.
     # ------------------------------------------------------------------
 
-    def test_ac12_delete_volume_deletes_a_local_svol_on_the_local_array(
+    def test_delete_volume_deletes_a_local_svol_on_the_local_array(
             self):
         """rep_primary.delete_volume stays real: it would delete nothing."""
         common = self._common()
@@ -4072,7 +4072,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         remote_delete.assert_called_once_with(volume)
         local_delete.assert_not_called()
 
-    def test_ac13_group_delete_removes_a_local_svol_member_locally(self):
+    def test_group_delete_removes_a_local_svol_member_locally(self):
         """get_ldev stays real: with no pldev, no pair is deleted.
 
         The member's sldev is found on rep_primary by its label.
@@ -4102,7 +4102,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             modify_ldev_name=mock.DEFAULT,
             _create_ctg_snap_pair=mock.DEFAULT)
 
-    def test_ac14_group_snapshot_snaps_local_svols_on_the_local_array(self):
+    def test_group_snapshot_snaps_local_svols_on_the_local_array(self):
         """get_ldev stays real: on rep_primary it reads the pldev key.
 
         It would reject the member as having no LDEV.
@@ -4141,7 +4141,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
               'provider_location': json.dumps({'sldev': 22})}],
             snapshots_update)
 
-    def test_ac15_delete_group_snapshot_removes_local_svols_locally(self):
+    def test_delete_group_snapshot_removes_local_svols_locally(self):
         """rep_primary._delete_group stays real: it would delete nothing.
 
         Its delete_snapshot reads the pldev key.
@@ -4169,11 +4169,11 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             [{'id': snapshot.id, 'status': 'deleted'}], snapshots_update)
 
     # ------------------------------------------------------------------
-    # A3: an adopted S-VOL ({"sldev": N}, no pldev) whose copy group's S
-    # side is local must be promotable, not stuck in ERROR.
+    # An adopted S-VOL ({"sldev": N}, no pldev) whose copy group's S side
+    # is local must be promotable, not stuck in ERROR.
     # ------------------------------------------------------------------
 
-    def test_ac10_get_ldevs_missing_pvol_is_expected_for_a_local_svol(self):
+    def test_get_ldevs_missing_pvol_is_expected_for_a_local_svol(self):
         common = self._common()
         volume = self._svol_only_volume(30)
         with mock.patch.object(
@@ -4196,7 +4196,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             common._get_ldevs(volume)
         primary_log.assert_called_once()
 
-    def test_ac10_get_ldevs_missing_svol_still_warns_for_a_local_svol_side(
+    def test_get_ldevs_missing_svol_still_warns_for_a_local_svol_side(
             self):
         common = self._common()
         volume = TEST_VOLUME[3]  # provider_location is None
@@ -4217,7 +4217,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     @mock.patch.object(group_types, 'get_group_type_specs',
                        return_value='<is> True')
-    def test_ac4_failover_replication_takes_over_a_local_svol_side_locally(
+    def test_failover_replication_takes_over_a_local_svol_side_locally(
             self, get_group_type_specs):
         """rep_secondary is down for the whole failover."""
         common = self._common()
@@ -4274,7 +4274,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             volumes_update[0]['replication_status'])
 
     # ------------------------------------------------------------------
-    # B4: an S-VOL with no matching pair in the copy group must not be
+    # An S-VOL with no matching pair in the copy group must not be
     # silently re-paired (which orphans the old LDEV) - it belongs in
     # wrong_state so the operator sees ERROR.
     # ------------------------------------------------------------------
@@ -4293,11 +4293,6 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual([], replicating)
         self.assertEqual(1, len(wrong_state))
         self.assertEqual(volume, wrong_state[0][0])
-
-    # ------------------------------------------------------------------
-    # B5: enable_replication / _group_repl_update_group report ENABLED on
-    # pair creation and no longer block on _WAIT_PAIR.
-    # ------------------------------------------------------------------
 
     def test_group_repl_update_group_does_not_wait_for_pair(self):
         common = self._common()
@@ -4318,11 +4313,6 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         wait_pair.assert_not_called()
         self.assertEqual(
             [enabled], [u['replication_status'] for u in add_update])
-
-    # ------------------------------------------------------------------
-    # B1: per-copy-group pair status reporting is opt-in and, once on,
-    # cached with a TTL rather than read from the array on every poll.
-    # ------------------------------------------------------------------
 
     def test_update_volume_stats_pair_status_off_by_default(self):
         common = self._common()
@@ -4399,11 +4389,6 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             first[hbsd_replication._PAIR_STATUS_KEY],
             second[hbsd_replication._PAIR_STATUS_KEY])
 
-    # ------------------------------------------------------------------
-    # B2: truncation past the copy-group cap is operator-visible and
-    # marks the report as not fully enumerated.
-    # ------------------------------------------------------------------
-
     def test_pair_status_capabilities_truncation_marks_not_enumerated(self):
         common = self._common()
         self.override_config(
@@ -4425,10 +4410,6 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertFalse(
             capabilities[hbsd_replication._PAIR_STATUS_ENUMERATED_KEY])
         warn.assert_called()
-
-    # ------------------------------------------------------------------
-    # B3: per-group read failures are reported once, not once per group.
-    # ------------------------------------------------------------------
 
     def test_pair_status_capabilities_batches_group_read_failures(self):
         common = self._common()
@@ -4618,7 +4599,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                 40, common._pool_id_for(common.rep_secondary, TEST_VOLUME[0]))
         resolve.assert_not_called()
 
-    def test_ac14_group_snapshot_uses_the_local_pool_for_a_local_svol(self):
+    def test_group_snapshot_uses_the_local_pool_for_a_local_svol(self):
         common = self._common()
         member = self._svol_only_volume(11)
         common.rep_primary.storage_info['pool_id'] = [30, 31]
@@ -4703,12 +4684,12 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             ret)
 
     # ------------------------------------------------------------------
-    # hitachi_replication_role is gone. Which site holds a copy group's S
-    # side, and which holds an sldev-only object, is read from the
-    # storage systems when it is needed.
+    # Which site holds a copy group's S side, and which holds an
+    # sldev-only object, is read from the storage systems when it is
+    # needed.
     # ------------------------------------------------------------------
 
-    def test_ac1_no_replication_role_option_or_role_helpers(self):
+    def test_no_replication_role_option_or_role_helpers(self):
         self.assertEqual(
             [], [opt.name for opt in hbsd_replication.COMMON_REPLICATION_OPTS
                  if opt.name == 'hitachi_replication_role'])
@@ -4717,7 +4698,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                      '_require_svol_instance'):
             self.assertFalse(hasattr(common, name), name)
 
-    def test_ac2_leftover_role_line_in_cinder_conf_is_ignored(self):
+    def test_leftover_role_line_in_cinder_conf_is_ignored(self):
         fd, path = tempfile.mkstemp(suffix='.conf')
         self.addCleanup(os.remove, path)
         with os.fdopen(fd, 'w') as conf_file:
@@ -4733,7 +4714,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             cfg.NoSuchOptError, getattr, parsed.hitachi_dr,
             'hitachi_replication_role')
 
-    def test_ac3_svol_side_is_local_when_rep_primary_holds_it(self):
+    def test_svol_side_is_local_when_rep_primary_holds_it(self):
         common = self._common()
         grp = self._svol_copy_grp('CGL')
         with mock.patch.object(
@@ -4751,7 +4732,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                 hbsd_replication._MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST])
         peer.assert_not_called()
 
-    def test_ac3_svol_side_not_on_rep_primary_is_the_peer_unasked(self):
+    def test_svol_side_not_on_rep_primary_is_the_peer_unasked(self):
         common = self._common()
         with mock.patch.object(
                 common.rep_primary.client, 'get_remote_copy_grp',
@@ -4765,7 +4746,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         local.assert_called_once()
         peer.assert_not_called()
 
-    def test_ac3_svol_side_asks_the_peer_when_rep_primary_errors(self):
+    def test_svol_side_asks_the_peer_when_rep_primary_errors(self):
         common = self._common()
         grp = self._svol_copy_grp('CGP')
         with mock.patch.object(
@@ -4779,7 +4760,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                 common._copy_group_svol_side('CGP'))
         peer.assert_called_once_with(None, 'CGP', is_secondary=True)
 
-    def test_ac3_svol_side_is_unknown_when_neither_site_confirms(self):
+    def test_svol_side_is_unknown_when_neither_site_confirms(self):
         common = self._common()
         with mock.patch.object(
                 common.rep_primary.client, 'get_remote_copy_grp',
@@ -4795,7 +4776,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                 hbsd_utils.HBSDMsg.GROUP_REPLICATION_SIDE_UNKNOWN),
             str(exc))
 
-    def test_ac3_svol_side_is_unknown_when_the_peer_is_not_initialized(self):
+    def test_svol_side_is_unknown_when_the_peer_is_not_initialized(self):
         common = self._common()
         common.rep_secondary = None
         with mock.patch.object(
@@ -4805,7 +4786,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                 exception.VolumeDriverException,
                 common._copy_group_svol_side, 'CG')
 
-    def test_ac3_svol_side_of_a_failed_over_backend_is_the_peer(self):
+    def test_svol_side_of_a_failed_over_backend_is_the_peer(self):
         common = self._common()
         common._active_backend_id = common.rep_secondary.backend_id
         with mock.patch.object(
@@ -4820,7 +4801,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         peer.assert_not_called()
 
     @mock.patch.object(requests.Session, "request")
-    def test_ac3_not_found_reply_is_returned_not_raised(self, request):
+    def test_not_found_reply_is_returned_not_raised(self, request):
         """The REST client hands KART30013-E back rather than raising it."""
         request.return_value = FakeResponse(404, dict(
             ERROR_RESULT,
@@ -4832,14 +4813,14 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual(1, request.call_count)
         self.assertIn('/remote-mirror-copygroups/', request.call_args[0][1])
 
-    def test_ac3_not_found_message_id_matches_the_rest_client(self):
+    def test_not_found_message_id_matches_the_rest_client(self):
         self.assertEqual(
             hbsd_rest_api.MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST,
             hbsd_replication._MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST)
 
     @mock.patch.object(group_types, 'get_group_type_specs',
                        return_value='<is> True')
-    def test_ac5_failover_replication_takes_over_the_peer_with_local_down(
+    def test_failover_replication_takes_over_the_peer_with_local_down(
             self, get_group_type_specs):
         common = self._common()
         copy_group_name = common._create_group_copy_group_name(
@@ -4865,7 +4846,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     @mock.patch.object(group_types, 'get_group_type_specs',
                        return_value='<is> True')
-    def test_ac20_failover_replication_raises_when_the_side_is_unknown(
+    def test_failover_replication_raises_when_the_side_is_unknown(
             self, get_group_type_specs):
         common = self._common()
         down = exception.VolumeDriverException(data='down')
@@ -4886,7 +4867,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         local_takeover.assert_not_called()
         peer['takeover_remote_copy_grp'].assert_not_called()
 
-    def test_ac6_list_replication_targets_reads_a_local_svol_side(self):
+    def test_list_replication_targets_reads_a_local_svol_side(self):
         common = self._common()
         copy_group_name = common._create_group_copy_group_name(
             TEST_GROUP[0].id)
@@ -4902,7 +4883,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             {'replication_targets': [
                 {'backend_id': common.rep_secondary_backend_id}]}, ret)
 
-    def test_ac6_list_replication_targets_lists_via_the_peer_otherwise(self):
+    def test_list_replication_targets_lists_via_the_peer_otherwise(self):
         common = self._common()
         copy_group_name = common._create_group_copy_group_name(
             TEST_GROUP[0].id)
@@ -4919,7 +4900,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             {'replication_targets': [
                 {'backend_id': common.rep_secondary_backend_id}]}, ret)
 
-    def test_ac6_list_replication_targets_raises_when_the_lookup_errors(
+    def test_list_replication_targets_raises_when_the_lookup_errors(
             self):
         common = self._common()
         with mock.patch.object(
@@ -4939,7 +4920,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     @mock.patch.object(group_types, 'get_group_type_specs',
                        return_value='<is> True')
-    def test_ac7_enable_replication_adopts_from_a_local_svol_side(
+    def test_enable_replication_adopts_from_a_local_svol_side(
             self, get_group_type_specs):
         common = self._common()
         volume = self._svol_only_volume(40)
@@ -4968,7 +4949,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     @mock.patch.object(group_types, 'get_group_type_specs',
                        return_value='<is> True')
-    def test_ac7_enable_replication_adopts_from_a_peer_svol_side(
+    def test_enable_replication_adopts_from_a_peer_svol_side(
             self, get_group_type_specs):
         common = self._common()
         volume = self._svol_only_volume(40)
@@ -4990,7 +4971,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     @mock.patch.object(group_types, 'get_group_type_specs',
                        return_value='<is> True')
-    def test_ac20_enable_replication_adopt_marks_members_error_if_unknown(
+    def test_enable_replication_adopt_marks_members_error_if_unknown(
             self, get_group_type_specs):
         common = self._common()
         volume = self._svol_only_volume(40)
@@ -5014,7 +4995,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             'hitachi_replication_report_pair_status', True,
             group=conf.SHARED_CONF_GROUP)
 
-    def test_ac8_pair_status_reads_each_group_from_its_listed_side(self):
+    def test_pair_status_reads_each_group_from_its_listed_side(self):
         """One listing holds copy groups in both directions."""
         common = self._common()
         self._pair_status_on()
@@ -5043,7 +5024,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             {'CGP', 'CGS'},
             set(json.loads(capabilities[hbsd_replication._PAIR_STATUS_KEY])))
 
-    def test_ac8_pair_status_journal_side_follows_the_group_side(self):
+    def test_pair_status_journal_side_follows_the_group_side(self):
         common = self._common()
         self._pair_status_on()
         rows = [{'copyGroupName': 'CGS', 'localDeviceGroupName': 'CGSS'}]
@@ -5066,7 +5047,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual(2, state['journal_id'])
         self.assertEqual(hbsd_utils.SECONDARY_STR, state['journal_side'])
 
-    def test_ac8_pair_status_reads_local_svol_groups_when_listing_fails(
+    def test_pair_status_reads_local_svol_groups_when_listing_fails(
             self):
         common = self._common()
         self._pair_status_on()
@@ -5097,7 +5078,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             json.loads(capabilities[hbsd_replication._PAIR_STATUS_KEY])[
                 'CGS']['pair_status'])
 
-    def test_ac8_pair_status_of_a_failed_over_backend_reads_the_peer(self):
+    def test_pair_status_of_a_failed_over_backend_reads_the_peer(self):
         """A failed-over backend reads only the copy groups it knows."""
         common = self._common()
         self._pair_status_on()
@@ -5117,7 +5098,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertFalse(
             capabilities[hbsd_replication._PAIR_STATUS_ENUMERATED_KEY])
 
-    def test_ac22_pair_status_never_raises_when_a_local_read_fails(self):
+    def test_pair_status_never_raises_when_a_local_read_fails(self):
         common = self._common()
         self._pair_status_on()
         common._known_copy_groups.add('CGS')
@@ -5134,7 +5115,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual(
             {}, json.loads(capabilities[hbsd_replication._PAIR_STATUS_KEY]))
 
-    def test_ac9_ssws_wait_polls_the_site_it_is_given(self):
+    def test_ssws_wait_polls_the_site_it_is_given(self):
         common = self._common()
         common.rep_secondary = None
         params = common._get_wait_pair_status_change_params(
@@ -5142,7 +5123,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertIs(common.rep_primary, params['instance'])
         self.assertIsNone(params['remote_client'])
 
-    def test_ac9_ssws_wait_defaults_to_the_peer(self):
+    def test_ssws_wait_defaults_to_the_peer(self):
         """Per-volume failover relies on this default."""
         common = self._common()
         params = common._get_wait_pair_status_change_params(
@@ -5150,7 +5131,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertIs(common.rep_secondary, params['instance'])
 
     @ddt.data(True, False)
-    def test_ac11_sldev_owner_is_the_site_carrying_its_label(self, local):
+    def test_sldev_owner_is_the_site_carrying_its_label(self, local):
         common = self._common()
         volume = self._svol_only_volume(9)
         label = self._label_of(volume)
@@ -5164,7 +5145,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual(label, ldev_info['label'])
         local_info.assert_called_once_with(None, 9)
 
-    def test_ac11_sldev_owner_of_a_paired_volume_reads_no_label(self):
+    def test_sldev_owner_of_a_paired_volume_reads_no_label(self):
         common = self._common()
         with mock.patch.object(
                 common.rep_primary, 'get_ldev_info') as local_info, \
@@ -5176,7 +5157,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         local_info.assert_not_called()
         peer_info.assert_not_called()
 
-    def test_ac11_sldev_owner_of_a_snapshot_matches_the_snapshot_id(self):
+    def test_sldev_owner_of_a_snapshot_matches_the_snapshot_id(self):
         common = self._common()
         snapshot = self._snapshot_of(TEST_VOLUME[0], sldev=5)
         with self._label_stub(
@@ -5186,7 +5167,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             site, _ = common._resolve_sldev_owner(snapshot)
         self.assertIs(common.rep_primary, site)
 
-    def test_ac11_sldev_owner_takes_a_match_when_the_other_site_is_down(
+    def test_sldev_owner_takes_a_match_when_the_other_site_is_down(
             self):
         """The disaster case: the peer is gone, the adopted S-VOL is here."""
         common = self._common()
@@ -5198,7 +5179,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             site, _ = common._resolve_sldev_owner(volume)
         self.assertIs(common.rep_primary, site)
 
-    def test_ac12_delete_volume_busy_local_svol_raises_volume_is_busy(self):
+    def test_delete_volume_busy_local_svol_raises_volume_is_busy(self):
         common = self._common()
         volume = self._svol_only_volume(9)
         with self._label_stub(common.rep_primary, self._label_of(volume)), \
@@ -5215,7 +5196,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             common.rep_secondary, delete_ldev=mock.DEFAULT,
             delete_volume=mock.DEFAULT)
 
-    def test_ac19_delete_volume_on_neither_site_skips_every_time(self):
+    def test_delete_volume_on_neither_site_skips_every_time(self):
         common = self._common()
         volume = self._svol_only_volume(9)
         with self._label_stub(common.rep_primary, None), \
@@ -5229,7 +5210,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         for method in peer.values():
             method.assert_not_called()
 
-    def test_ac20_delete_volume_raises_and_writes_nothing_if_unknown(self):
+    def test_delete_volume_raises_and_writes_nothing_if_unknown(self):
         common = self._common()
         volume = self._svol_only_volume(9)
         with self._label_stub(
@@ -5250,7 +5231,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         for method in peer.values():
             method.assert_not_called()
 
-    def test_ac21_delete_volume_raises_when_both_sites_claim_the_ldev(self):
+    def test_delete_volume_raises_when_both_sites_claim_the_ldev(self):
         common = self._common()
         volume = self._svol_only_volume(9)
         label = self._label_of(volume)
@@ -5270,7 +5251,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         for method in peer.values():
             method.assert_not_called()
 
-    def test_ac20_group_delete_marks_an_unresolvable_member_error(self):
+    def test_group_delete_marks_an_unresolvable_member_error(self):
         common = self._common()
         volume = self._svol_only_volume(20)
         down = exception.VolumeDriverException(data='down')
@@ -5286,7 +5267,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         local_delete.assert_not_called()
         remote_delete.assert_not_called()
 
-    def test_ac14_group_snapshot_member_on_neither_site_is_an_error(self):
+    def test_group_snapshot_member_on_neither_site_is_an_error(self):
         common = self._common()
         member = self._svol_only_volume(11)
         snapshot = self._snapshot_of(member)
@@ -5307,7 +5288,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             [{'id': snapshot.id, 'status': fields.SnapshotStatus.ERROR}],
             snapshots_update)
 
-    def test_ac15_delete_group_snapshot_on_the_peer_uses_its_delete_group(
+    def test_delete_group_snapshot_on_the_peer_uses_its_delete_group(
             self):
         common = self._common()
         snapshot = self._snapshot_of(TEST_VOLUME[0], sldev=33)
@@ -5328,7 +5309,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             TEST_GROUP_SNAP[0], [snapshot], True)
         local_delete.assert_not_called()
 
-    def test_ac20_delete_group_snapshot_marks_an_unknown_member_error(self):
+    def test_delete_group_snapshot_marks_an_unknown_member_error(self):
         common = self._common()
         snapshot = self._snapshot_of(TEST_VOLUME[0], sldev=33)
         down = exception.VolumeDriverException(data='down')
@@ -5356,7 +5337,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             create_volume_from_snapshot=mock.DEFAULT,
             copy_on_storage=mock.DEFAULT, modify_ldev_name=mock.DEFAULT)
 
-    def test_ac16_create_group_from_src_clones_a_local_source_locally(self):
+    def test_create_group_from_src_clones_a_local_source_locally(self):
         """rep_secondary's LDEV with the source's number is another object's.
 
         Only its label is read; cloning it would copy the other's data.
@@ -5394,7 +5375,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
               'replication_status': fields.ReplicationStatus.DISABLED}],
             volumes_update)
 
-    def test_ac16_create_group_from_src_clones_a_peer_source_as_today(self):
+    def test_create_group_from_src_clones_a_peer_source_as_today(self):
         common = self._common()
         source = self._svol_only_volume(10)
         volume = TEST_VOLUME[1]
@@ -5413,7 +5394,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual(
             json.dumps({'sldev': 51}), volumes_update[0]['provider_location'])
 
-    def test_ac16_create_group_from_src_source_on_neither_site_raises(self):
+    def test_create_group_from_src_source_on_neither_site_raises(self):
         common = self._common()
         source = self._svol_only_volume(10)
         with self._label_stub(common.rep_primary, None), \
@@ -5443,7 +5424,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             get_ldev_info=mock.DEFAULT, modify_ldev_name=mock.DEFAULT,
             get_ldev_size_in_gigabyte=mock.DEFAULT)
 
-    def test_ac17_group_manage_adopts_from_a_local_svol_side(self):
+    def test_group_manage_adopts_from_a_local_svol_side(self):
         common = self._common()
         volume = self._bound_volume()
         with mock.patch.object(
@@ -5476,7 +5457,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual(
             json.dumps({'sldev': 7}), model_update['provider_location'])
 
-    def test_ac17_group_manage_adopts_from_a_confirmed_peer_svol_side(self):
+    def test_group_manage_adopts_from_a_confirmed_peer_svol_side(self):
         common = self._common()
         volume = self._bound_volume()
         peer_grp = self._svol_copy_grp('CGBOUND')
@@ -5509,7 +5490,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
     @ddt.data(
         exception.VolumeDriverException(data='not on this array'),
         None)
-    def test_ac17_group_manage_raises_unless_a_site_holds_the_copy_group(
+    def test_group_manage_raises_unless_a_site_holds_the_copy_group(
             self, rep_primary_error):
         """Found on neither array (None), or neither array answers."""
         common = self._common()
@@ -5535,7 +5516,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             method.assert_not_called()
         local_relabel.assert_not_called()
 
-    def test_ac17_group_manage_get_size_reads_the_local_svol_side(self):
+    def test_group_manage_get_size_reads_the_local_svol_side(self):
         common = self._common()
         volume = self._bound_volume()
         with mock.patch.object(
@@ -5559,7 +5540,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             mock.patch.object(common.rep_primary, 'modify_ldev_name'),
             mock.patch.object(common.rep_secondary, 'modify_ldev_name'))
 
-    def test_ac18_group_unmanage_clears_a_local_svol_nickname_locally(self):
+    def test_group_unmanage_clears_a_local_svol_nickname_locally(self):
         common = self._common()
         volume = self._bound_volume(sldev=8)
         local_patch, peer_patch = self._unmanage_patches(common)
@@ -5570,7 +5551,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         local_clear.assert_called_once_with(8, '')
         remote_clear.assert_not_called()
 
-    def test_ac19_group_unmanage_on_neither_site_skips_the_clear(self):
+    def test_group_unmanage_on_neither_site_skips_the_clear(self):
         common = self._common()
         volume = self._bound_volume(sldev=8)
         local_patch, peer_patch = self._unmanage_patches(common)
@@ -5581,7 +5562,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         local_clear.assert_not_called()
         remote_clear.assert_not_called()
 
-    def test_ac20_group_unmanage_raises_when_the_lookup_errors(self):
+    def test_group_unmanage_raises_when_the_lookup_errors(self):
         common = self._common()
         volume = self._bound_volume(sldev=8)
         down = exception.VolumeDriverException(data='down')
@@ -5594,7 +5575,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         local_clear.assert_not_called()
         remote_clear.assert_not_called()
 
-    def test_ac18_group_unmanage_failed_clear_is_logged_not_raised(self):
+    def test_group_unmanage_failed_clear_is_logged_not_raised(self):
         common = self._common()
         volume = self._bound_volume(sldev=8)
         with self._label_stub(common.rep_primary, self._label_of(volume)), \
@@ -5609,7 +5590,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         local_clear.assert_called_once_with(8, '')
         remote_clear.assert_not_called()
 
-    def test_ac25_psr_dr_contract_is_unchanged(self):
+    def test_psr_dr_contract_is_unchanged(self):
         self.assertEqual(
             'group_replication_pairs', hbsd_replication._PAIR_STATUS_KEY)
         self.assertEqual(
@@ -5707,7 +5688,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     @mock.patch.object(group_types, 'get_group_type_specs',
                        return_value='<is> True')
-    def test_ac26_failback_still_resyncs_through_rep_secondary(
+    def test_failback_still_resyncs_through_rep_secondary(
             self, get_group_type_specs):
         """Known gap: failback always resyncs through rep_secondary."""
         common = self._common()
@@ -5755,7 +5736,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     @mock.patch.object(group_types, 'get_group_type_specs',
                        return_value='<is> True')
-    def test_ac28_failover_replication_serves_both_directions(
+    def test_failover_replication_serves_both_directions(
             self, get_group_type_specs):
         common = self._common()
         peer_group, local_cg, peer_cg, svol_side = self._both_directions(
@@ -5779,7 +5760,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual(failed_over, local_update)
         self.assertEqual(failed_over, peer_update)
 
-    def test_ac28_list_replication_targets_serves_both_directions(self):
+    def test_list_replication_targets_serves_both_directions(self):
         common = self._common()
         peer_group, local_cg, peer_cg, svol_side = self._both_directions(
             common)
@@ -5797,7 +5778,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual(targets, peer_ret)
         list_grps.assert_called_once_with(common.rep_secondary.client)
 
-    def test_ac28_group_delete_removes_each_member_where_it_lives(self):
+    def test_group_delete_removes_each_member_where_it_lives(self):
         """An adopted local member and a paired member on one backend."""
         common = self._common()
         adopted = self._svol_only_volume(20)
@@ -5828,7 +5809,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
     # Error and edge paths of the two lookups.
     # ------------------------------------------------------------------
 
-    def test_ac11_sldev_owner_found_locally_without_a_peer(self):
+    def test_sldev_owner_found_locally_without_a_peer(self):
         """The peer never initialized; the adopted S-VOL is still here."""
         common = self._common()
         volume = self._svol_only_volume(9)
@@ -5837,7 +5818,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             site, _ = common._resolve_sldev_owner(volume)
         self.assertIs(common.rep_primary, site)
 
-    def test_ac20_delete_volume_reraises_a_local_delete_error(self):
+    def test_delete_volume_reraises_a_local_delete_error(self):
         common = self._common()
         volume = self._svol_only_volume(9)
         with self._label_stub(common.rep_primary, self._label_of(volume)), \
@@ -5850,7 +5831,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                 exception.VolumeDriverException, common.delete_volume,
                 volume)
 
-    def test_ac15_delete_group_snapshot_splits_mixed_owners(self):
+    def test_delete_group_snapshot_splits_mixed_owners(self):
         """One S-VOL here, one on the peer: each is deleted where it is."""
         common = self._common()
         local = self._snapshot_of(TEST_VOLUME[0], sldev=33)
@@ -5888,7 +5869,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             [{'id': local.id, 'status': 'deleted'},
              {'id': remote.id, 'status': 'deleted'}], snapshots_update)
 
-    def test_ac15_delete_group_snapshot_reports_a_busy_local_svol(self):
+    def test_delete_group_snapshot_reports_a_busy_local_svol(self):
         common = self._common()
         snapshot = self._snapshot_of(TEST_VOLUME[0], sldev=33)
         with self._label_stub(
@@ -5905,7 +5886,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual(
             [{'id': snapshot.id, 'status': 'available'}], snapshots_update)
 
-    def test_ac8_first_poll_with_the_listing_down_reports_nothing(self):
+    def test_first_poll_with_the_listing_down_reports_nothing(self):
         """No cache and no local S side leaves enumerated false."""
         common = self._common()
         self._pair_status_on()
@@ -5920,7 +5901,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     @mock.patch.object(group_types, 'get_group_type_specs',
                        return_value='<is> True')
-    def test_ac20_enable_replication_adopt_errors_when_the_peer_fails(
+    def test_enable_replication_adopt_errors_when_the_peer_fails(
             self, get_group_type_specs):
         """rep_primary says no; the peer then cannot be read."""
         common = self._common()
@@ -5940,7 +5921,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     @mock.patch.object(group_types, 'get_group_type_specs',
                        return_value='<is> True')
-    def test_ac7_enable_replication_errors_a_member_not_in_the_group(
+    def test_enable_replication_errors_a_member_not_in_the_group(
             self, get_group_type_specs):
         common = self._common()
         volume = self._svol_only_volume(40)
@@ -5958,7 +5939,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             [{'id': volume.id, 'replication_status': error}],
             volumes_update)
 
-    def test_ac16_create_group_from_src_removes_its_clones_on_failure(self):
+    def test_create_group_from_src_removes_its_clones_on_failure(self):
         """A failed second clone takes the first one back off its site.
 
         The cleanup's own failure is logged; the clone error propagates.
@@ -5996,7 +5977,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         cleanup.assert_called_once_with(50)
         self.assertIn('copy failed', str(exc))
 
-    def test_ac19_group_unmanage_of_a_volume_without_svol_asks_nobody(self):
+    def test_group_unmanage_of_a_volume_without_svol_asks_nobody(self):
         """No S-VOL, so no site is asked and nothing is raised."""
         common = self._common()
         volume = self._bound_volume()
@@ -6009,7 +5990,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         peer_info.assert_not_called()
 
     @ddt.data(True, False)
-    def test_ac6_list_replication_targets_of_a_failed_over_backend(
+    def test_list_replication_targets_of_a_failed_over_backend(
             self, found):
         """A failed-over backend reads the peer's S side."""
         common = self._common()
@@ -6238,7 +6219,7 @@ class FakeVolume(dict):
 
 @ddt.ddt
 class HBSDGroupReplicationHelperTest(test.TestCase):
-    """Unit tests for the module level helpers of hbsd_replication."""
+    """Unit test class for the module level helpers of hbsd_replication."""
 
     @ddt.data(
         # (secondary_backend_id, expected backend, expected mode)
@@ -6560,7 +6541,7 @@ class HBSDGroupReplicationHelperTest(test.TestCase):
 
 
 class HBSDGroupReplicationRestApiTest(test.TestCase):
-    """Unit tests for the REST calls added for group replication."""
+    """Unit test class for the group replication REST calls."""
 
     def setUp(self):
         super(HBSDGroupReplicationRestApiTest, self).setUp()

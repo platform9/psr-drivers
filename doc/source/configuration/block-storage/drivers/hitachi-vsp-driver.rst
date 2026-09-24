@@ -6,7 +6,7 @@
 .. when the group-replication work is proposed upstream, kept at the same path
 .. here so the move is a copy rather than a rewrite.
 ..
-.. The two new configuration options
+.. The configuration options
 .. (``hitachi_replication_report_pair_status`` and its ``_ttl``) need no text
 .. here: that page renders options with ``.. config-table::`` over
 .. ``cinder.volume.drivers.hitachi.hbsd_replication``, so their ``help``
@@ -69,9 +69,9 @@ Allowed values
 The extra spec must be exactly ``<is> True``, or absent. The scheduler and the
 driver both read the value, and they do not parse it the same way. The
 scheduler compares ``<is>`` values with ``strutils.bool_from_string``. The
-driver accepts only the literal ``<is> True``, after trimming surrounding
-whitespace, which is the rule ``volume_utils.is_group_a_type`` applies to group
-types.
+driver accepts only the literal ``<is> True``, as
+``volume_utils.is_group_a_type`` requires of group types, though it trims
+surrounding whitespace first.
 
 .. list-table::
    :header-rows: 1
@@ -139,8 +139,8 @@ each copy group's pair state as the ``group_replication_pairs`` pool
 capability, letting a consumer read pair state from
 ``GET /scheduler-stats/get_pools?detail=True`` rather than calling the storage
 system. It is off by default because building the report costs one REST call
-per copy group on every stats poll, against the same Configuration Manager
-endpoint that serves pair creation.
+per copy group each time the cached report expires, against the same
+Configuration Manager endpoint that serves pair creation.
 
 ``group_replication_pairs_updated_at`` stamps the report, and
 ``group_replication_pairs_enumerated`` is ``False`` when the driver could not

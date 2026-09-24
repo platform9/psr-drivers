@@ -75,7 +75,7 @@ Beyond the eight entry points:
 | `manage_existing_get_size()` — size of an existing LDEV for import validation | `hbsd_replication.py` |
 | Copy-group binding recorded in volume metadata (`replication_copy_group`), so a volume added to a CG later still resolves to the right copy group | `_resolve_copy_group_name()` |
 | Group-name binding by prefix `hbsd-cg:<name>` for adopting an existing array copy group | `_resolve_copy_group_name()` |
-| Journal lifecycle — created on first pair, deleted on `disable_replication()` | `_group_repl_journal_ids()` / `_group_repl_delete_journals()` |
+| Journal lifecycle — created with a copy group's first pair, deleted once the copy group is gone (`disable_replication()` or group delete) | `create_journals()` / `_group_repl_delete_journals()` |
 | S side found per copy group — adoption, failover, pair status and target listing find which array holds each copy group's S side; a volume with only an S-VOL is found on the array whose LDEV carries its label | `_copy_group_svol_side()` / `_resolve_sldev_owner()` |
 | Per-copy-group pair state in `update_volume_stats()` capabilities — **off by default**, see `hitachi_replication_report_pair_status` | `_pair_status_capabilities()` |
 | Graceful vs emergency failover (`split` vs `takeover ... forceSplit`) | `_failover_mode()` |
@@ -134,7 +134,7 @@ and inside `replication_device`.
 ### cinder.conf — DR site
 
 A DR backend is configured the same way: its own array in the backend section,
-the source array in `replication_device`. There is no role to set.
+the source array in `replication_device`.
 
 For each copy group, the driver asks the arrays which one holds the S side,
 starting with its own array, which answers without the peer. A volume that has
@@ -145,7 +145,7 @@ volume's label. One backend can therefore hold copy groups in both directions.
 
 | Option | Default | Notes |
 |--------|---------|-------|
-| `hitachi_replication_report_pair_status` | `False` | Report each copy group's pair state as the `group_replication_pairs` pool capability. Costs one REST call per copy group on every stats poll, so it is off by default — turn it on only where a consumer reads that capability |
+| `hitachi_replication_report_pair_status` | `False` | Report each copy group's pair state as the `group_replication_pairs` pool capability. Costs one REST call per copy group each time the cached report expires, so it is off by default — turn it on only where a consumer reads that capability |
 | `hitachi_replication_report_pair_status_ttl` | `300` | Seconds to cache that report. Only read when the option above is `True` |
 | `hitachi_replication_mun` | `1` | Mirror unit ID (0–3) |
 | `hitachi_replication_journal_size` | *(unset)* | GB, 10–1024. **Required** for UR — the driver errors out without it |
@@ -199,8 +199,8 @@ The spec must be exactly `<is> True`, or absent. The scheduler and the driver
 both read the value, and they do not parse it the same way. The scheduler goes
 through `extra_specs_ops.match`, where `<is>` compares with
 `strutils.bool_from_string`. The driver accepts only the literal `<is> True`,
-after trimming surrounding whitespace, which is the rule
-`volume_utils.is_group_a_type` applies to group types.
+as `volume_utils.is_group_a_type` requires of group types, though it trims
+surrounding whitespace first.
 
 | Value | Scheduler | Driver | Result |
 |---|---|---|---|
@@ -240,9 +240,8 @@ the per-volume replication path. A PSR deployment therefore configures:
 The volume-type spec is the only way to stop a volume pairing at create. Without
 it a volume pairs at create and cannot later join a copy group.
 
-Neither site sets a replication role. A DR backend learns that it holds a copy
-group's S side by reading the group from its own array, so it still works when
-the source array is down.
+A DR backend learns that it holds a copy group's S side by reading the group
+from its own array, so it still works when the source array is down.
 
 ### Failover semantics
 

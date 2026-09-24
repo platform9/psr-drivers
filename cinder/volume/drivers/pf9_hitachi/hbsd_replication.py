@@ -356,8 +356,8 @@ def _volume_in_group_replication(volume):
 def _typed_for_group_replication(extra_specs):
     """Whether the volume type marks its volumes for group replication.
 
-    Only the literal '<is> True' (whitespace trimmed) enables it, the same
-    rule volume_utils.is_group_a_type applies to group types.
+    Only the literal '<is> True' enables it, as volume_utils.is_group_a_type
+    requires of group types, though surrounding whitespace is trimmed here.
     """
     if not extra_specs:
         return False
@@ -471,8 +471,8 @@ def _delays(short_interval, long_interval, timeout):
         yield i
         if utils.timed_out(start_time, timeout):
             # Not 'raise StopIteration': PEP 479 turns that into a
-            # RuntimeError inside a generator, which made the for...else
-            # timeout branch in _wait_pair_status_change unreachable.
+            # RuntimeError inside a generator, so the for...else timeout
+            # branch in _wait_pair_status_change would never run.
             return
         watch.stop()
         interval = long_interval if utils.timed_out(
@@ -842,7 +842,7 @@ class HBSDREPLICATION(rest.HBSDREST):
         """Whether a replication-enabled volume is paired as it is created."""
         if _volume_in_group_replication(volume):
             return False
-        # enable_replication pairs these; pairing now takes the single mirror
+        # enable_replication pairs these; pairing here takes the single mirror
         # unit and makes that add fail with GROUP_REPLICATION_ALREADY_PAIRED.
         if extra_specs is None:
             extra_specs = self.rep_primary.get_volume_extra_specs(volume)
@@ -900,9 +900,9 @@ class HBSDREPLICATION(rest.HBSDREST):
     def _resolve_sldev_owner(self, obj):
         """Return (site, ldev_info) for obj's S-VOL, or (None, None).
 
-        An sldev-only obj is matched by label on both sites, since an adopted
-        S-VOL is local but clones and snapshots made from peer S-VOLs are
-        remote; any other obj is on rep_secondary, unread.
+        Unless failed over, an sldev-only obj is matched by label on both
+        sites, since an adopted S-VOL is local but clones and snapshots made
+        from peer S-VOLs are remote; anything else is on rep_secondary, unread.
         """
         if self._active_backend_id or _get_ldev_site(obj) != _SECONDARY:
             self._require_rep_secondary()
@@ -1181,11 +1181,10 @@ class HBSDREPLICATION(rest.HBSDREST):
     def _pair_status_capabilities(self):
         """Per-copy-group pair state and the inputs an RPO check needs.
 
-        Cached for hitachi_replication_report_pair_status_ttl seconds: this
-        costs one REST call per copy group, so re-reading it every stats
-        poll is not free. On an array error, the last good value is served
-        with its original timestamp rather than dropped, so a consumer can
-        judge staleness itself instead of losing the field.
+        Cached for hitachi_replication_report_pair_status_ttl seconds, as it
+        costs one REST call per copy group; if listing fails and no S side is
+        local, the cached value keeps its original timestamp so a consumer can
+        judge staleness.
         """
         capabilities = {
             _PAIR_STATUS_PEER_KEY: self.rep_secondary is not None}
@@ -1227,8 +1226,8 @@ class HBSDREPLICATION(rest.HBSDREST):
                 copy_group_names = [grp['copyGroupName'] for grp in copy_grps
                                     if grp.get('copyGroupName')]
                 self._known_copy_groups.update(copy_group_names)
-                # hbsd_rest_api names the S side's device group
-                # <copy group>S; a copy group named otherwise is missed here.
+                # Pair creation in this module names the S side's device
+                # group <copy group>S; a group named otherwise is missed here.
                 self._local_svol_copy_groups.difference_update(
                     copy_group_names)
                 self._local_svol_copy_groups.update(
