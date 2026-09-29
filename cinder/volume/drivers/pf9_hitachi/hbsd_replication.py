@@ -2313,6 +2313,8 @@ class HBSDREPLICATION(rest.HBSDREST):
     def _group_repl_create_pair(self, volume, copy_group_name, pvol, svol,
                                 is_data_reduction_force_copy,
                                 is_new_copy_grp):
+        self._require_rep_primary()
+        self._require_rep_secondary()
         parent = self
         created_journal_ids = []
 
@@ -2357,6 +2359,8 @@ class HBSDREPLICATION(rest.HBSDREST):
     def _group_repl_add_volume(self, volume, copy_group_name,
                                is_new_copy_grp, operation):
         """Create the S-VOL and its pair for one group replication member."""
+        self._require_rep_primary()
+        self._require_rep_secondary()
         try:
             pvol = self.rep_primary.get_ldev(volume)
             if pvol is None:
@@ -2435,6 +2439,8 @@ class HBSDREPLICATION(rest.HBSDREST):
         return {'id': volume.id, 'status': 'deleted'}
 
     def _group_repl_delete_volume(self, volume, copy_group_name, operation):
+        self._require_rep_primary()
+        self._require_rep_secondary()
         try:
             pvol = self.rep_primary.get_ldev(volume)
             if pvol is None:
@@ -2562,6 +2568,8 @@ class HBSDREPLICATION(rest.HBSDREST):
 
     def _group_repl_resync_members(self, copy_group_name, volumes):
         """Restart replication for members whose pairs are only suspended."""
+        self._require_rep_primary()
+        self._require_rep_secondary()
         rep_type = self.driver_info['rep_type_async']
         try:
             with _log_step('resync copy group', copy_group=copy_group_name,
@@ -2726,6 +2734,8 @@ class HBSDREPLICATION(rest.HBSDREST):
     def _group_repl_delete_group_volume(self, group, volume,
                                         copy_group_name):
         """Delete one member's pair, then its LDEVs on both arrays."""
+        self._require_rep_primary()
+        self._require_rep_secondary()
         try:
             if copy_group_name is None:
                 return self._group_repl_delete_member_by_volume(volume)

@@ -4673,6 +4673,13 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         ('_group_repl_journal_ids', ('CG',)),
         ('_group_repl_pair_absent', ('CG', 1)),
         ('_group_repl_classify_members', ('CG', [])),
+        ('_group_repl_create_pair',
+         (TEST_VOLUME[0], 'CG', 1, 2, False, False)),
+        ('_group_repl_add_volume', (TEST_VOLUME[0], 'CG', False, 'op')),
+        ('_group_repl_delete_volume', (TEST_VOLUME[0], 'CG', 'op')),
+        ('_group_repl_resync_members', ('CG', [])),
+        ('_group_repl_delete_group_volume',
+         (TEST_GROUP[0], TEST_VOLUME[0], 'CG')),
     )
     @ddt.unpack
     def test_group_repl_helpers_require_both_sites(self, method, args):
