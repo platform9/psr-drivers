@@ -41,6 +41,7 @@ from requests.adapters import HTTPAdapter
 
 from cinder import exception
 from cinder.i18n import _
+from cinder.volume.drivers.hitachi import hbsd_utils as debug
 from cinder.volume.drivers.hitachi import hbsd_utils as utils
 from cinder.volume import volume_utils
 
@@ -288,7 +289,7 @@ class RestApiClient():
                         "accept": "application/json"}
         self.driver_prefix = driver_prefix
 
-        self.request_auditor = utils.create_default_request_auditor(conf)
+        self.request_auditor = debug.create_default_request_auditor(conf)
 
     class Session(requests.auth.AuthBase):
 

@@ -6,12 +6,8 @@
 .. when the group-replication work is proposed upstream, kept at the same path
 .. here so the move is a copy rather than a rewrite.
 ..
-.. The configuration options
-.. (``hitachi_replication_report_pair_status`` and its ``_ttl``) need no text
-.. here: that page renders options with ``.. config-table::`` over
-.. ``cinder.volume.drivers.hitachi.hbsd_replication``, so their ``help``
-.. strings in ``COMMON_REPLICATION_OPTS`` are the documentation. Extra specs
-.. are not generated, so the section below is written by hand.
+.. Configuration options are rendered by ``.. config-table::``; extra specs are
+.. not, so the section below is written by hand.
 
 Group replication
 -----------------
@@ -32,10 +28,10 @@ a replicated group must not be, because the driver pins one mirror unit
 that mirror unit: the volume would be paired twice, and the group join would
 fail.
 
-The driver can only tell the two apart from the volume type. A volume created
-before its group exists has no ``group_id``, and so no group type to consult --
-which is the usual order, since a group is normally formed from volumes that
-already exist.
+The driver tells the two apart from the volume's group when it has one, and
+otherwise from the volume type. A volume created before its group exists has
+no ``group_id``, and so no group type to consult -- which is the usual order,
+since a group is normally formed from volumes that already exist.
 
 Set the following extra spec on the volume type used for volumes that will
 join a replicated group:
@@ -59,19 +55,15 @@ on any other backend the create fails with ``No valid backend``.
 
 .. note::
 
-   The extra spec is the only way to stop a volume pairing at create time.
-   Without it, a replicated volume pairs at create time and cannot afterwards
-   join a copy group.
+   A volume created with group_replication_enabled extra spec is never paired at
+   create time. For any other replicated volume the extra spec is the only way
+   to stop that: without it, the volume pairs at create time and cannot
+   afterwards join a copy group.
 
 Allowed values
 ^^^^^^^^^^^^^^
 
-The extra spec must be exactly ``<is> True``, or absent. The scheduler and the
-driver both read the value, and they do not parse it the same way. The
-scheduler compares ``<is>`` values with ``strutils.bool_from_string``. The
-driver accepts only the literal ``<is> True``, as
-``volume_utils.is_group_a_type`` requires of group types, though it trims
-surrounding whitespace first.
+The extra spec must be exactly ``<is> True``, or absent.
 
 .. list-table::
    :header-rows: 1
@@ -100,50 +92,3 @@ surrounding whitespace first.
      - matches
      - **not** group-replicated
      - Scheduled, but paired at create time, so it can never join a copy group
-
-One name, three meanings
-^^^^^^^^^^^^^^^^^^^^^^^^
-
-``group_replication_enabled`` names three different things in this driver.
-They do not collide, because each lives on a different object:
-
-.. list-table::
-   :header-rows: 1
-
-   * - Object
-     - Set by
-     - Read by
-     - Means
-   * - Pool capability
-     - The driver, in ``update_volume_stats``
-     - The scheduler's ``CapabilitiesFilter``
-     - This backend can do group replication
-   * - Group type ``group_specs``
-     - Operator
-     - ``Group.is_replicated``
-     - This Cinder group is replicated
-   * - Volume type ``extra_specs``
-     - Operator
-     - ``CapabilitiesFilter``, and the driver at volume creation
-     - This volume is paired by ``enable_replication``, not at create time
-
-The pool capability and the volume type spec share a name on purpose: that
-pairing is what ``CapabilitiesFilter`` enforces. The group spec is Cinder's own
-standard key, the sibling of ``consistent_group_replication_enabled``.
-
-Reporting pair state in the pool capabilities
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-With ``hitachi_replication_report_pair_status = True`` the driver publishes
-each copy group's pair state as the ``group_replication_pairs`` pool
-capability, letting a consumer read pair state from
-``GET /scheduler-stats/get_pools?detail=True`` rather than calling the storage
-system. It is off by default because building the report costs one REST call
-per copy group each time the cached report expires, against the same
-Configuration Manager endpoint that serves pair creation.
-
-``group_replication_pairs_updated_at`` stamps the report, and
-``group_replication_pairs_enumerated`` is ``False`` when the driver could not
-ask the storage system for the full set -- a consumer that reads this
-capability must treat that as "unknown" and fall back, never as "nothing
-replicating".

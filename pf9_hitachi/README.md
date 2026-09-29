@@ -74,10 +74,9 @@ Beyond the eight entry points:
 |-----------|-------|
 | `manage_existing_get_size()` — size of an existing LDEV for import validation | `hbsd_replication.py` |
 | Copy-group binding recorded in volume metadata (`replication_copy_group`), so a volume added to a CG later still resolves to the right copy group | `_resolve_copy_group_name()` |
-| Group-name binding by prefix `hbsd-cg:<name>` for adopting an existing array copy group | `_resolve_copy_group_name()` |
+| Group-name binding by prefix `HBSD-CG:<name>` (any case) for adopting an existing array copy group | `_resolve_copy_group_name()` |
 | Journal lifecycle — created with a copy group's first pair, deleted once the copy group is gone (`disable_replication()` or group delete) | `create_journals()` / `_group_repl_delete_journals()` |
-| S side found per copy group — adoption, failover, pair status and target listing find which array holds each copy group's S side; a volume with only an S-VOL is found on the array whose LDEV carries its label | `_copy_group_svol_side()` / `_resolve_sldev_owner()` |
-| Per-copy-group pair state in `update_volume_stats()` capabilities — **off by default**, see `hitachi_replication_report_pair_status` | `_pair_status_capabilities()` |
+| S side found per copy group — adoption, failover and target listing find which array holds each copy group's S side; a volume with only an S-VOL is found on the array whose LDEV carries its label | `_copy_group_svol_side()` / `_resolve_sldev_owner()` |
 | Graceful vs emergency failover (`split` vs `takeover ... forceSplit`) | `_failover_mode()` |
 | Attach and detach of an adopted S-VOL on the array holding it; attach needs its copy group taken over (SSWS) or its pair gone | `_local_adopted_svol()` / `_check_adopted_svol_writable()` |
 
@@ -145,8 +144,6 @@ volume's label. One backend can therefore hold copy groups in both directions.
 
 | Option | Default | Notes |
 |--------|---------|-------|
-| `hitachi_replication_report_pair_status` | `False` | Report each copy group's pair state as the `group_replication_pairs` pool capability. Costs one REST call per copy group each time the cached report expires, so it is off by default — turn it on only where a consumer reads that capability |
-| `hitachi_replication_report_pair_status_ttl` | `300` | Seconds to cache that report. Only read when the option above is `True` |
 | `hitachi_replication_mun` | `1` | Mirror unit ID (0–3) |
 | `hitachi_replication_journal_size` | *(unset)* | GB, 10–1024. **Required** for UR — the driver errors out without it |
 | `hitachi_replication_journal_overflow_tolerance` | `60` | Seconds before a pair splits on journal-full |
@@ -235,10 +232,10 @@ the per-volume replication path. A PSR deployment therefore configures:
 |---|---|---|
 | Volume type | `replication_enabled=<is> True` **and** `group_replication_enabled=<is> True` | same |
 | Group type | `consistent_group_replication_enabled=<is> True` | same |
-| `hitachi_replication_report_pair_status` | `True` if psr-dr should read pair state through Cinder rather than calling the array directly; otherwise leave off | same |
 
-The volume-type spec is the only way to stop a volume pairing at create. Without
-it a volume pairs at create and cannot later join a copy group.
+A volume created directly into a replicated group is never paired at create.
+For any other volume the volume-type spec is the only way to stop that: without
+it the volume pairs at create and cannot later join a copy group.
 
 A DR backend learns that it holds a copy group's S side by reading the group
 from its own array, so it still works when the source array is down.

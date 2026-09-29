@@ -31,16 +31,6 @@ features:
     ``<is> False`` makes it unschedulable on every backend, and ``<is> true``
     is scheduled but not treated as group-replicated.
   - |
-    Hitachi driver: added ``hitachi_replication_report_pair_status``
-    (default ``False``) and ``hitachi_replication_report_pair_status_ttl``
-    (default ``300`` seconds). When the first is enabled, each copy group's
-    replication pair state is reported as the ``group_replication_pairs`` pool
-    capability, so a consumer can read pair state from the scheduler stats
-    instead of calling the storage system directly.
-    ``group_replication_pairs_enumerated`` is ``False`` when the driver could
-    not ask the storage system for every copy group. The
-    ``group_replication_peer_initialized`` capability is always reported.
-  - |
     Hitachi driver: for each copy group, the driver asks the storage systems
     which one holds the secondary side, starting with its own, which answers
     without the peer. A volume that has only a secondary volume is found on

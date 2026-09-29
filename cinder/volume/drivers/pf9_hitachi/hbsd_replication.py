@@ -40,12 +40,7 @@ _ASYNC_STRING = 'async'
 _MD_PVOL = 'replication_pvol_id'
 _MD_SVOL = 'replication_svol_id'
 _MD_COPY_GROUP = 'replication_copy_group'
-_GROUP_NAME_BINDING_PREFIX = 'hbsd-cg:'
-_PAIR_STATUS_KEY = 'group_replication_pairs'
-_PAIR_STATUS_UPDATED_KEY = 'group_replication_pairs_updated_at'
-_PAIR_STATUS_PEER_KEY = 'group_replication_peer_initialized'
-_PAIR_STATUS_ENUMERATED_KEY = 'group_replication_pairs_enumerated'
-_PAIR_STATUS_MAX_COPY_GROUPS = 64
+_GROUP_NAME_BINDING_PREFIX = 'HBSD-CG:'
 _GROUP_REPL_TYPE_KEYS = ('consistent_group_replication_enabled',
                          'group_replication_enabled')
 _GROUP_REPL_VOLUME_SPEC = 'group_replication_enabled'
@@ -164,19 +159,6 @@ COMMON_REPLICATION_OPTS = [
         default=5, min=0, max=60,
         help='Delay in minutes before a volume pair is split after path '
         'failure occurs'),
-    cfg.BoolOpt(
-        'hitachi_replication_report_pair_status',
-        default=False,
-        help='Report per-copy-group replication pair state as a pool '
-             'capability. This costs one REST call per copy group on '
-             'every stats poll, so it is off by default; enable it only '
-             'where a consumer reads group_replication_pairs.'),
-    cfg.IntOpt(
-        'hitachi_replication_report_pair_status_ttl',
-        default=300, min=0,
-        help='Seconds to cache the per-copy-group pair status report '
-             'before recomputing it. Only used when '
-             'hitachi_replication_report_pair_status is enabled.'),
 ]
 
 _REPLICATION_DEVICE_KEY_NAMES = [
@@ -581,15 +563,6 @@ class HBSDREPLICATION(rest.HBSDREST):
         # Held on self rather than on rep_secondary: it comes from config and
         # must stay readable when do_setup clears rep_secondary.
         self.rep_secondary_backend_id = None
-        # Copy groups this process has seen. Once failed over they cannot be
-        # listed, but each remembered name can still be read.
-        self._known_copy_groups = set()
-        # The seen copy groups whose S side is rep_primary. Pair status can
-        # read those from rep_primary alone while the peer cannot list.
-        self._local_svol_copy_groups = set()
-        # The last _pair_status_capabilities() result, for the TTL cache
-        # and to serve a stale-but-stamped value if the array is down.
-        self._pair_status_cache = None
         self._active_backend_id = active_backend_id
         self._LDEV_NAME = self.driver_info['driver_prefix'] + '-LDEV-%d-%d'
 
@@ -788,9 +761,7 @@ class HBSDREPLICATION(rest.HBSDREST):
             data['consistent_group_replication_enabled'] = True
             data['group_replication_enabled'] = True
             if 'pools' in data:
-                pair_status = self._pair_status_capabilities()
                 for pool in data['pools']:
-                    pool.update(pair_status)
                     pool['replication_enabled'] = True
                     pool['replication_targets'] = [
                         self.rep_secondary_backend_id]
@@ -853,16 +824,14 @@ class HBSDREPLICATION(rest.HBSDREST):
     def _read_local_svol_copy_grp(self, copy_group_name):
         """Read copy_group_name from rep_primary as its S side, or None.
 
-        None means rep_primary does not hold the S side; either answer
-        updates _local_svol_copy_groups, and any other error raises.
+        None means rep_primary does not hold the S side; any other error
+        raises.
         """
         grp = self.rep_primary.client.get_remote_copy_grp(
             None, copy_group_name, is_secondary=True,
             ignore_message_id=[_MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST])
         if grp.get('messageId') == _MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST:
-            self._local_svol_copy_groups.discard(copy_group_name)
             return None
-        self._local_svol_copy_groups.add(copy_group_name)
         return grp
 
     def _copy_group_svol_side(self, copy_group_name):
@@ -943,7 +912,7 @@ class HBSDREPLICATION(rest.HBSDREST):
     def _delete_svol_on(self, site, obj, ldev_info, is_snapshot=False):
         """Delete obj's S-VOL on site, as _resolve_sldev_owner named it."""
         if site is None:
-            # No site has an LDEV labelled for obj; delete_volume skips a
+            # No site has an LDEV labeled for obj; delete_volume skips a
             # mismatched label too.
             utils.output_log(
                 MSG.INVALID_LDEV_FOR_DELETION,
@@ -981,9 +950,18 @@ class HBSDREPLICATION(rest.HBSDREST):
         if bound:
             return bound.pop()
         name = getattr(group, 'name', None) or ''
-        if name.startswith(_GROUP_NAME_BINDING_PREFIX):
-            explicit = name[len(_GROUP_NAME_BINDING_PREFIX):].strip()
+        prefix_len = len(_GROUP_NAME_BINDING_PREFIX)
+        if name[:prefix_len].upper() == _GROUP_NAME_BINDING_PREFIX:
+            explicit = name[prefix_len:].strip()
             if explicit:
+                if len(explicit) > _MAX_GROUP_COPY_GROUP_NAME:
+                    msg = utils.output_log(
+                        MSG.INVALID_PARAMETER,
+                        param='group %(group)s: copy group name %(name)s is '
+                              'longer than %(max)d characters' % {
+                                  'group': group.id, 'name': explicit,
+                                  'max': _MAX_GROUP_COPY_GROUP_NAME})
+                    self.raise_error(msg)
                 return explicit
         return self._create_group_copy_group_name(group.id)
 
@@ -1073,13 +1051,8 @@ class HBSDREPLICATION(rest.HBSDREST):
     def _create_group_copy_group_name(self, group_id):
         """Derive one copy group name per Cinder group."""
         prefix = self.driver_info['target_prefix']
-        name = prefix + group_id.replace(
+        return prefix + group_id.replace(
             '-', '').upper()[:_MAX_GROUP_COPY_GROUP_NAME - len(prefix)]
-        if len(name) > _MAX_GROUP_COPY_GROUP_NAME:
-            msg = utils.output_log(
-                MSG.INVALID_PARAMETER, param='copy group name: %s' % name)
-            self.raise_error(msg)
-        return name
 
     def _create_group_snapshot_group_name(self, group_snapshot_id):
         """Derive one Thin Image group name per Cinder group snapshot."""
@@ -1108,189 +1081,6 @@ class HBSDREPLICATION(rest.HBSDREST):
     def _journal_instances(self):
         """The sites a journal can actually be created on or removed from."""
         return [instance for instance in self.instances if instance]
-
-    def _journals_by_id(self, instance):
-        try:
-            journals = instance.client.get_journals() or []
-        except Exception:
-            LOG.debug('Could not list journals for the pool capabilities.',
-                      exc_info=True)
-            return {}
-        return {journal['journalId']: journal for journal in journals
-                if journal.get('journalId') is not None}
-
-    def _journal_state(self, copy_pairs, journals, is_secondary):
-        jkey = 'svolJournalId' if is_secondary else 'pvolJournalId'
-        ids = {pair[jkey] for pair in copy_pairs
-               if pair.get(jkey) is not None}
-        if len(ids) != 1:
-            # No journal, or a copy group spanning several: the storage
-            # system defines no aggregate over journals.
-            return {}
-        journal = journals.get(ids.pop())
-        if not journal:
-            return {}
-        state = {
-            'journal_id': journal.get('journalId'),
-            'journal_status': journal.get('journalStatus'),
-            'journal_usage_rate': journal.get('usageRate'),
-            'journal_q_count': journal.get('qCount'),
-            'journal_q_marker': journal.get('qMarker'),
-            'journal_active_paths': journal.get('numOfActivePaths'),
-            'journal_side': utils.SECONDARY_STR if is_secondary
-            else utils.PRIMARY_STR,
-        }
-        return {key: value for key, value in state.items()
-                if value is not None}
-
-    def _copy_grp_pair_state(self, copy_group_name, svol_site=None,
-                             journals_fn=None):
-        """Read one copy group's state as the storage system reports it.
-
-        svol_site is the site to read the group from as its S side, alone;
-        None reads it from rep_primary as its P side, with the peer.
-        """
-        is_secondary = svol_site is not None
-        if is_secondary:
-            grp = svol_site.client.get_remote_copy_grp(
-                None, copy_group_name, is_secondary=True)
-        else:
-            grp = self.rep_primary.client.get_remote_copy_grp(
-                self.rep_secondary.client, copy_group_name)
-        copy_pairs = grp.get('copyPairs') or []
-        state = {
-            'pair_count': len(copy_pairs),
-            'pair_status': grp.get('pairStatus'),
-            'consistency_time': grp.get('consistencyTime'),
-            'journal_usage_rate': grp.get('journalUsageRate'),
-        }
-        if state['pair_status'] is None and copy_pairs:
-            state['pvol_statuses'] = sorted(
-                {pair['pvolStatus'] for pair in copy_pairs
-                 if pair.get('pvolStatus')})
-            state['svol_statuses'] = sorted(
-                {pair['svolStatus'] for pair in copy_pairs
-                 if pair.get('svolStatus')})
-        if state.get('journal_usage_rate') is None:
-            journals = journals_fn() if journals_fn else {}
-            state.update(self._journal_state(
-                copy_pairs, journals, is_secondary))
-        return {key: value for key, value in state.items()
-                if value is not None}
-
-    def _pair_status_capabilities(self):
-        """Per-copy-group pair state and the inputs an RPO check needs.
-
-        Cached for hitachi_replication_report_pair_status_ttl seconds, as it
-        costs one REST call per copy group; if listing fails and no S side is
-        local, the cached value keeps its original timestamp so a consumer can
-        judge staleness.
-        """
-        capabilities = {
-            _PAIR_STATUS_PEER_KEY: self.rep_secondary is not None}
-        if self.rep_secondary is None:
-            return capabilities
-        if not self.conf.hitachi_replication_report_pair_status:
-            return capabilities
-        cached = self._pair_status_cache
-        if cached is not None and not timeutils.is_older_than(
-                cached['time'],
-                self.conf.hitachi_replication_report_pair_status_ttl):
-            capabilities.update(cached['data'])
-            return capabilities
-        enumerated = True
-        if self._active_backend_id:
-            enumerated = False
-            copy_group_names = sorted(self._known_copy_groups)
-        else:
-            try:
-                copy_grps = self.rep_primary.client.get_remote_copy_grps(
-                    self.rep_secondary.client) or []
-            except Exception:
-                LOG.warning(
-                    'Could not enumerate copy groups for the pool '
-                    'capabilities.', exc_info=True)
-                copy_grps = None
-            if copy_grps is None:
-                # Listing needs the peer. The groups whose S side is here
-                # can still be read from rep_primary alone.
-                copy_group_names = sorted(self._local_svol_copy_groups)
-                if not copy_group_names:
-                    if cached is not None:
-                        capabilities.update(cached['data'])
-                        return capabilities
-                    capabilities[_PAIR_STATUS_ENUMERATED_KEY] = False
-                    return capabilities
-                enumerated = False
-            else:
-                copy_group_names = [grp['copyGroupName'] for grp in copy_grps
-                                    if grp.get('copyGroupName')]
-                self._known_copy_groups.update(copy_group_names)
-                # Pair creation in this module names the S side's device
-                # group <copy group>S; a group named otherwise is missed here.
-                self._local_svol_copy_groups.difference_update(
-                    copy_group_names)
-                self._local_svol_copy_groups.update(
-                    grp['copyGroupName'] for grp in copy_grps
-                    if grp.get('copyGroupName') and
-                    grp.get('localDeviceGroupName') ==
-                    grp['copyGroupName'] + 'S')
-        capabilities[_PAIR_STATUS_ENUMERATED_KEY] = enumerated
-        if not copy_group_names:
-            capabilities[_PAIR_STATUS_KEY] = json.dumps({})
-            capabilities[_PAIR_STATUS_UPDATED_KEY] = (
-                timeutils.utcnow().isoformat())
-            self._pair_status_cache = {
-                'time': timeutils.utcnow(), 'data': dict(capabilities)}
-            return capabilities
-        if len(copy_group_names) > _PAIR_STATUS_MAX_COPY_GROUPS:
-            LOG.warning(
-                'Reporting pair state for %(max)d of %(found)d copy groups; '
-                'raise _PAIR_STATUS_MAX_COPY_GROUPS to report more.',
-                {'max': _PAIR_STATUS_MAX_COPY_GROUPS,
-                 'found': len(copy_group_names)})
-            copy_group_names = copy_group_names[:_PAIR_STATUS_MAX_COPY_GROUPS]
-            capabilities[_PAIR_STATUS_ENUMERATED_KEY] = False
-        pairs = {}
-        failed_groups = []
-        # The copy group list carries names only, so each group is read on its
-        # own. Journals are only a fallback for a missing journalUsageRate, so
-        # they are fetched lazily, at most once.
-        journals_cache = []
-
-        def journals_fn():
-            # Every group is read from one site, which holds its journals.
-            if not journals_cache:
-                journals_cache.append(self._journals_by_id(
-                    self.rep_secondary if self._active_backend_id
-                    else self.rep_primary))
-            return journals_cache[0]
-
-        for copy_group_name in copy_group_names:
-            if self._active_backend_id:
-                svol_site = self.rep_secondary
-            elif copy_group_name in self._local_svol_copy_groups:
-                svol_site = self.rep_primary
-            else:
-                svol_site = None
-            try:
-                pairs[copy_group_name] = self._copy_grp_pair_state(
-                    copy_group_name, svol_site=svol_site,
-                    journals_fn=journals_fn)
-            except Exception:
-                failed_groups.append(copy_group_name)
-        if failed_groups:
-            LOG.warning(
-                'Could not read %(count)d copy group(s) for the pool '
-                'capabilities: %(names)s.',
-                {'count': len(failed_groups),
-                 'names': ', '.join(failed_groups[:5])})
-        capabilities[_PAIR_STATUS_KEY] = json.dumps(pairs, sort_keys=True)
-        capabilities[_PAIR_STATUS_UPDATED_KEY] = (
-            timeutils.utcnow().isoformat())
-        self._pair_status_cache = {
-            'time': timeutils.utcnow(), 'data': dict(capabilities)}
-        return capabilities
 
     def _delete_journals(self, journal_ids):
         """Delete journal volumes."""
@@ -2474,12 +2264,16 @@ class HBSDREPLICATION(rest.HBSDREST):
         return success_status
 
     def _group_repl_copy_grp_exists(self, copy_group_name):
+        self._require_rep_primary()
+        self._require_rep_secondary()
         remote_copy_grps = self.rep_primary.client.get_remote_copy_grps(
             self.rep_secondary.client) or []
         return any(grp['copyGroupName'] == copy_group_name
                    for grp in remote_copy_grps)
 
     def _group_repl_journal_ids(self, copy_group_name):
+        self._require_rep_primary()
+        self._require_rep_secondary()
         try:
             grp = self.rep_primary.client.get_remote_copy_grp(
                 self.rep_secondary.client, copy_group_name)
@@ -2626,10 +2420,12 @@ class HBSDREPLICATION(rest.HBSDREST):
                 'replication_status': fields.ReplicationStatus.ERROR}
 
     def _group_repl_pair_absent(self, copy_group_name, pvol):
-        try:
-            grp = self.rep_primary.client.get_remote_copy_grp(
-                self.rep_secondary.client, copy_group_name)
-        except exception.VolumeDriverException:
+        self._require_rep_primary()
+        self._require_rep_secondary()
+        grp = self.rep_primary.client.get_remote_copy_grp(
+            self.rep_secondary.client, copy_group_name,
+            ignore_message_id=[_MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST])
+        if grp.get('messageId') == _MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST:
             return True
         return not any(pair.get('pvolLdevId') == pvol
                        for pair in grp.get('copyPairs') or [])
@@ -2701,6 +2497,8 @@ class HBSDREPLICATION(rest.HBSDREST):
 
     def _group_repl_classify_members(self, copy_group_name, volumes):
         """Split members by what the copy group already holds for them."""
+        self._require_rep_primary()
+        self._require_rep_secondary()
         candidates = [volume for volume in volumes
                       if _get_ldev_site(volume) == _PRIMARY_SECONDARY]
         if not candidates:
@@ -2903,9 +2701,8 @@ class HBSDREPLICATION(rest.HBSDREST):
         try:
             copy_group_name = self._resolve_copy_group_name(group, volumes)
         except exception.VolumeDriverException:
-            LOG.warning('Group replication: the members of group %s name '
-                        'different copy groups, so the group is not bound '
-                        'to one. Deleting each member through the '
+            LOG.warning('Group replication: the copy group of group %s could '
+                        'not be resolved. Deleting each member through the '
                         'per-volume path instead.', group.id)
             copy_group_name = None
         journal_ids = (self._group_repl_journal_ids(copy_group_name)
@@ -3058,10 +2855,15 @@ class HBSDREPLICATION(rest.HBSDREST):
                        owner[0] is self.rep_secondary for owner in owners):
                     return self.rep_secondary._delete_group(
                         group_snapshot, snapshots, True)
-                snapshots_model_update = [
-                    self._group_repl_delete_snapshot_svol(
-                        group_snapshot, snapshot, owner)
-                    for snapshot, owner in zip(snapshots, owners)]
+                snapshots_model_update = []
+                for snapshot, owner in zip(snapshots, owners):
+                    if isinstance(owner, Exception):
+                        update = self._group_repl_snapshot_delete_failed(
+                            group_snapshot, snapshot, owner)
+                    else:
+                        update = self._group_repl_delete_snapshot_svol(
+                            group_snapshot, snapshot, owner)
+                    snapshots_model_update.append(update)
         except Exception:
             with excutils.save_and_reraise_exception():
                 utils.output_log(
@@ -3075,26 +2877,27 @@ class HBSDREPLICATION(rest.HBSDREST):
 
     def _group_repl_delete_snapshot_svol(self, group_snapshot, snapshot,
                                          owner):
-        """Delete one snapshot's S-VOL, reporting it as _delete_group does.
-
-        owner is what _resolve_sldev_owner returned, or the error it raised.
-        """
+        """Delete one snapshot's S-VOL where _resolve_sldev_owner found it."""
         try:
-            if isinstance(owner, Exception):
-                raise owner
             self._delete_svol_on(
                 owner[0], snapshot, owner[1], is_snapshot=True)
         except (exception.VolumeDriverException, exception.VolumeIsBusy,
                 exception.SnapshotIsBusy) as exc:
-            utils.output_log(
-                MSG.GROUP_OBJECT_DELETE_FAILED, obj='snapshot',
-                group='group snapshot', group_id=group_snapshot.id,
-                obj_id=snapshot.id, ldev=_svol_of(snapshot), reason=exc.msg)
-            return {'id': snapshot.id,
-                    'status': 'available' if isinstance(
-                        exc, (exception.VolumeIsBusy,
-                              exception.SnapshotIsBusy)) else 'error'}
+            return self._group_repl_snapshot_delete_failed(
+                group_snapshot, snapshot, exc)
         return {'id': snapshot.id, 'status': 'deleted'}
+
+    def _group_repl_snapshot_delete_failed(self, group_snapshot, snapshot,
+                                           exc):
+        """Report one snapshot that was not deleted, as _delete_group does."""
+        utils.output_log(
+            MSG.GROUP_OBJECT_DELETE_FAILED, obj='snapshot',
+            group='group snapshot', group_id=group_snapshot.id,
+            obj_id=snapshot.id, ldev=_svol_of(snapshot), reason=exc.msg)
+        return {'id': snapshot.id,
+                'status': 'available' if isinstance(
+                    exc, (exception.VolumeIsBusy,
+                          exception.SnapshotIsBusy)) else 'error'}
 
     def _is_pair_target_port(self, instance, port):
         pair_targets = getattr(instance, '_pair_targets', None) or []
@@ -3114,12 +2917,8 @@ class HBSDREPLICATION(rest.HBSDREST):
                 if not self._is_pair_target_port(instance, port)]
 
     def _check_adopted_svol_manageability(self, ldev, existing_ref,
-                                          instance=None):
-        """Check that ldev on instance can be adopted as an S-VOL.
-
-        instance defaults to rep_secondary, the site this backend pairs to.
-        """
-        instance = instance or self.rep_secondary
+                                          instance):
+        """Check that ldev on instance can be adopted as an S-VOL."""
         ldev_info = instance.get_ldev_info(
             ['emulationType', 'numOfPorts', 'attributes', 'status', 'ports'],
             ldev)
@@ -3225,20 +3024,6 @@ class HBSDREPLICATION(rest.HBSDREST):
                 MSG.INVALID_LDEV_FOR_DELETION, method='unmanage',
                 id=volume['id'])
             return
-        instance, _ = self._resolve_sldev_owner(volume)
-        if instance is None:
-            # Neither site has an LDEV labelled for the volume, so there is
-            # no nickname to clear.
-            utils.output_log(
-                MSG.INVALID_LDEV_FOR_DELETION, method='unmanage',
-                id=volume['id'])
-        else:
-            try:
-                instance.modify_ldev_name(ldev, '')
-            except exception.VolumeDriverException:
-                utils.output_log(
-                    MSG.GROUP_REPLICATION_NICKNAME_CLEANUP_FAILED,
-                    volume=volume['id'], ldev=ldev)
         utils.output_log(
             MSG.GROUP_REPLICATION_VOLUME_UNMANAGED,
             volume=volume['id'], ldev=ldev)
@@ -3260,9 +3045,9 @@ class HBSDREPLICATION(rest.HBSDREST):
             self._group_repl_classify_members(
                 copy_group_name, add_volumes or [])
             if copy_grp_exists else ([], [], []))
-        suspended_ids = ({volume.id for volume in suspended} |
-                         {volume.id for volume in replicating} |
-                         {volume.id for volume, _ in wrong_state})
+        paired_ids = ({volume.id for volume in suspended} |
+                      {volume.id for volume in replicating} |
+                      {volume.id for volume, _ in wrong_state})
         add_volumes_update = []
         if suspended:
             add_volumes_update.extend(
@@ -3274,7 +3059,7 @@ class HBSDREPLICATION(rest.HBSDREST):
         added_updates = []
         is_new_copy_grp = not copy_grp_exists
         for volume in add_volumes or []:
-            if volume.id in suspended_ids:
+            if volume.id in paired_ids:
                 continue
             volume_model_update = self._group_repl_add_volume(
                 volume, copy_group_name, is_new_copy_grp,
@@ -3325,14 +3110,6 @@ class HBSDREPLICATION(rest.HBSDREST):
     def _get_rep_pairs(self, volumes):
         rep_pairs = []
         for volume in volumes:
-            if _volume_in_group_replication(volume):
-                utils.output_log(
-                    MSG.GROUP_REPLICATION_UNSUPPORTED_OPERATION,
-                    operation='Host failback',
-                    details='volume: %(volume)s, group: %(group)s; use '
-                            'group failback for group replication volumes' %
-                            {'volume': volume.id, 'group': volume.group_id})
-                continue
             if volume.replication_status in (
                     fields.ReplicationStatus.FAILED_OVER,
                     fields.ReplicationStatus.FAILOVER_ERROR):
@@ -3441,7 +3218,18 @@ class HBSDREPLICATION(rest.HBSDREST):
 
     def _failback_volume(self, volumes):
         failback_success_pairs = []
-        rep_pairs = self._get_rep_pairs(volumes)
+        candidates = []
+        for volume in volumes:
+            if _volume_in_group_replication(volume):
+                utils.output_log(
+                    MSG.GROUP_REPLICATION_UNSUPPORTED_OPERATION,
+                    operation='Host failback',
+                    details='volume: %(volume)s, group: %(group)s; use '
+                            'group failback for group replication volumes' %
+                            {'volume': volume.id, 'group': volume.group_id})
+                continue
+            candidates.append(volume)
+        rep_pairs = self._get_rep_pairs(candidates)
         if rep_pairs:
             try:
                 remote_copy_grps = (
@@ -3574,9 +3362,9 @@ class HBSDREPLICATION(rest.HBSDREST):
         suspended, replicating, wrong_state = (
             self._group_repl_classify_members(copy_group_name, volumes)
             if copy_grp_exists else ([], [], []))
-        suspended_ids = ({volume.id for volume in suspended} |
-                         {volume.id for volume in replicating} |
-                         {volume.id for volume, _ in wrong_state})
+        paired_ids = ({volume.id for volume in suspended} |
+                      {volume.id for volume in replicating} |
+                      {volume.id for volume, _ in wrong_state})
         volumes_model_update = []
         if suspended:
             volumes_model_update.extend(
@@ -3588,7 +3376,7 @@ class HBSDREPLICATION(rest.HBSDREST):
         added_updates = []
         is_new_copy_grp = not copy_grp_exists
         for volume in volumes:
-            if volume.id in suspended_ids:
+            if volume.id in paired_ids:
                 continue
             volume_model_update = self._group_repl_add_volume(
                 volume, copy_group_name, is_new_copy_grp,
@@ -3663,7 +3451,6 @@ class HBSDREPLICATION(rest.HBSDREST):
         rep_type = self.driver_info['rep_type_async']
         mode = _failover_mode(group, requested_mode)
         is_graceful = not is_failback and mode == _MODE_GRACEFUL
-        self._known_copy_groups.add(copy_group_name)
         try:
             if is_failback:
                 self.rep_secondary.client.resync_remote_copy_grp(

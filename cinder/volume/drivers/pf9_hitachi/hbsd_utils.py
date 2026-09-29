@@ -408,14 +408,6 @@ class HBSDMsg(enum.Enum):
                'backend. (%(details)s)',
         'suffix': WARNING_SUFFIX,
     }
-    GROUP_REPLICATION_NICKNAME_CLEANUP_FAILED = {
-        'msg_id': 350,
-        'loglevel': base_logging.WARNING,
-        'msg': 'Failed to clean up the LDEV nickname for an unmanaged '
-               'group replication volume. (volume: %(volume)s, LDEV: '
-               '%(ldev)s)',
-        'suffix': WARNING_SUFFIX,
-    }
     STORAGE_COMMAND_FAILED = {
         'msg_id': 600,
         'loglevel': base_logging.ERROR,
