@@ -1025,14 +1025,21 @@ class HBSDGroupReplicationMessageTest(test.TestCase):
     """Unit test class for the group replication message catalogue."""
 
     def test_msg_ids_are_unique(self):
+        upstream_duplicates = {'MIGRATE_SI_FAILED', 'INVALID_EXTRA_SPEC_KEY_2'}
         seen = {}
         duplicates = []
         for msg in hbsd_utils.HBSDMsg:
             msg_id = msg.value['msg_id']
-            if msg_id in seen:
+            if msg_id in seen and not (
+                    {seen[msg_id], msg.name} <= upstream_duplicates):
                 duplicates.append((msg_id, seen[msg_id], msg.name))
             seen[msg_id] = msg.name
         self.assertEqual([], duplicates)
+
+    def test_group_replication_msg_ids_start_at_800(self):
+        ids = [msg.value['msg_id'] for msg in hbsd_utils.HBSDMsg
+               if msg.name.startswith('GROUP_REPLICATION_')]
+        self.assertEqual(list(range(800, 800 + len(ids))), ids)
 
     @ddt.data(
         'GROUP_REPLICATION_PAIR_CREATED',
@@ -1062,7 +1069,7 @@ class HBSDGroupReplicationMessageTest(test.TestCase):
 
     def test_already_paired_remedy_names_the_volume_type_spec(self):
         msg = hbsd_utils.HBSDMsg.GROUP_REPLICATION_ALREADY_PAIRED.value
-        self.assertEqual(788, msg['msg_id'])
+        self.assertEqual(816, msg['msg_id'])
         self.assertIn("group_replication_enabled='<is> True'", msg['msg'])
         self.assertNotIn('group_only', msg['msg'])
 

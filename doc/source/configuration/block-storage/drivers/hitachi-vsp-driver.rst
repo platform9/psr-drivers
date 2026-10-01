@@ -33,12 +33,16 @@ otherwise from the volume type. A volume created before its group exists has
 no ``group_id``, and so no group type to consult -- which is the usual order,
 since a group is normally formed from volumes that already exist.
 
-Set the following extra spec on the volume type used for volumes that will
-join a replicated group:
+Cinder's group replication API requires every volume type in a replicated
+group to set ``replication_enabled='<is> True'``. On the volume type used for
+volumes that will join a replicated group, set ``group_replication_enabled``
+as well:
 
 .. code-block:: console
 
-   $ openstack volume type set --property group_replication_enabled='<is> True' \
+   $ openstack volume type set \
+     --property replication_enabled='<is> True' \
+     --property group_replication_enabled='<is> True' \
      <volume type name>
 
 A volume of that type is created unpaired and reports
@@ -47,18 +51,18 @@ group's copy group. A volume of a plain ``replication_enabled`` type on the
 same backend is unaffected and is still paired at create time, so one backend
 serves both.
 
-The key is unscoped, so the scheduler's ``CapabilitiesFilter`` matches it
-against the ``group_replication_enabled`` pool capability. The driver reports
-that capability only on a backend configured for replication. A volume of this
-type can therefore only be placed on a backend that can do group replication;
-on any other backend the create fails with ``No valid backend``.
+``group_replication_enabled`` is unscoped, so the scheduler's
+``CapabilitiesFilter`` matches it against the pool capability of the same name.
+The driver reports that capability only on a backend configured for
+replication. A volume of this type can therefore only be placed on a backend
+that can do group replication; on any other backend the create fails with
+``No valid backend``.
 
 .. note::
 
-   A volume created with group_replication_enabled extra spec is never paired at
-   create time. For any other replicated volume the extra spec is the only way
-   to stop that: without it, the volume pairs at create time and cannot
-   afterwards join a copy group.
+   A volume of a type with this extra spec is never paired at create time, nor
+   is one created directly into a replicated group. Any other replicated
+   volume pairs at create time and cannot afterwards join a copy group.
 
 Allowed values
 ^^^^^^^^^^^^^^

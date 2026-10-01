@@ -10,9 +10,11 @@ features:
     failover preserves write ordering across every member.
   - |
     Hitachi driver: added the ``group_replication_enabled`` volume type
-    extra spec. A volume whose type carries ``<is> True`` for it is not paired
-    when it is created; its pair is created by ``enable_replication`` when the
-    volume joins a group's copy group. One backend can now serve both models
+    extra spec, set alongside ``replication_enabled='<is> True'``, which
+    Cinder requires on every volume type of a replicated group. A volume
+    whose type carries ``<is> True`` for it is not paired when it is created;
+    its pair is created by ``enable_replication`` when the volume joins a
+    group's copy group. One backend can now serve both models
     at once -- a plain ``replication_enabled`` volume type still pairs at
     create time, unchanged.
 
