@@ -33,14 +33,12 @@ from cinder.tests.unit import fake_volume
 from cinder.tests.unit import test
 from cinder.volume import configuration as conf
 from cinder.volume import driver
-# PF9 Start
-from cinder.volume.drivers.pf9_hitachi import hbsd_common
-from cinder.volume.drivers.pf9_hitachi import hbsd_iscsi
-from cinder.volume.drivers.pf9_hitachi import hbsd_replication
-from cinder.volume.drivers.pf9_hitachi import hbsd_rest
-from cinder.volume.drivers.pf9_hitachi import hbsd_rest_api
-from cinder.volume.drivers.pf9_hitachi import hbsd_rest_fc
-# PF9 End
+from cinder.volume.drivers.hitachi import hbsd_common
+from cinder.volume.drivers.hitachi import hbsd_iscsi
+from cinder.volume.drivers.hitachi import hbsd_replication
+from cinder.volume.drivers.hitachi import hbsd_rest
+from cinder.volume.drivers.hitachi import hbsd_rest_api
+from cinder.volume.drivers.hitachi import hbsd_rest_fc
 from cinder.volume import volume_types
 from cinder.volume import volume_utils
 
@@ -1586,3 +1584,49 @@ class HBSDRESTISCSIDriverTest(test.TestCase):
                   hbsd_replication.REST_MIRROR_API_OPTS +
                   hbsd_replication.REST_MIRROR_SSL_OPTS)
         self.assertEqual(actual, ret)
+
+    def test_enable_replication_not_configured(self):
+        self.assertRaises(
+            exception.VolumeDriverException,
+            self.driver.enable_replication,
+            self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]])
+
+    def test_disable_replication_not_configured(self):
+        self.assertRaises(
+            exception.VolumeDriverException,
+            self.driver.disable_replication,
+            self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]])
+
+    def test_failover_replication_not_configured(self):
+        self.assertRaises(
+            exception.VolumeDriverException,
+            self.driver.failover_replication,
+            self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]])
+
+    def test_list_replication_targets_not_configured(self):
+        self.assertEqual(
+            {'replication_targets': []},
+            self.driver.list_replication_targets(self.ctxt, TEST_GROUP[0]))
+
+    @ddt.data('enable_replication', 'disable_replication')
+    def test_group_replication_calls_are_forwarded_to_common(self, name):
+        with mock.patch.object(self.driver.common, name) as forwarded:
+            getattr(self.driver, name)(
+                self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]])
+        forwarded.assert_called_once_with(
+            self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]])
+
+    def test_list_replication_targets_is_forwarded_to_common(self):
+        with mock.patch.object(
+                self.driver.common, 'list_replication_targets') as forwarded:
+            self.driver.list_replication_targets(self.ctxt, TEST_GROUP[0])
+        forwarded.assert_called_once_with(self.ctxt, TEST_GROUP[0])
+
+    def test_failover_replication_forwards_the_secondary_id(self):
+        with mock.patch.object(
+                self.driver.common, 'failover_replication') as forwarded:
+            self.driver.failover_replication(
+                self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]],
+                secondary_backend_id='remote:graceful')
+        forwarded.assert_called_once_with(
+            self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]], 'remote:graceful')

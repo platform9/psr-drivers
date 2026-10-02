@@ -15,6 +15,11 @@
 #
 """REST interface module for Hitachi HBSD Driver."""
 
+# PF9 Start
+# PF9 TEMPORARY: drop before upstream.
+from __future__ import annotations
+# PF9 End
+
 from collections import defaultdict
 from itertools import count
 import json
@@ -35,11 +40,9 @@ from cinder import exception
 from cinder.objects import fields
 from cinder.objects import SnapshotList
 from cinder.volume import configuration
-# PF9 Start
-from cinder.volume.drivers.pf9_hitachi import hbsd_common as common
-from cinder.volume.drivers.pf9_hitachi import hbsd_rest_api as rest_api
-from cinder.volume.drivers.pf9_hitachi import hbsd_utils as utils
-# PF9 End
+from cinder.volume.drivers.hitachi import hbsd_common as common
+from cinder.volume.drivers.hitachi import hbsd_rest_api as rest_api
+from cinder.volume.drivers.hitachi import hbsd_utils as utils
 from cinder.volume.drivers.san import san
 from cinder.volume import volume_utils
 
@@ -93,6 +96,7 @@ _REST_DEFAULT_PORT = 443
 
 _GET_LDEV_COUNT = 16384
 _MAX_LDEV_ID = 65535
+_MAX_LDEV_LABEL = 32
 EX_ENLDEV = 'EX_ENLDEV'
 EX_INVARG = 'EX_INVARG'
 _INVALID_RANGE = [EX_ENLDEV, EX_INVARG]
@@ -1475,7 +1479,7 @@ class HBSDREST(common.HBSDCommon):
                         self.output_log(MSG.DELETE_LDEV_FAILED, ldev=new_ldev)
         return None, volumes_model_update
 
-    def update_group(self, group, add_volumes=None):
+    def update_group(self, group, add_volumes=None, remove_volumes=None):
         if add_volumes and volume_utils.is_group_a_cg_snapshot_type(group):
             for volume in add_volumes:
                 ldev = self.get_ldev(volume)
@@ -1539,9 +1543,10 @@ class HBSDREST(common.HBSDCommon):
                 self.output_log(MSG.DELETE_PAIR_FAILED, pvol=pair['pvol'],
                                 svol=pair['svol'])
 
-    def _create_ctg_snap_pair(self, pairs):
-        snapshotgroup_name = self._create_ctg_snapshot_group_name(
-            pairs[0]['pvol'])
+    def _create_ctg_snap_pair(self, pairs, snapshotgroup_name=None):
+        if snapshotgroup_name is None:
+            snapshotgroup_name = self._create_ctg_snapshot_group_name(
+                pairs[0]['pvol'])
         try:
             for pair in pairs:
                 try:
