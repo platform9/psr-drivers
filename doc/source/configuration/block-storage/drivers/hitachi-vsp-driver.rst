@@ -1,13 +1,1101 @@
-.. NOTE FOR REVIEWERS OF THIS REPOSITORY
-..
-.. This is not a standalone document. It holds the sections to be merged into
-.. cinder's own
-.. ``doc/source/configuration/block-storage/drivers/hitachi-vsp-driver.rst``
-.. when the group-replication work is proposed upstream, kept at the same path
-.. here so the move is a copy rather than a rewrite.
-..
-.. Configuration options are rendered by ``.. config-table::``; extra specs are
-.. not, so the section below is written by hand.
+============================
+Hitachi block storage driver
+============================
+
+Hitachi block storage driver provides Fibre Channel and iSCSI support for
+Hitachi VSP storages.
+
+System requirements
+~~~~~~~~~~~~~~~~~~~
+
+Supported storages:
+
++-----------------+------------------------+
+| Storage model   | Firmware version       |
++=================+========================+
+| VSP E590,       | 93-03-22 or later      |
+| E790            |                        |
++-----------------+------------------------+
+| VSP E990        | 93-01-01 or later      |
++-----------------+------------------------+
+| VSP E1090,      | 93-06-2x or later      |
+| E1090H          |                        |
++-----------------+------------------------+
+| VSP F350,       | 88-01-04 or later      |
+| F370,           |                        |
+| F700,           |                        |
+| F900            |                        |
+|                 |                        |
+| VSP G350,       |                        |
+| G370,           |                        |
+| G700,           |                        |
+| G900            |                        |
++-----------------+------------------------+
+| VSP F400,       | 83-04-43 or later      |
+| F600,           |                        |
+| F800            |                        |
+|                 |                        |
+| VSP G200,       |                        |
+| G400,           |                        |
+| G600,           |                        |
+| G800            |                        |
++-----------------+------------------------+
+| VSP N400,       | 83-06-01 or later      |
+| N600,           |                        |
+| N800            |                        |
++-----------------+------------------------+
+| VSP 5100,       | 90-01-41 or later      |
+| 5500,           |                        |
+| 5100H,          |                        |
+| 5500H           |                        |
++-----------------+------------------------+
+| VSP 5200,       | 90-08-0x or later      |
+| 5600,           |                        |
+| 5200H,          |                        |
+| 5600H           |                        |
++-----------------+------------------------+
+| VSP F1500       | 80-05-43 or later      |
+|                 |                        |
+| VSP G1000,      |                        |
+| VSP G1500       |                        |
++-----------------+------------------------+
+| VSP One B24,    | A3-04-20 or later      |
+| B26,            |                        |
+| B28             |                        |
++-----------------+------------------------+
+| VSP One Block   | A0-05-21 or later      |
+| High End        |                        |
++-----------------+------------------------+
+
+Required storage licenses:
+
+* Hitachi Storage Virtualization Operating System (SVOS)
+
+  - Hitachi LUN Manager
+  - Hitachi Dynamic Provisioning
+* Hitachi Local Replication (Hitachi Thin Image)
+
+* Deduplication and compression (VSP One Block)
+
+Optional storage licenses:
+
+* Deduplication and compression (non-VSP One Block)
+
+* Global-Active Device
+
+Supported operations
+~~~~~~~~~~~~~~~~~~~~
+
+* Create, delete, attach, and detach volumes.
+* Create, list, and delete volume snapshots.
+* Create a volume from a snapshot.
+* Create, list, update, and delete consistency groups.
+* Create, list, and delete consistency group snapshots.
+* Copy a volume to an image.
+* Copy an image to a volume.
+* Clone a volume.
+* Extend a volume.
+* Migrate a volume (host assisted).
+* Migrate a volume (storage assisted).
+* Get volume statistics.
+* Efficient non-disruptive volume backup.
+* Manage and unmanage a volume.
+* Attach a volume to multiple instances at once (multi-attach).
+* Revert a volume to a snapshot.
+
+Hitachi block storage driver also supports the following additional features:
+
+* Global-Active Device
+* Remote replication
+* Maximum number of copy pairs and consistency groups
+* Data deduplication and compression
+* DRS volumes
+* Port scheduler
+* Port assignment using extra spec
+* Configuring Quality of Service (QoS) settings
+* Immutable snapshots
+
+.. note::
+
+   * A volume having snapshots cannot be extended with this driver.
+
+   * Storage assisted volume migration is only supported between same storage.
+
+Configuration
+~~~~~~~~~~~~~
+
+.. warning::
+
+   It is highly recommended to use different port configurations for the
+   CSI (OpenShift) plugin and the HBSD driver, and setting the
+   ``hitachi_group_create`` configuration element to True. Not doing so
+   may result in long-running searches that slow down deployment time,
+   and can even lead to timeouts.
+
+Set up Hitachi storage
+----------------------
+
+You need to specify settings as described below for storage systems. For
+details about each setting, see the user's guide of the storage systems.
+
+Common resources:
+
+1. ``All resources``
+    The name of any storage resource, such as a DP pool or a host group,
+    cannot contain any whitespace characters or else it will be unusable
+    by the driver.
+
+2. ``User accounts``
+    Create a storage device account belonging to the Administrator User Group.
+
+3. ``DP Pool``
+    Create a DP pool that is used by the driver.
+
+4. ``Resource group``
+    If using a new resource group for exclusive use by an OpenStack system,
+    create a new resource group, and assign the necessary resources, such as
+    LDEVs, port, and host group (iSCSI target) to the created resource.
+
+5. ``Ports``
+    Enable Port Security for the ports used by the driver.
+
+If you use iSCSI:
+
+1. ``Ports``
+    Assign an IP address and a TCP port number to the port.
+
+.. note::
+
+   * Do not change LDEV nickname for the LDEVs created by Hitachi block
+     storage driver. The nickname is referred when deleting a volume or
+     a snapshot, to avoid data-loss risk. See details in `bug #2072317`_.
+
+Set up Hitachi storage volume driver and volume operations
+----------------------------------------------------------
+
+Set the volume driver to Hitachi block storage driver by setting the
+volume_driver option in the cinder.conf file as follows:
+
+If you use Fibre Channel:
+
+.. code-block:: ini
+
+   [hitachi_vsp]
+   volume_driver = cinder.volume.drivers.hitachi.hbsd_fc.HBSDFCDriver
+   volume_backend_name = hitachi_vsp
+   san_ip = 1.2.3.4
+   san_login = hitachiuser
+   san_password = password
+   hitachi_storage_id = 123456789012
+   hitachi_pools = pool0
+
+If you use iSCSI:
+
+.. code-block:: ini
+
+   [hitachi_vsp]
+   volume_driver = cinder.volume.drivers.hitachi.hbsd_iscsi.HBSDISCSIDriver
+   volume_backend_name = hitachi_vsp
+   san_ip = 1.2.3.4
+   san_login = hitachiuser
+   san_password = password
+   hitachi_storage_id = 123456789012
+   hitachi_pools = pool0, pool1
+
+Set up and operation for additional features
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Set up Global-Active Device and volume operation
+------------------------------------------------
+
+Beginning with the 2023.1, If you use Global-Active Device (GAD),
+you can make the data of individual volumes redundant between two
+storage systems, thereby improving the availability of the storage systems.
+For details, see the `Global-Active Device User Guide`_.
+
+.. note::
+
+   * You cannot apply Global-Active Device configuration and remote
+     replication configuration to the same backend.
+
+   * You cannot use Asymmetric Logical Unit Access (ALUA).
+
+Storage firmware versions for GAD
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+If you are using a VSP F350, F370, F700, F900 storage system or a VSP G350,
+G370, G700,G900 storage system in a Global-Active Device configuration,
+make sure the firmware version is 88-03-21 or later.
+
+Creating a Global-Active Device environment
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+Before using Global-Active Device, create the prerequisite environment,
+such as connecting remote paths, configuring a quorum disk,
+and creating a virtual storage machine (VSM), by other storage system
+management tools. Hitachi block storage driver supports the following
+configurations.
+
+* Configuration where the P-VOL is not registered to a VSM
+
+* Configuration where the P-VOL is registered to a VSM
+
+For details, see the Workflow for creating a GAD environment in the
+`Global-Active Device User Guide`_
+
+Hitachi block storage driver automatically setups following procedures
+that are described in the section `Workflow for creating a GAD environment`_ :
+
+* The following steps of Setting up the secondary storage system:
+
+  - Setting the GAD reserve attribute on the S-VOL
+  - Creating a host group (Only if the configuration option
+    ``hitachi_group_create`` is True)
+  - Creating the S-VOL
+  - Adding an LU path to the S-VOL
+
+* Updating the CCI configuration definition files
+
+* Creating the GAD pair
+
+* Adding an alternate path to the S-VOL
+
+You must register the information about the secondary storage system to the
+REST API server in the primary site and register the information about the
+primary storage system to the REST API server in the secondary site.
+For details about how to register the information, see the
+`Hitachi Command Suite Configuration Manager REST API Reference Guide`_ or
+the `Hitachi Ops Center API Configuration Manager REST API Reference Guide`_.
+
+.. note::
+
+   * The users specified for both configuration options
+     ``san_login`` and ``hitachi_mirror_rest_user`` must have following
+     roles:
+
+     * Storage Administrator (View & Modify)
+
+     * Storage Administrator (Remote Copy)
+
+   * Reserve unused host group IDs (iSCSI target IDs) for the resource groups
+     related on the VSM. Reserve the IDs in ascending order. The number of IDs
+     you need to reserve is 1 plus the sum of the number of controller nodes
+     and the number of compute nodes. For details on how to reserve a host
+     group ID (iSCSI target ID), see `Global-Active Device User Guide`_.
+   * The LUNs of the host groups (iSCSI targets) of the specified ports on
+     the primary storage system must match the LUNs of the host groups
+     (iSCSI targets) of the specified ports on the secondary storage system.
+     If they do not match, match the LUNs for the primary storage system with
+     those for the secondary storage system.
+   * When you use a same storage system as secondary storage system for
+     Global-Active Device configuration and backend storage system for general
+     use at the same time, you cannot use the same ports between different
+     backend storage systems.
+     Please specify different ports in the configuration options
+     ``hitachi_target_ports``, ``hitachi_compute_target_ports``, or
+     ``hitachi_rest_pair_target_ports`` between different backend storage
+     systems.
+
+Create volume in a Global-Active Device configuration
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+If you create a Cinder volume in a Global-Active Device configuration,
+each Global-Active Device pair is mapped to a Cinder volume.
+
+In order for you to create volumes with the Global-Active Device attribute
+specified, you must first create a volume type that contains the
+``hbsd:topology=active_active_mirror_volume`` extra-spec.
+You can do this as follows:
+
+.. code-block:: console
+
+   $ openstack volume type create <volume type name>
+   $ openstack volume type set --property \
+   hbsd:topology=active_active_mirror_volume <volume type name>
+
+You can then create GAD volumes as follows:
+
+.. code-block:: console
+
+   $ openstack volume create --type <volume type name> --size <size>
+
+.. note::
+
+   * Note the following if the configuration is "P-VOL registered to a VSM":
+
+     * Do not create volumes whose volume types do not have
+       ``hbsd:topology=active_active_mirror_volume`` extra-spec.
+
+     * While setting up the environment, set a virtual LDEV ID for every LDEV
+       specified by the configuration option ``hitachi_ldev_range parameter``
+       on the primary storage system using storage management software
+       because virtual LDEV IDs are necessary for GAD pair creation.
+
+Unavailable Cinder functions
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+Following cinder functions are unavailable in a Global-Active Device
+configuration:
+
+* Migrate a volume (storage assisted)
+
+* Manage Volume
+
+* Unmanage Volume
+
+.. note::
+
+   In addition, if the configuration is "P-VOL registered to a VSM",
+   the backup creation command of the Backup Volume functions cannot be run
+   with the ``--snapshot option`` or the ``--force`` option specified.
+
+
+Set up remote replication and volume operation
+----------------------------------------------
+
+Hitachi block storage driver uses Universal Replicator for remote replication.
+For details about Universal Replicator, see the
+`Universal Replicator User Guide`_.
+
+.. note::
+
+   * You cannot use a configuration that has multiple replication targets (the configuration described on the following webpage).
+
+   https://docs.openstack.org/cinder/latest/contributor/replication.html
+
+   * You cannot apply global-active device configuration and remote replication configuration to the same backend.
+
+**System requirements for a remote replication configuration**
+
+**Storage firmware versions**
+
++-----------------+------------------------+
+| Storage model   | Firmware version       |
++=================+========================+
+| VSP E590,       | 93-03-22 or later      |
+| E790            |                        |
++-----------------+------------------------+
+| VSP E990        | 93-01-01 or later      |
++-----------------+------------------------+
+| VSP E1090,      | 93-06-2x or later      |
+| E1090H          |                        |
+| VSP F350,       | 88-06-01 or later      |
+| F370,           |                        |
+| F700,           |                        |
+| F900            |                        |
+|                 |                        |
+| VSP G350,       |                        |
+| G370,           |                        |
+| G700,           |                        |
+| G900            |                        |
++-----------------+------------------------+
+| VSP 5100,       | 90-04-01 or later      |
+| 5500,           |                        |
+| 5100H,          |                        |
+| 5500H           |                        |
++-----------------+------------------------+
+| VSP One B24,    | A3-04-20 or later      |
+| B26,            |                        |
+| B28             |                        |
++-----------------+------------------------+
+| VSP One Block   | A0-05-21 or later      |
+| High End        |                        |
++-----------------+------------------------+
+
+**Storage management software**
+
+Configuration Manager REST API version 8.6.5-00 or later is required;
+however, a newer version might be required
+depending on the storage system model.
+Use the Configuration Manager REST API
+that corresponds to the firmware version
+of the storage system model you are using.
+
+**Storage software license**
+
+Obtain the following software licenses, which are
+included in Hitachi Remote Replication:
+
+* Universal Replicator
+
+* TrueCopy
+
+**Creating a remote replication environment**
+
+Before you can use Universal Replicator,
+use other storage system management tools
+to create the prerequisite environment.
+For details, see the description of operations
+in a Universal Replicator configuration
+in the `Universal Replicator User Guide`_,
+and the description of the workflow for creating a remote copy environment
+in the `Hitachi Command Suite Configuration Manager REST API Reference Guide`_
+or the
+`Hitachi Ops Center API Configuration Manager REST API Reference Guide`_.
+
+Perform the procedure up to and including the step
+in which remote paths are set.
+
+You must also specify parameters for Hitachi block storage driver.
+
+.. note::
+
+   The users specified for the san_login parameter and the san_login parameter of the replication_device parameter must have following roles:
+
+   * Storage Administrator (Remote Copy)
+   * Storage Administrator (System Resource Management)
+
+**Volume operations in a remote replication configuration**
+
+If you create a Cinder volume in a remote replication configuration,
+each Universal Replicator pair is mapped to a Cinder volume.
+You can then perform operations on Cinder volume
+without thinking of it as a copy pair.
+
+.. note::
+
+   * The status of a Universal Replicator pair is assumed to be COPY or PAIR. If the status is not COPY or PAIR, replication is not performed normally between the primary and secondary storage systems. To check the pair status or change the status, use the storage system management software.
+   * When restarting the primary or secondary storage system, perform the procedure described in Powering-off the primary or secondary storage system in the `Universal Replicator User Guide`_.
+
+**Create volume in a remote replication configuration**
+
+To create a replicated volume, specify replication_enabled="<is> True"
+as an extra spec for the volume type as follows:
+
+.. code-block:: ini
+
+   # cinder type-create <volume type name>
+   # cinder type-key <volume type name> \
+   set replication_enabled="<is> True"
+   # cinder create --volume-type <volume type name> <size>
+
+.. note::
+
+   * In this case, the following restrictions apply:
+
+    * After a volume is created, do not change volume type extra specs and the ``replication_device`` parameter value.
+
+**Unavailable Cinder functions**
+
+If a remote replication configuration is used,
+you cannot use the following Cinder functions:
+
+* Volume Migration (host assisted)
+* Volume Migration (storage assisted)
+* Consistency Group
+* Generic volume group
+* Revert to snapshot
+* Manage Volume
+* Unmanage Volume
+* Retype Volume
+
+Maximum number of copy pairs and consistency groups
+---------------------------------------------------
+
+The maximum number of Thin Image pairs that can be created for each LDEV
+assigned to a volume (or snapshot) is restricted on a per-storage-system basis.
+If the number of pairs exceeds the maximum, copying cannot proceed normally.
+
+For information about the maximum number of copy pairs and consistency groups
+that can be created, see the `Hitachi Thin Image User Guide`_.
+
+Configuring Quality of Service (QoS) settings
+---------------------------------------------
+
+By configuring Quality of Service (QoS) settings, you can restrict the
+I/O processing of each volume, thereby maintaining the required performance
+and quality levels.
+
+In Hitachi block storage driver, you can configure the following settings for
+each volume. However, you cannot configure these settings for journal volumes.
+
+* Throughput (IOPS, amount of data transferred in MB/s)
+
+  You can set the upper and lower limits on throughput. If an upper
+  limit is exceeded, I/O is suppressed. If a lower limit is not met, I/O
+  is adjusted so that the lower limit is met.
+
+* Priority level of the I/O processing
+
+  You can set priority levels for the I/O processing of multiple
+  volumes.  I/O is adjusted for faster I/O response, starting with
+  high-priority volumes.
+
+**System requirements for QoS**
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+**Storage firmware versions**
+
++-----------------+------------------------+
+| Storage model   | Firmware version       |
++=================+========================+
+| VSP E590,       | 93-03-22 or later      |
+| E790            |                        |
++-----------------+------------------------+
+| VSP E990        | 93-01-01 or later      |
++-----------------+------------------------+
+| VSP E1090,      | 93-06-2x or later      |
+| E1090H          |                        |
+| VSP F350,       | 88-06-01 or later      |
+| F370,           |                        |
+| F700,           |                        |
+| F900            |                        |
+|                 |                        |
+| VSP G350,       |                        |
+| G370,           |                        |
+| G700,           |                        |
+| G900            |                        |
++-----------------+------------------------+
+| VSP 5100,       | 90-04-01 or later      |
+| 5500,           |                        |
+| 5100H,          |                        |
+| 5500H           |                        |
++-----------------+------------------------+
+| VSP One B24,    | A3-04-20 or later      |
+| B26,            |                        |
+| B28             |                        |
++-----------------+------------------------+
+| VSP One Block   | A0-05-21 or later      |
+| High End        |                        |
++-----------------+------------------------+
+
+**Storage management software**
+
+Configuration Manager REST API version 10.2.0-00 or later is required.
+
+**Configuring QoS settings and creating volumes**
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+Create QoS specs that define QoS settings, and then associate the QoS
+specs with a volume type. You can configure QoS settings for a volume
+by running the following functions with this volume type specified.
+
+* Create Volume
+* Create Snapshot
+* Create Volume from Snapshot
+* Create Volume from Volume (Clone)
+* Consistency Group
+* Generic volume group
+
+The following example describes the procedure for configuring QoS settings
+when creating a new volume using the Create Volume function.
+
+Before you begin, Check the following information.
+
+* QoS settings
+
+  - Upper or lower limit on throughput (IOPS, amount of data transferred
+    in MB/s)
+  - Priority level of I/O processing
+
+* ID and name of the volume type
+
+  A volume type is needed in order to associate it with the QoS specs.
+  If no volume types exist, create one in advance.
+
+**Procedure**
+
+1. Create the QoS specs
+
+   a. If you use the cinder command:
+
+.. code-block:: console
+
+    $ cinder qos-create <name-of-the-QoS-specs> [consumer=back-end] \
+    <name-of-a-QoS-specs-property>=<value-of-the-QoS-specs-property> \
+    [<name-of-a-QoS-specs-property>=<value-of-the-QoS-specs-property> ...]
+
+\
+   b. If you use the openstack command:
+
+.. code-block:: console
+
+    $ openstack volume qos create [--consumer back-end] \
+    --property \
+    <name-of-a-QoS-specs-property>=<value-of-the-QoS-specs-property> \
+    [--property \
+    <name-of-a-QoS-specs-property>=<value-of-the-QoS-specs-property> ...] \
+    <name-of-the-QoS-specs>
+
+\
+ Specify a name for ``<name-of-the-QoS-specs>``.
+
+ Specify ``<name-of-a-QoS-specs-property>`` and
+ ``<value-of-the-QoS-specs-property>`` as follows.
+ For details on the range of values you can specify, see the overview of
+ QoS operations in the `Performance Guide`_.
+
+ +--------------------+------------------------------------------+
+ | QoS specs property | Description                              |
+ +====================+==========================================+
+ | upperIops          | The upper limit on IOPS.                 |
+ +--------------------+------------------------------------------+
+ | upperTransferRate  | The upper limit on the amount of data    |
+ |                    | transferred in MB/s.                     |
+ +--------------------+------------------------------------------+
+ | lowerIops          | The lower limit on IOPS.                 |
+ +--------------------+------------------------------------------+
+ | lowerTransferRate  | The lower limit on the amount of data    |
+ |                    | transferred in MB/s.                     |
+ +--------------------+------------------------------------------+
+ | responsePriority   | The priority level of the I/O processing.|
+ +--------------------+------------------------------------------+
+
+ +----------------------------+----------------------------------+
+ | Dynamic QoS specs property | Description                      |
+ +============================+==================================+
+ | upperIopsPerGB             | The upper limit on IOPS per GB   |
+ |                            | of volume size.                  |
+ +----------------------------+----------------------------------+
+
+ The following is an example of running the command.
+
+\
+   a. If you use the cinder command:
+
+.. code-block:: console
+
+    $ cinder qos-create test_qos consumer=back-end upperIops=2000
+
+\
+   b. If you use the openstack command:
+
+.. code-block:: console
+
+    $ openstack volume qos create --consumer back-end \
+    --property upperIops=2000 test_qos
+
+\
+ When you run this command, the ID of the created QoS specs is also output.
+ Record this ID, because you will need it in a later step.
+
+\
+
+2. Associate the QoS specs with a volume type.
+
+   a. If you use the cinder command:
+
+.. code-block:: console
+
+    $ cinder qos-associate <ID-of-the-QoS-specs> <ID-of-the-volume-type>
+
+\
+   b. If you use the openstack command:
+
+.. code-block:: console
+
+    $ openstack volume qos associate <name-of-the-QoS-specs> \
+    <name-of-the-volume-type>
+
+3. Specify the volume type that is associated with the QoS specs, and then
+   create a volume.
+
+   a. If you use the cinder command:
+
+.. code-block:: console
+
+    $ cinder create --volume-type <name-of-the-volume-type> <size>
+
+\
+   b. If you use the openstack command:
+
+.. code-block:: console
+
+    $ openstack volume create --size <size> --type <name-of-the-volume-type> \
+    <name>
+
+**Changing QoS settings**
+
+To change the QoS settings, use the Retype function to change the volume type
+to one that has different QoS specs.
+
+You can also change a volume type for which no QoS specs are set to a volume
+type for which QoS specs are set, and vice versa.
+
+**Clearing QoS settings**
+
+To clear the QoS settings, clear the association between the volume type and
+QoS specs, and then delete the QoS specs.
+
+**Adaptive QoS settings**
+
+Adaptive QoS settings can be used to configure QoS based on volume properties.
+
+*upperIopsPerGB* can be used to configure the *upperIops* setting based on the
+volume size. If the volume is resized the QoS settings will be updated as
+necessary.
+
+This value is applied per each GB of volume size. For example, if the cinder
+volume is of size 1 (1GB) and the *upperIopsPerGB* value is set to 1000, then
+*upperIops* will be configured as 1000.
+
+This dynamically generated value will be within the legal range for IOPS
+configuration.
+
+If *upperIops* is also configured then *upperIops* will be the largest possible
+dynamically generated value.
+
+If *lowerIops* is also configured, the *lowerIops* will be configured for the
+volume and the smallest possible dynamically generated value will be
+*lowerIops* + 1.
+
+
+Data deduplication and compression
+----------------------------------
+
+Use deduplication and compression to improve storage utilization using data
+reduction.
+
+For details,
+see `Capacity saving function: data deduplication and compression`_
+in the `Provisioning Guide`_.
+
+**Enabling deduplication and/or compression**
+
+To use the deduplication and/or compression on the storage models, your storage
+administrator must first enable the deduplication and compression for the DP
+pool.
+
+For details about how to enable this setting, see the description of pool
+management in the
+`Hitachi Command Suite Configuration Manager REST API Reference Guide`_ or the
+`Hitachi Ops Center API Configuration Manager REST API Reference Guide`_.
+
+.. note::
+
+   * Do not set a subscription limit (virtualVolumeCapacityRate) for the DP
+     pool.
+
+Creating a volume with deduplication and/or compression enabled
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+To create a volume with the deduplication and/or compression setting enabled,
+enable deduplication and/or compression for the relevant volume type.
+
+**Procedure**
+
+1. To enable the deduplication and compression setting, specify the value
+``deduplication_compression`` for ``hbsd:capacity_saving`` in the extra specs
+for the volume type.
+
+2. To enable the compression only setting, specify the value
+``compression`` for ``hbsd:capacity_saving`` in the extra specs for the volume
+type.
+
+3. When creating a volume of the volume types created in the previous steps,
+you can create a volume with the deduplication and/or compression function
+enabled.
+
+Deleting a volume with deduplication and/or compression enabled
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+The cinder delete command finishes when the storage system starts the LDEV
+deletion process. The LDEV cannot be reused until the LDEV deletion process is
+completed on the storage system.
+
+DRS volumes
+----------------------------------
+
+Use DRS volumes to improve storage utilization using data
+reduction and data sharing.
+
+DRS volumes are required for VSP One Block series storage
+when performing Clone operations.
+
+DRS volumes may not have the ``hbsd:drs`` extra spec
+removed through retyping (or vice-versa), and the
+``hbsd:capacity_saving`` value for a DRS volume
+may switch between ``deduplication_compression`` and
+``compression``, but may not be removed or disabled.
+
+For details,
+see `Capacity saving function: data deduplication and compression`_
+in the `Provisioning Guide`_.
+
+**Enabling DRS**
+
+To use the DRS functionality on the storage models, your storage
+administrator must first enable the deduplication and compression for the DP
+pool.
+
+For details about how to enable this setting, see the description of pool
+management in the
+`Hitachi Command Suite Configuration Manager REST API Reference Guide`_ or the
+`Hitachi Ops Center API Configuration Manager REST API Reference Guide`_.
+
+.. note::
+
+   * Do not set a subscription limit (virtualVolumeCapacityRate) for the DP
+     pool.
+
+Creating a volume with DRS enabled
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+To create a volume with the DRS setting enabled,
+enable deduplication and/or compression and DRS for the relevant volume type.
+
+**Procedure**
+
+1. To enable the deduplication and compression setting, specify the value
+``deduplication_compression`` for ``hbsd:capacity_saving`` in the extra specs
+for the volume type.
+
+2. To enable the compression only setting, specify the value
+``compression`` for ``hbsd:capacity_saving`` in the extra specs
+for the volume type.
+
+3. To enable the DRS setting, speciy the value ``<is> True`` for ``hbsd:drs``
+in the extra specs for the volume type.
+
+4. When creating a volume of the volume types created in the previous steps,
+you can create a volume with the deduplication and/or compression function and
+DRS function enabled.
+
+Automatic DRS volume creation
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+You can configure DRS to be automatically used on a backend by setting
+the configuration value ``hitachi_use_drs_volumes`` to ``True``. If set to
+``True``, the ``hitachi_drs_default_csv`` setting will determine the capacity
+saving value (``deduplication_compression`` or ``compression``).
+
+This setting is overridden by the ``hbsd:drs`` extra spec, which may be set
+to ``<is> False`` to create a non-DRS volume. The ``hbsd:capacity_saving``
+extra spec may also be provided to override the configuration setting for
+capacity saving when using DRS.
+
+Setting ``hitachi_use_drs_volumes`` to ``True`` is recommended when working
+with VSP One Block storage arrays.
+
+Deleting a volume with deduplication and/or compression enabled
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+The cinder delete command finishes when the storage system starts the LDEV
+deletion process. The LDEV cannot be reused until the LDEV deletion process is
+completed on the storage system.
+
+.. note::
+
+   * When deleting a volume that has been cloned using Thin Image Advanced and
+     vClone (DRS volumes + same pool), the vClone parent volume cannot be deleted
+     until all children have been deleted.
+
+Immutable Snapshots (Snapshot Retention)
+---------------------------------------------
+
+By using Immutable Snapshots, you can guarantee that a snapshot cannot be
+deleted for a set number of hours.
+
+Immutable Snapshots can be configured in one of two ways:
+
+* With an extra specification on the volume to create a snapshot for.
+
+  This method uses an extra spec on the volume to create a snapshot for. The
+  value will be used for all snapshots created for this volume. Changing or
+  removing this extra spec will not change the retention period of existing
+  snapshots.
+
+  The extra specification must be named hbsd:snapshot_retention.
+  The valid range for this setting is 0 - 12288. 0 is the same as no retention.
+
+  This method is overridden by snapshot properties if both are provided.
+
+* With a property set while creating the snapshot itself.
+
+  This method uses a property while creating a snapshot to specify the
+  retention period. Changing or removing this property will have no effect on
+  the snapshot once it is created.
+
+  The property must be named hbsd:snapshot_retention.
+  The valid range for this setting is 0 - 12288. 0 is the same as no retention.
+
+  This method overrides an extra spec if both are provided.
+
+.. note::
+
+   * Attempting to delete a snapshot that is still in its retention period will
+     fail. Other operations can still be performed as normal.
+
+**System requirements for Immutable Snapshots (Snapshot Retention)**
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+**Storage firmware versions**
+
++-----------------+------------------------+
+| Storage model   | Firmware version       |
++=================+========================+
+| VSP E590,       | 93-03-22 or later      |
+| E790            |                        |
++-----------------+------------------------+
+| VSP E990        | 93-01-01 or later      |
++-----------------+------------------------+
+| VSP E1090,      | 93-06-2x or later      |
+| E1090H          |                        |
++-----------------+------------------------+
+| VSP 5100,       | 90-04-01 or later      |
+| 5500,           |                        |
+| 5100H,          |                        |
+| 5500H           |                        |
++-----------------+------------------------+
+| VSP One B24,    | A3-04-20 or later      |
+| B26,            |                        |
+| B28             |                        |
++-----------------+------------------------+
+| VSP One Block   | A0-05-21 or later      |
+| High End        |                        |
++-----------------+------------------------+
+
+**Configuring Snapshot Retention with Extra Specs**
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+Create a volume type that contains the immutable snapshot extra spec,
+and then associate it with a volume to create snapshots for.
+
+The following example describes the procedure for configuring the
+immutable snapshot extra spec.
+
+**Procedure**
+
+1. Create the volume type
+
+.. code-block:: console
+
+    $ openstack volume type create [--consumer back-end] \
+    --property hbsd:snapshot_retention=<retention-value-in-hours> \
+    <name-of-the-volume-type>
+
+2. Associate the type with a volume.
+
+   a. During volume creation:
+
+.. code-block:: console
+
+    $ openstack volume create --type <type> --size <size> <name>
+
+\
+   b. By retyping:
+
+.. code-block:: console
+
+    $ openstack volume set --type <name-of-the-volume-type> <name>
+
+3. Create a snapshot for the volume.
+
+.. code-block:: console
+
+    $ openstack volume snapshot create [--size <size>] --source \
+    <volume-name> <snapshot-name>
+
+The following is an example of running the commands.
+
+.. code-block:: console
+
+    $ openstack volume type create --consumer back-end \
+    --property hbsd:snapshot_retention=96 test_retention
+
+    $ openstack volume create --size 1 --type test_retention test_volume
+
+    $ openstack volume snapshot create --source test_volume test_snapshot
+
+\
+
+**Configuring Snapshot Retention with Snapshot Properties**
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+Create a snapshot for an existing volume by using a property to set the
+retention.
+
+The following example describes the procedure for creating the snapshot
+with retention.
+
+**Procedure**
+
+1. Create a snapshot for the volume.
+
+.. code-block:: console
+
+    $ openstack volume snapshot create [--size <size>] --source \
+    <volume-name> --property hbsd:snapshot_retention=<value-in-hours> \
+    <snapshot-name>
+
+The following is an example of running the command.
+
+.. code-block:: console
+
+    $ openstack volume snapshot create --source test_volume --property \
+    hbsd:snapshot_retention=96 test_snapshot
+
+\
+
+Port scheduler
+--------------
+
+You can use the port scheduler function to reduce the number of WWNs,
+which are storage system resource.
+
+In Hitachi block storage driver, if host groups are created automatically,
+host groups are created for each compute node or VM (in an environment that
+has a WWN for each VM). If you do not use the port scheduler function,
+host groups are created and the same WWNs are registered in all of the ports
+that are specified for the configuration option
+``hitachi_compute_target_ports`` or for the configuration option
+``hitachi_target_ports``.
+For Hitachi storage devices, a maximum of 255 host groups and 255 WWNs can be
+registered for one port.
+When volumes are attached, the upper limit on the number of WWNs that can be
+registered might be unexpectedly exceeded.
+
+For the port scheduler function, when the cinder-volume service starts,
+the Fibre Channel Zone Manager obtains the WWNs of active compute nodes and
+of active VMs. When volumes are attached, the WWNs are registered in
+a round-robin procedure, in the same order as the order of ports specified
+for the configuiration option ``hitachi_compute_target_ports`` or for the
+configuiration option ``hitachi_target_ports``.
+
+If you want to use the port scheduler function,
+set the configuration option ``hitachi_port_scheduler``.
+
+.. note::
+
+   * Only Fibre Channel is supported. For details about ports,
+     see Fibre Channel connectivity.
+   * If a host group already exists in any of the ports specified for the
+     configuration option ``hitachi_compute_target_ports`` or for the
+     configuration option ``hitachi_target_ports``, no new host group will be
+     created on those ports.
+   * Restarting the cinder-volume service re-initializes the round robin
+     scheduling determined by the configuration option
+     ``hitachi_compute_target_ports`` or the configuration option
+     ``hitachi_target_ports``.
+   * The port scheduler function divides up the active WWNs from each fabric
+     controller and registers them to each port. For this reason,
+     the number of WWNs registered may vary from port to port.
+
+Port assignment using extra specs
+---------------------------------
+
+Defining particular ports in the Hitachi-supported extra spec
+``hbsd:target_ports`` determines which of the ports specified by the
+configuration options ``hitachi_target_ports`` or the configuration option
+``hitachi_compute_target_ports`` are used to create LUN paths during volume
+attach operations for each volume type.
+
+.. note::
+
+   * Use a comma to separate multiple ports.
+   * In a Global-Active Device configuration or a remote replication, use the extra spec
+     ``hbsd:target_ports`` for the primary storage system and the extra spec
+     ``hbsd:remote_target_ports`` for the secondary storage system.
+   * In a Global-Active Device configuration, the ports specified for
+     the extra spec ``hbsd:target_ports`` must be specified for both the
+     configuration options for the primary storage system
+     (``hitachi_target_ports`` or ``hitachi_compute_target_ports``)
+     and for the secondary storage system
+     (``hitachi_mirror_target_ports`` or
+     ``hitachi_mirror_compute_target_ports``).
+   * In a remote replication configuration, the ports specified for the extra spec
+     ``hbsd:remote_target_ports`` must be specified for the ``target_ports`` child parameter
+     or the ``compute_target_ports`` child parameter of the ``replication_device`` parameter.
 
 Group replication
 -----------------
@@ -20,7 +1108,7 @@ group's volumes a single consistency point. ``enable_replication``,
 a whole, so a failover preserves write ordering across every member.
 
 Pairing at create time, or at group join
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 A replicated volume is normally paired as it is created. A volume destined for
 a replicated group must not be, because the driver pins one mirror unit
@@ -96,3 +1184,182 @@ The extra spec must be exactly ``<is> True``, or absent.
      - matches
      - **not** group-replicated
      - Scheduled, but paired at create time, so it can never join a copy group
+
+Failover and failback
+<<<<<<<<<<<<<<<<<<<<<
+
+``failover_replication`` fails over or fails back the copy group of a
+replicated group. The ``secondary_backend_id`` names the target and can carry
+a mode suffix:
+
+.. list-table::
+   :header-rows: 1
+
+   * - ``secondary_backend_id``
+     - Behavior
+   * - ``<backend_id>``
+     - Graceful if the group type sets
+       ``hbsd:group_replication_failover_mode`` to ``graceful``, otherwise
+       emergency.
+   * - ``<backend_id>:graceful``
+     - Splits the copy group from the primary storage system. Use it while
+       the primary storage system is reachable.
+   * - ``<backend_id>:emergency``
+     - Takes over the copy group from the storage system that holds its
+       secondary side, without the primary storage system. Use it when the
+       primary storage system is down.
+   * - ``default``
+     - Fails back. Sent to the backend of the source storage system, the
+       driver swap-resyncs the pairs from the DR storage system, splits them
+       from the source, and swap-resyncs them from the source, so the source
+       volumes are primary again. It reads the pairs on both storage systems
+       first and continues from where an earlier attempt stopped.
+
+A failover with no mode suffix and no group type extra spec is an emergency
+failover. A mode suffix on ``default`` is rejected with
+``InvalidReplicationTarget``.
+
+Configuration options
+~~~~~~~~~~~~~~~~~~~~~
+
+This table shows configuration options for Hitachi block storage driver.
+
+.. config-table::
+   :config-target: Hitachi block storage driver
+
+   cinder.volume.drivers.hitachi.hbsd_rest
+   cinder.volume.drivers.hitachi.hbsd_common
+   cinder.volume.drivers.hitachi.hbsd_rest_fc
+   cinder.volume.drivers.hitachi.hbsd_replication
+
+Required options
+----------------
+
+- ``san_ip``
+    IP address of SAN controller
+
+- ``san_login``
+    Username for SAN controller
+
+- ``san_password``
+    Password for SAN controller
+
+- ``hitachi_storage_id``
+    Product number of the storage system.
+
+- ``hitachi_pool``
+    Pool number or pool name of the DP pool.
+
+``replication_device`` parameter
+--------------------------------
+
+If you want to set up a remote replication configuration,
+you need to specify the ``replication_device`` parameter
+to specify settings for the secondary site.
+Specify the following child parameters in the form of
+``replication_device = key1: value1, key2: value2, ...``.
+
+Example: ``replication_device = backend_id: backend1,
+storage_id: 938000000001,
+pool: pool_name, ldev_range: 10000-19999, target_ports: CL1-A;CL2-A,
+pair_target_number: 1, san_ip: 1.2.3.4, san_api_port: 443,
+san_login: storage_user, san_password: storage_password``.
+
+- ``backend_id``
+    Specify the ID of the secondary storage system. You can use any string.
+    This value is used when you run the ``cinder failover-host`` command.
+    This child parameter is mandatory if you specify the
+    ``replication_device`` parameter.
+
+- ``storage_id``
+    Same as the ``hitachi_storage_id`` parameter except
+    that this child parameter applies to the secondary site.
+
+- ``pool``
+    Same as the ``hitachi_pool`` parameter except
+    that this child parameter applies to the secondary site.
+
+- ``snap_pool``
+    Same as the ``hitachi_snap_pool`` parameter except
+    that this child parameter applies to the secondary site.
+
+- ``ldev_range``
+    Same as the ``hitachi_ldev_range`` parameter except
+    that this child parameter applies to the secondary site.
+
+- ``target_ports``
+    Same as the ``hitachi_target_ports`` parameter except
+    that this child parameter applies to the secondary site
+    and the delimiter is a semicolon, not a comma.
+
+- ``compute_target_ports``
+    Same as the ``hitachi_compute_target_ports`` parameter except
+    that this child parameter applies to the secondary site
+    and the delimiter is a semicolon, not a comma.
+
+- ``pair_target_number``
+    Same as the ``hitachi_pair_target_number`` parameter except
+    that this child parameter applies to the secondary site.
+
+- ``rest_pair_target_ports``
+    Same as the ``hitachi_rest_pair_target_ports`` parameter except
+    that this child parameter applies to the secondary site.
+
+- ``san_login``
+    Same as the ``san_login`` parameter except
+    that this child parameter applies to the secondary site.
+
+- ``san_password``
+    Same as the ``san_password`` parameter except
+    that this child parameter applies to the secondary site.
+
+- ``san_ip``
+    Same as the ``san_ip`` parameter except
+    that this child parameter applies to the secondary site.
+
+- ``san_api_port``
+    Same as the ``san_api_port`` parameter except
+    that this child parameter applies to the secondary site.
+
+- ``use_chap_auth``
+    Same as the ``use_chap_auth`` parameter except
+    that this child parameter applies to the secondary site.
+
+- ``chap_username``
+    Same as the ``chap_username`` parameter except
+    that this child parameter applies to the secondary site.
+
+- ``chap_password``
+    Same as the ``chap_password`` parameter except
+    that this child parameter applies to the secondary site.
+
+- ``driver_ssl_cert_verify``
+    Same as the ``driver_ssl_cert_verify`` parameter except
+    that this child parameter applies to the secondary site.
+
+- ``driver_ssl_cert_path``
+    Same as the ``driver_ssl_cert_path`` parameter except
+    that this child parameter applies to the secondary site.
+
+.. Document Hyperlinks
+.. _Global-Active Device User Guide: https://docs.hitachivantara.com/r/en-us/svos/9.8.7/mk-98rd9024
+.. _Hitachi Command Suite Configuration Manager REST API Reference Guide:
+  https://download.hitachivantara.com/download/epcra/hc2292.pdf
+.. _Universal Replicator User Guide: https://docs.hitachivantara.com/r/en-us/svos/9.8.7/mk-98rd9023
+.. _Hitachi Ops Center API Configuration Manager REST API Reference Guide:
+  https://docs.hitachivantara.com/r/en-us/ops-center-api-configuration-manager/11.0.x/mk-99cfm000
+.. _Hitachi Thin Image User Guide: https://docs.hitachivantara.com/r/en-us/svos/9.8.7/mk-98rd9020
+.. _Workflow for creating a GAD environment:
+  https://docs.hitachivantara.com/r/en-us/svos/9.8.7/mk-98rd9024/configuration-and-pair-management-using-cci/workflow-for-creating-a-gad-environment
+.. _Provisioning Guide:
+  https://docs.hitachivantara.com/r/en-us/svos/9.8.7/mk-97hm85026/
+  introduction-to-provisioning
+.. _Capacity saving function\: data deduplication and compression:
+  https://docs.hitachivantara.com/r/en-us/svos/9.8.7/mk-97hm85026/
+  about-adaptive-data-reduction/capacity-saving/
+  capacity-saving-function-data-deduplication-and-compression
+.. _bug #2072317:
+  https://bugs.launchpad.net/cinder/+bug/2072317
+.. _Performance Guide:
+  https://docs.hitachivantara.com/r/en-us/svos/9.6.0/mk-98rd9019/
+  hitachi-performance-monitor-operations

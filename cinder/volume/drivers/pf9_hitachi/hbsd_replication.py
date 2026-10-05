@@ -71,6 +71,15 @@ _MAX_GROUP_COPY_GROUP_NAME = min(
     rest._MAX_LDEV_LABEL - len(_JOURNAL_VOLUME_LABEL % ''))
 _PAIR_REPLICATING = ('PAIR', 'PFUL', 'COPY')
 _PAIR_SUSPENDED = ('PSUS', 'SSUS', 'PSUE', 'PFUS')
+# Where a group failback can continue from, as (DR array, source array)
+# (role, statuses) halves, None matching any status; _group_repl_fail_back
+# indexes its step lists by row, so the order is part of the contract.
+_FAILBACK_ROWS = (
+    (('S', ('SSWS',)), ('P', ('PSUS', 'PSUE'))),
+    (('P', ('COPY', 'PAIR')), ('S', None)),
+    (('P', ('PSUS',)), ('S', ('SSUS', 'SSWS'))),
+    (('S', ('COPY', 'PAIR')), ('P', ('COPY', 'PAIR'))),
+)
 
 _MIRROR_IDENTIFIER = 'G'
 _ASYNC_IDENTIFIER = 'U'
@@ -293,6 +302,41 @@ CONF.register_opts(REST_MIRROR_SSL_OPTS)
 LOG = logging.getLogger(__name__)
 
 MSG = utils.HBSDMsg
+
+
+def _copy_grp_pair_roles(grp):
+    """{LDEV set: (pvol, svol, role, status)} for the pairs of a copy group.
+
+    The role comes from which one of pvolStatus and svolStatus is reported,
+    since device-group suffixes do not move on a swap, and is '?' when both
+    or neither are.
+    """
+    pairs = {}
+    for pair in grp.get('copyPairs') or []:
+        pvol_status = pair.get('pvolStatus')
+        svol_status = pair.get('svolStatus')
+        if pvol_status and not svol_status:
+            role, status = 'P', pvol_status
+        elif svol_status and not pvol_status:
+            role, status = 'S', svol_status
+        else:
+            role = '?'
+            status = '/'.join(
+                s for s in (pvol_status, svol_status) if s) or '-'
+        pvol, svol = pair.get('pvolLdevId'), pair.get('svolLdevId')
+        pairs[frozenset((pvol, svol))] = (pvol, svol, role, status)
+    return pairs
+
+
+def _in_failback_row(pair, row_half):
+    role, statuses = row_half
+    return pair[2] == role and (statuses is None or pair[3] in statuses)
+
+
+def _describe_failback_half(half):
+    if not half:
+        return 'unreadable'
+    return ', '.join('%s/%s %s %s' % pair for pair in half.values())
 
 
 @contextlib.contextmanager
@@ -1448,6 +1492,30 @@ class HBSDREPLICATION(rest.HBSDREST):
             volume=volume.id, snapshot_info='', ldev=ldev)
         self.raise_error(msg)
 
+    def _check_bound_pvol_writable(self, volume, operation):
+        """Raise while a paired copy group member's pldev is a standby S-VOL.
+
+        A failback leaves it S between its swaps; a pair that cannot be found
+        or whose role cannot be told does not block.
+        """
+        if (self._active_backend_id or
+                not isinstance(volume, cinder_volume.Volume) or
+                _get_ldev_site(volume) != _PRIMARY_SECONDARY):
+            return
+        copy_group_name = _volume_copy_group_binding(volume)
+        if not copy_group_name:
+            return
+        pldev = self.rep_primary.get_ldev(volume)
+        grp = self.rep_primary.client.get_remote_copy_grp(
+            None, copy_group_name, is_secondary=False,
+            ignore_message_id=[_MSGID_SPECIFIED_OBJECT_DOES_NOT_EXIST])
+        for pvol, svol, role, status in _copy_grp_pair_roles(grp).values():
+            if pldev in (pvol, svol) and role == 'S' and status != 'SSWS':
+                msg = self.rep_primary.output_log(
+                    MSG.REPLICATION_PAIR_ERROR, operation=operation,
+                    volume=volume.id, snapshot_info='', ldev=pldev)
+                self.raise_error(msg)
+
     def _has_rep_pair(self, ldev, instance=None, ldev_info=None):
         """Return if the specified LDEV has a replication pair.
 
@@ -1833,6 +1901,9 @@ class HBSDREPLICATION(rest.HBSDREST):
                 return self.rep_primary.initialize_connection(
                     _as_local_ldev(volume, ldev), connector)
             self._verify_ldev(volume, 'initialize volume connection')
+            if not is_snapshot:
+                self._check_bound_pvol_writable(
+                    volume, 'initialize volume connection')
             return self._get_active_backend().initialize_connection(
                 volume, connector, is_snapshot=is_snapshot)
 
@@ -3454,11 +3525,15 @@ class HBSDREPLICATION(rest.HBSDREST):
             svol_site, _ = self._copy_group_svol_side(copy_group_name)
         except exception.VolumeDriverException:
             msg = utils.output_log(
-                msgid, group=group.id, copy_group=copy_group_name)
+                msgid, group=group.id, copy_group=copy_group_name,
+                step='read copy group side')
             raise exception.UnableToFailOver(reason=msg)
         if svol_site is not self.rep_primary:
             self._require_rep_secondary()
         rep_type = self.driver_info['rep_type_async']
+        if is_failback and svol_site is self.rep_secondary:
+            return self._group_repl_fail_back(
+                group, copy_group_name, volumes, rep_type)
         mode = _failover_mode(group, requested_mode)
         is_graceful = not is_failback and mode == _MODE_GRACEFUL
         try:
@@ -3474,7 +3549,8 @@ class HBSDREPLICATION(rest.HBSDREST):
                     None, copy_group_name)
         except exception.VolumeDriverException:
             msg = svol_site.output_log(
-                msgid, group=group.id, copy_group=copy_group_name)
+                msgid, group=group.id, copy_group=copy_group_name,
+                step='swap resync')
             raise exception.UnableToFailOver(reason=msg)
         utils.output_log(
             MSG.GROUP_REPLICATION_TAKEOVER_STARTED,
@@ -3516,6 +3592,98 @@ class HBSDREPLICATION(rest.HBSDREST):
         model_update = {
             'replication_status': self._group_repl_aggregate_status(
                 volumes_model_update, status)}
+        return model_update, volumes_model_update
+
+    def _read_failback_half(self, site, copy_group_name, is_secondary):
+        """site's own half as _copy_grp_pair_roles returns it, or None.
+
+        None means unreadable or empty.
+        """
+        try:
+            grp = site.client.get_remote_copy_grp(
+                None, copy_group_name, is_secondary=is_secondary)
+        except exception.VolumeDriverException:
+            LOG.debug('Group replication: could not read a half of copy '
+                      'group %s for failback.', copy_group_name,
+                      exc_info=True)
+            return None
+        return _copy_grp_pair_roles(grp) or None
+
+    def _failback_row(self, copy_group_name, dr, source):
+        """The index in _FAILBACK_ROWS that holds every pair, or raise."""
+        rows = set()
+        if dr and source and dr.keys() == source.keys():
+            for key in dr:
+                rows.add(next(
+                    (index for index, (dr_row, source_row) in
+                     enumerate(_FAILBACK_ROWS)
+                     if _in_failback_row(dr[key], dr_row) and
+                     _in_failback_row(source[key], source_row)), None))
+        if len(rows) == 1 and None not in rows:
+            return rows.pop()
+        msg = utils.output_log(
+            MSG.GROUP_REPLICATION_FAILBACK_UNSUPPORTED,
+            copy_group=copy_group_name, dr=_describe_failback_half(dr),
+            source=_describe_failback_half(source))
+        raise exception.UnableToFailOver(reason=msg)
+
+    def _group_repl_fail_back(self, group, copy_group_name, volumes,
+                              rep_type):
+        """Return source -> DR replication from wherever a failback stopped.
+
+        Runs the steps left for the _FAILBACK_ROWS row the pairs are in; a
+        failed call or wait raises UnableToFailOver naming its step.
+        """
+        pairs = []
+        volumes_model_update = []
+        for volume in volumes:
+            pvol, svol = self._get_ldevs(
+                volume, is_failback=True, svol_site=self.rep_secondary)
+            volume_status = fields.ReplicationStatus.ERROR
+            if pvol is not None and svol is not None:
+                pairs.append((pvol, svol))
+                volume_status = fields.ReplicationStatus.ENABLED
+            volumes_model_update.append(
+                {'id': volume.id, 'replication_status': volume_status})
+        row = self._failback_row(
+            copy_group_name,
+            self._read_failback_half(
+                self.rep_secondary, copy_group_name, True),
+            self._read_failback_half(
+                self.rep_primary, copy_group_name, False))
+        source, dr = self.rep_primary.client, self.rep_secondary.client
+        wait = ('wait for PAIR', _WAIT_PAIR, None)
+        dr_swap = (
+            'swap resync on the DR array', _WAIT_PAIR,
+            lambda: dr.resync_remote_copy_grp(
+                source, copy_group_name, rep_type, swap=True,
+                is_secondary=True))
+        split = (
+            'split on the source array', _WAIT_PSUS,
+            lambda: source.split_remote_copy_grp(
+                dr, copy_group_name, rep_type))
+        source_swap = (
+            'swap resync on the source array', _WAIT_PAIR,
+            lambda: source.resync_remote_copy_grp(
+                dr, copy_group_name, rep_type, swap=True))
+        steps = ((dr_swap, split, source_swap), (wait, split, source_swap),
+                 (source_swap,), (wait,))[row]
+        for step, wait_type, invoke in steps:
+            try:
+                with _log_step(step, copy_group=copy_group_name):
+                    if invoke:
+                        invoke()
+                    for pvol, svol in pairs:
+                        self._wait_pair_status_change(
+                            copy_group_name, pvol, svol, rep_type, wait_type)
+            except exception.VolumeDriverException:
+                msg = utils.output_log(
+                    MSG.GROUP_REPLICATION_FAILBACK_FAILED, group=group.id,
+                    copy_group=copy_group_name, step=step)
+                raise exception.UnableToFailOver(reason=msg)
+        model_update = {
+            'replication_status': self._group_repl_aggregate_status(
+                volumes_model_update, fields.ReplicationStatus.ENABLED)}
         return model_update, volumes_model_update
 
     def list_replication_targets(self, context, group):
