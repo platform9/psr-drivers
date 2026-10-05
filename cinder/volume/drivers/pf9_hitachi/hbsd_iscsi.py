@@ -101,7 +101,7 @@ class HBSDISCSIDriver(driver.ISCSIDriver):
         2.8.3 - Fix zombie issue with vClone parents on VSP One Block when
                 volumes are quickly created and destroyed.
         2.8.4 - Add support for 'compression' capacity saving setting.
-        2.9.0 - Add volume group replication support.
+        3.1.0 - Add volume group replication support.
 
     """
 

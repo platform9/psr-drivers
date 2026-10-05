@@ -37,7 +37,7 @@ from cinder.i18n import _
 from cinder import utils as cinder_utils
 from cinder.volume import volume_types
 
-VERSION = '2.9.0'
+VERSION = '3.1.0'
 CI_WIKI_NAME = 'Hitachi_CI'
 PARAM_PREFIX = 'hitachi'
 VENDOR_NAME = 'Hitachi'
@@ -915,7 +915,7 @@ class HBSDMsg(enum.Enum):
         'msg_id': 806,
         'loglevel': base_logging.ERROR,
         'msg': 'Failed to fail back the group replication. (group: '
-               '%(group)s, copy group: %(copy_group)s)',
+               '%(group)s, copy group: %(copy_group)s, step: %(step)s)',
         'suffix': ERROR_SUFFIX,
     }
     GROUP_REPLICATION_TARGETS_QUERY_FAILED = {
@@ -1028,6 +1028,15 @@ class HBSDMsg(enum.Enum):
         'msg': 'Could not tell which storage system holds the LDEV, so it '
                'was changed on neither. (%(obj)s: %(obj_id)s, LDEV: '
                '%(ldev)s, storage systems holding it: %(holders)s)',
+        'suffix': ERROR_SUFFIX,
+    }
+    GROUP_REPLICATION_FAILBACK_UNSUPPORTED = {
+        'msg_id': 821,
+        'loglevel': base_logging.ERROR,
+        'msg': 'The pairs of the copy group are in no state that a group '
+               'failback can continue from, so nothing was sent to either '
+               'storage system. (copy group: %(copy_group)s, DR storage '
+               'system: %(dr)s, source storage system: %(source)s)',
         'suffix': ERROR_SUFFIX,
     }
 

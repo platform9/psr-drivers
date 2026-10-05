@@ -51,3 +51,50 @@ features:
     taken over, which leaves the secondary volume in SSWS, or the pair
     deleted; while the pair still replicates, the attach fails with
     MSGID0766.
+  - |
+    Hitachi driver: a group snapshot of a replicated group is created as one
+    crash-consistent Thin Image group on the storage system that holds the
+    secondary volumes of every member. When those secondary volumes are not
+    all on one storage system, or creating the snapshot fails, the group
+    snapshot goes to ``error``, MSGID0809 is logged, and the LDEVs the driver
+    created for it are deleted.
+  - |
+    Hitachi driver: ``failover_replication`` accepts a mode suffix on
+    ``secondary_backend_id``. ``<backend_id>:graceful`` splits the copy group
+    from the primary storage system, for use while it is reachable.
+    ``<backend_id>:emergency`` takes the copy group over from the storage
+    system that holds its secondary side, without the primary storage system.
+    With no suffix the mode comes from the group type extra spec
+    ``hbsd:group_replication_failover_mode``, and is emergency when that spec
+    is not ``graceful``.
+  - |
+    Hitachi driver: ``failover_replication`` with ``secondary_backend_id``
+    set to ``default``, sent to the backend of the source storage system,
+    returns a copy group to source-to-DR replication. The driver
+    swap-resyncs the pairs from the DR storage system, splits them from the
+    source, and swap-resyncs them from the source, waiting after each call
+    until the pair of every group member reaches ``PAIR``, or ``PSUS`` and
+    ``SSUS`` after the split. A failed call or wait fails with MSGID0806,
+    which names the step that failed. The driver reads the pairs on both
+    storage systems before it sends anything and continues from where an
+    earlier attempt stopped; when the pairs are in a state it cannot continue
+    from, it sends nothing and fails with MSGID0821, which lists every pair on
+    both storage systems. A mode suffix on ``default`` is rejected with
+    ``InvalidReplicationTarget``.
+  - |
+    Hitachi driver: attaching a volume paired into a group's copy group fails
+    with MSGID0766 while its LDEV on the backend's own storage system is the
+    secondary side of its pair and not taken over (``SSWS``), as it is
+    between the swaps of a group failback. A pair the driver cannot find, or
+    whose role it cannot tell, does not block the attach.
+fixes:
+  - |
+    Hitachi driver: Fixed a timed-out wait for a replication pair status
+    change raising ``RuntimeError`` instead of the driver's timeout error.
+  - |
+    Hitachi driver: Fixed a journal volume LDEV being left on the storage
+    system when labelling it failed while creating journals.
+  - |
+    Hitachi driver: Fixed ``update_group`` raising ``TypeError``, which hid
+    the original error, when the update failed and no volumes were being
+    removed.
