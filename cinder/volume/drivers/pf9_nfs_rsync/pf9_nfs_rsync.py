@@ -161,9 +161,13 @@ class PF9NFSRsyncDriver(nfs.NfsDriver):
             pool["replication_enabled"] = True
             pool["replication_type"] = ["async"]
             pool["replication_targets"] = [backend]
+            # Group types carry consistent_group_replication_enabled; without
+            # this capability the scheduler cannot place such a group here.
+            pool["consistent_group_replication_enabled"] = True
         self._stats["replication_enabled"] = True
         self._stats["replication_type"] = ["async"]
         self._stats["replication_targets"] = [backend]
+        self._stats["consistent_group_replication_enabled"] = True
 
     def _start_replication_thread(self) -> None:
         peer = self.configuration.safe_get("pf9_replication_peer")
