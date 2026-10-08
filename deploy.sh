@@ -3,10 +3,10 @@
 # Custom Driver Deployment Script to Cinder enabled VM
 #
 # Usage:
-#   ./deploy.sh <user@host> <driver_name>
+#   ./deploy.sh <user@host> <driver_name> <ssh_key_path>
 #
 # Examples:
-#   ./deploy.sh root@192.168.1.50 pf9_hitachi
+#   ./deploy.sh root@192.168.1.50 pf9_hitachi ~/.ssh/id_rsa
 #
 # PREREQUISITES:
 #   - SSH access to the target VM must be configured
@@ -24,25 +24,27 @@ NC='\033[0m'
 
 REMOTE_HOST="$1"
 DRIVER_NAME="$2"
+SSH_KEY="$3"
 SERVICE_NAME="pf9-cindervolume-base"
 REMOTE_CINDER_ROOT="/opt/pf9/pf9-cindervolume-base"
 LOCAL_DRIVER_DIR="cinder/volume/drivers"
 
-if [ -z "$REMOTE_HOST" ] || [ -z "$DRIVER_NAME" ]; then
+if [ -z "$REMOTE_HOST" ] || [ -z "$DRIVER_NAME" ] || [ -z "$SSH_KEY" ]; then
     cat << 'EOF'
 
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                    Custom Driver Deployment — Generic                        ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
-Usage: ./deploy.sh <user@host> <driver_name>
+Usage: ./deploy.sh <user@host> <driver_name> <ssh_key_path>
 
 Examples:
-  ./deploy.sh root@192.168.1.50 pf9_hitachi
+  ./deploy.sh root@192.168.1.50 pf9_hitachi ~/.ssh/id_rsa
 
 Arguments:
   user@host       Remote VM SSH connection string (required)
   driver_name     Driver directory name in cinder/volume/drivers/ (required)
+  ssh_key_path    SSH private key used for every ssh/scp call (required)
 
 PREREQUISITES:
   - SSH access to the target VM must be configured
@@ -65,13 +67,23 @@ if [[ ! "$REMOTE_HOST" =~ @ ]]; then
     echo -e "${BLUE}Please use:${NC} <user>@<host>"
     echo ""
     echo "Examples:"
-    echo "  $0 root@192.168.1.50 pf9_hitachi"
+    echo "  $0 root@192.168.1.50 pf9_hitachi ~/.ssh/id_rsa"
+    exit 1
+fi
+
+# A quoted "~/..." reaches the script without shell tilde expansion.
+case "$SSH_KEY" in
+    "~") SSH_KEY="$HOME" ;;
+    "~/"*) SSH_KEY="$HOME/${SSH_KEY#"~/"}" ;;
+esac
+if [ ! -f "$SSH_KEY" ] || [ ! -r "$SSH_KEY" ]; then
+    echo -e "${RED}[ERROR]${NC} SSH key not found: $SSH_KEY"
     exit 1
 fi
 
 # Verify SSH access
 echo -e "${BLUE}[CHECK]${NC} Verifying SSH access to $REMOTE_HOST..."
-if ! ssh -o ConnectTimeout=5 "$REMOTE_HOST" "echo OK" &>/dev/null; then
+if ! ssh -o ConnectTimeout=5 -i "$SSH_KEY" "$REMOTE_HOST" "echo OK" &>/dev/null; then
     echo -e "${RED}[ERROR]${NC} Cannot connect to $REMOTE_HOST via SSH"
     echo ""
     echo -e "${YELLOW}Troubleshooting:${NC}"
@@ -86,6 +98,28 @@ if ! ssh -o ConnectTimeout=5 "$REMOTE_HOST" "echo OK" &>/dev/null; then
     exit 1
 fi
 echo -e "${GREEN}[OK]${NC} SSH access verified"
+echo ""
+
+# scp does not expand wildcards in its destination, so the remote shell resolves the Python version once.
+SITE_PACKAGES_GLOB="$REMOTE_CINDER_ROOT/lib/python*/site-packages"
+echo -e "${BLUE}[CHECK]${NC} Locating $SITE_PACKAGES_GLOB on $REMOTE_HOST..."
+SITE_PACKAGES_DIRS=($(ssh -i "$SSH_KEY" "$REMOTE_HOST" "ls -d $SITE_PACKAGES_GLOB 2>/dev/null"))
+if [ ${#SITE_PACKAGES_DIRS[@]} -eq 0 ]; then
+    echo -e "${RED}[ERROR]${NC} No match for $SITE_PACKAGES_GLOB on $REMOTE_HOST"
+    exit 1
+fi
+if [ ${#SITE_PACKAGES_DIRS[@]} -gt 1 ]; then
+    echo -e "${RED}[ERROR]${NC} Multiple matches for $SITE_PACKAGES_GLOB on $REMOTE_HOST:"
+    printf '  %s\n' "${SITE_PACKAGES_DIRS[@]}"
+    exit 1
+fi
+REMOTE_DRIVERS_DIR="${SITE_PACKAGES_DIRS[0]}/cinder/volume/drivers"
+if ! ssh -i "$SSH_KEY" "$REMOTE_HOST" "test -d '$REMOTE_DRIVERS_DIR'"; then
+    echo -e "${RED}[ERROR]${NC} $REMOTE_DRIVERS_DIR not found on $REMOTE_HOST - is pf9-cinder installed?"
+    exit 1
+fi
+REMOTE_DRIVER_PATH="$REMOTE_DRIVERS_DIR/$DRIVER_NAME"
+echo -e "${GREEN}[OK]${NC} Driver path: $REMOTE_DRIVER_PATH"
 echo ""
 
 # Get list of driver files
@@ -109,6 +143,7 @@ EOF
 echo -e "${BLUE}Target VM:${NC} $REMOTE_HOST"
 echo -e "${BLUE}pf9-cinder location:${NC} $REMOTE_CINDER_ROOT"
 echo -e "${BLUE}Driver name:${NC} $DRIVER_NAME"
+echo -e "${BLUE}Driver path:${NC} $REMOTE_DRIVER_PATH"
 echo ""
 echo -e "${YELLOW}DISCLAIMER:${NC}"
 echo "  This script will restart the $SERVICE_NAME service."
@@ -118,6 +153,7 @@ echo ""
 echo "This deployment will perform the following steps:"
 echo ""
 echo "  STEP 1: Copy driver files via SCP"
+echo "          → Create $REMOTE_DRIVER_PATH if missing"
 for file in "${DRIVER_FILES[@]}"; do
     basename_file=$(basename "$file")
     echo "          → Copy $basename_file"
@@ -133,7 +169,7 @@ echo -e "${RED}WARNING:${NC} Service restart will briefly interrupt Cinder volum
 echo ""
 echo "─────────────────────────────────────────────────────────────────────────────"
 echo ""
-read -p "Do you want to proceed? (yes/no) " -r
+read -p "Do you want to proceed? (yY/nN) " -r
 echo ""
 
 echo $REPLY
@@ -142,29 +178,30 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     exit 0
 fi
 
-REMOTE_DRIVER_PATH="$REMOTE_CINDER_ROOT/lib/python3.12/site-packages/cinder/volume/drivers/$DRIVER_NAME"
-echo -e "${GREEN}[OK]${NC} Driver path: $REMOTE_DRIVER_PATH"
-echo ""
-
 # Copy files
 echo -e "${BLUE}[STEP 3]${NC} Copying driver files..."
+if ! ssh -i "$SSH_KEY" "$REMOTE_HOST" "test -d '$REMOTE_DRIVER_PATH'"; then
+    # Escaped so id -un runs on the remote host as the SSH user; unescaped it would expand to the local user.
+    ssh -i "$SSH_KEY" "$REMOTE_HOST" "sudo mkdir '$REMOTE_DRIVER_PATH' && sudo chown \"\$(id -un)\" '$REMOTE_DRIVER_PATH'" || { echo -e "${RED}[ERROR]${NC} Failed to create $REMOTE_DRIVER_PATH"; exit 1; }
+    echo -e "${GREEN}[OK]${NC} Created $REMOTE_DRIVER_PATH"
+fi
 for file in "${DRIVER_FILES[@]}"; do
     filename=$(basename "$file")
-    scp -q "$file" "$REMOTE_HOST:$REMOTE_DRIVER_PATH/" || { echo -e "${RED}[ERROR]${NC} Failed to copy $filename"; exit 1; }
+    scp -i "$SSH_KEY" -q "$file" "$REMOTE_HOST:$REMOTE_DRIVER_PATH/" || { echo -e "${RED}[ERROR]${NC} Failed to copy $filename"; exit 1; }
     echo -e "${GREEN}[OK]${NC} $filename copied"
 done
 echo ""
 
 # Restart service
 echo -e "${BLUE}[STEP 4]${NC} Restarting $SERVICE_NAME service..."
-ssh "$REMOTE_HOST" "sudo systemctl restart $SERVICE_NAME" || { echo -e "${RED}[ERROR]${NC} Failed to restart service"; exit 1; }
+ssh -i "$SSH_KEY" "$REMOTE_HOST" "sudo systemctl restart $SERVICE_NAME" || { echo -e "${RED}[ERROR]${NC} Failed to restart service"; exit 1; }
 sleep 10
 echo -e "${GREEN}[OK]${NC} Service restarted"
 echo ""
 
 # Verify
 echo -e "${BLUE}[STEP 5]${NC} Verifying installation..."
-if ssh "$REMOTE_HOST" "$REMOTE_CINDER_ROOT/bin/python -m py_compile '$REMOTE_DRIVER_PATH'/*.py" 2>/dev/null; then
+if ssh -i "$SSH_KEY" "$REMOTE_HOST" "$REMOTE_CINDER_ROOT/bin/python -m py_compile '$REMOTE_DRIVER_PATH'/*.py" 2>/dev/null; then
     echo -e "${GREEN}[OK]${NC} Driver files are syntactically correct"
 else
     echo -e "${YELLOW}[WARN]${NC} Driver import verification failed - check logs"
