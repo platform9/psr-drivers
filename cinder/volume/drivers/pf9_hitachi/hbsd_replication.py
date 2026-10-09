@@ -3514,6 +3514,16 @@ class HBSDREPLICATION(rest.HBSDREST):
                   'group': group.id, 'cg': copy_group_name,
                   'n': len(volumes), 't': secondary_backend_id,
                   'm': requested_mode or '-'})
+        if secondary_backend_id not in (None, _REP_FAILBACK,
+                                        self.rep_secondary_backend_id):
+            msg = utils.output_log(
+                MSG.INVALID_DESTINATION,
+                direction='over',
+                execution_site=(utils.SECONDARY_STR if self._active_backend_id
+                                else utils.PRIMARY_STR),
+                specified_backend_id=secondary_backend_id,
+                defined_backend_id=self.rep_secondary_backend_id)
+            raise exception.InvalidReplicationTarget(reason=msg)
         if is_failback and requested_mode:
             msg = utils.output_log(
                 MSG.INVALID_DESTINATION,

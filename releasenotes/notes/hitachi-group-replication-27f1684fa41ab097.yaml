@@ -66,7 +66,11 @@ features:
     system that holds its secondary side, without the primary storage system.
     With no suffix the mode comes from the group type extra spec
     ``hbsd:group_replication_failover_mode``, and is emergency when that spec
-    is not ``graceful``.
+    is not ``graceful``. A ``secondary_backend_id`` other than ``default``,
+    the ``backend_id`` of the ``replication_device`` option, or that
+    ``backend_id`` with a mode suffix is rejected with
+    ``InvalidReplicationTarget`` before the driver sends anything to a
+    storage system.
   - |
     Hitachi driver: ``failover_replication`` with ``secondary_backend_id``
     set to ``default``, sent to the backend of the source storage system,
