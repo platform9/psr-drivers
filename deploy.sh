@@ -190,6 +190,9 @@ for file in "${DRIVER_FILES[@]}"; do
     scp -i "$SSH_KEY" -q "$file" "$REMOTE_HOST:$REMOTE_DRIVER_PATH/" || { echo -e "${RED}[ERROR]${NC} Failed to copy $filename"; exit 1; }
     echo -e "${GREEN}[OK]${NC} $filename copied"
 done
+
+# Change ownership to pf9:pf9group
+ssh -i "$SSH_KEY" "$REMOTE_HOST" "sudo chown -R pf9:pf9group '$REMOTE_DRIVER_PATH'" || { echo -e "${RED}[ERROR]${NC} Failed to change ownership of $REMOTE_DRIVER_PATH"; exit 1; }
 echo ""
 
 # Restart service
