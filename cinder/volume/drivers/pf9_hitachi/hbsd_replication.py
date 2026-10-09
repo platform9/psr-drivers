@@ -305,11 +305,13 @@ MSG = utils.HBSDMsg
 
 
 def _copy_grp_pair_roles(grp):
-    """{LDEV set: (pvol, svol, role, status)} for the pairs of a copy group.
+    """{pair key: (pvol, svol, role, status)} for the pairs of a copy group.
 
     The role comes from which one of pvolStatus and svolStatus is reported,
     since device-group suffixes do not move on a swap, and is '?' when both
-    or neither are.
+    or neither are. Each array reports only its own side's LDEV id, so the
+    key is the copy pair name, which both halves share, and only a pair
+    without one falls back to its LDEV ids.
     """
     pairs = {}
     for pair in grp.get('copyPairs') or []:
@@ -324,7 +326,8 @@ def _copy_grp_pair_roles(grp):
             status = '/'.join(
                 s for s in (pvol_status, svol_status) if s) or '-'
         pvol, svol = pair.get('pvolLdevId'), pair.get('svolLdevId')
-        pairs[frozenset((pvol, svol))] = (pvol, svol, role, status)
+        key = pair.get('copyPairName') or frozenset((pvol, svol))
+        pairs[key] = (pvol, svol, role, status)
     return pairs
 
 

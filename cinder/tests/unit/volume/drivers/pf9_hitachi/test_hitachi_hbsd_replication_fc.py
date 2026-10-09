@@ -4300,6 +4300,28 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertIn('DR storage system: %s,' % dr_text, str(exc))
         self.assertIn('source storage system: %s)' % source_text, str(exc))
 
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_failback_joins_halves_by_pair_name(
+            self, get_group_type_specs):
+        common = self._common()
+        dr = {'copyGroupName': 'CG', 'copyPairs': [
+            {'copyPairName': 'HBSD-LDEV-%d-%d' % (pvol, svol),
+             'pvolLdevId': None, 'svolLdevId': svol, 'svolStatus': 'SSWS'}
+            for pvol, svol in ((4, 40), (5, 50))]}
+        source = {'copyGroupName': 'CG', 'copyPairs': [
+            {'copyPairName': 'HBSD-LDEV-%d-%d' % (pvol, svol),
+             'pvolLdevId': pvol, 'svolLdevId': None, 'pvolStatus': 'PSUS'}
+            for pvol, svol in ((4, 40), (5, 50))]}
+        calls = self._failback_calls(common, dr=dr, source=source)
+        model_update, _ = self._fail_back(
+            common, [TEST_VOLUME[4], TEST_VOLUME[5]])
+        self.assertEqual(
+            self._expected_actions(self._ALL_STEPS), self._actions(calls))
+        self.assertEqual(
+            {'replication_status': fields.ReplicationStatus.ENABLED},
+            model_update)
+
     @ddt.data(
         ({'pvolStatus': 'PAIR', 'svolStatus': 'PAIR'}, '4/4 ? PAIR/PAIR'),
         ({}, '4/4 ? -'),
