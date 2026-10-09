@@ -158,6 +158,7 @@ for file in "${DRIVER_FILES[@]}"; do
     basename_file=$(basename "$file")
     echo "          → Copy $basename_file"
 done
+echo "          → Set owner pf9:pf9group"
 echo ""
 echo "  STEP 2: Restart $SERVICE_NAME service"
 echo "          → systemctl restart $SERVICE_NAME"
@@ -181,18 +182,21 @@ fi
 # Copy files
 echo -e "${BLUE}[STEP 3]${NC} Copying driver files..."
 if ! ssh -i "$SSH_KEY" "$REMOTE_HOST" "test -d '$REMOTE_DRIVER_PATH'"; then
-    # Escaped so id -un runs on the remote host as the SSH user; unescaped it would expand to the local user.
-    ssh -i "$SSH_KEY" "$REMOTE_HOST" "sudo mkdir '$REMOTE_DRIVER_PATH' && sudo chown \"\$(id -un)\" '$REMOTE_DRIVER_PATH'" || { echo -e "${RED}[ERROR]${NC} Failed to create $REMOTE_DRIVER_PATH"; exit 1; }
+    ssh -i "$SSH_KEY" "$REMOTE_HOST" "sudo mkdir '$REMOTE_DRIVER_PATH'" || { echo -e "${RED}[ERROR]${NC} Failed to create $REMOTE_DRIVER_PATH"; exit 1; }
     echo -e "${GREEN}[OK]${NC} Created $REMOTE_DRIVER_PATH"
 fi
+# The driver folder belongs to pf9, so a non-root SSH user cannot scp into it; files go through a staging folder.
+REMOTE_STAGING_DIR=$(ssh -i "$SSH_KEY" "$REMOTE_HOST" "mktemp -d") || { echo -e "${RED}[ERROR]${NC} Failed to create a staging folder on $REMOTE_HOST"; exit 1; }
 for file in "${DRIVER_FILES[@]}"; do
     filename=$(basename "$file")
-    scp -i "$SSH_KEY" -q "$file" "$REMOTE_HOST:$REMOTE_DRIVER_PATH/" || { echo -e "${RED}[ERROR]${NC} Failed to copy $filename"; exit 1; }
+    scp -i "$SSH_KEY" -q "$file" "$REMOTE_HOST:$REMOTE_STAGING_DIR/" || { echo -e "${RED}[ERROR]${NC} Failed to copy $filename"; ssh -i "$SSH_KEY" "$REMOTE_HOST" "rm -rf '$REMOTE_STAGING_DIR'"; exit 1; }
     echo -e "${GREEN}[OK]${NC} $filename copied"
 done
+ssh -i "$SSH_KEY" "$REMOTE_HOST" "sudo cp '$REMOTE_STAGING_DIR'/* '$REMOTE_DRIVER_PATH'/; rc=\$?; rm -rf '$REMOTE_STAGING_DIR'; exit \$rc" || { echo -e "${RED}[ERROR]${NC} Failed to move driver files into $REMOTE_DRIVER_PATH"; exit 1; }
 
 # Change ownership to pf9:pf9group
 ssh -i "$SSH_KEY" "$REMOTE_HOST" "sudo chown -R pf9:pf9group '$REMOTE_DRIVER_PATH'" || { echo -e "${RED}[ERROR]${NC} Failed to change ownership of $REMOTE_DRIVER_PATH"; exit 1; }
+echo -e "${GREEN}[OK]${NC} Owner set to pf9:pf9group"
 echo ""
 
 # Restart service

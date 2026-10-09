@@ -54,8 +54,8 @@ psr-drivers/
 2. Locate the remote `lib/python*/site-packages` folder and check that `cinder/volume/drivers` exists in it
 3. Display deployment plan with all steps
 4. Request explicit confirmation before proceeding
-5. Create `cinder/volume/drivers/<driver_name>` with sudo if missing, owned by the SSH user
-6. Copy all driver files via SCP
+5. Create `cinder/volume/drivers/<driver_name>` with sudo if missing
+6. Copy all driver files via SCP to a temporary folder on the VM, move them into the driver folder with sudo, and set the owner to `pf9:pf9group`
 7. Restart Cinder service
 8. Verify installation
 
@@ -81,6 +81,7 @@ This deployment will perform the following steps:
           → Create /opt/pf9/pf9-cindervolume-base/lib/python3.12/site-packages/cinder/volume/drivers/pf9_hitachi if missing
           → Copy file1.py
           → Copy file2.py
+          → Set owner pf9:pf9group
   STEP 2: Restart pf9-cindervolume-base service
           → systemctl restart pf9-cindervolume-base
   STEP 3: Verify installation
