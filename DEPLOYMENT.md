@@ -6,6 +6,7 @@ Guide for deploying custom drivers to Cinder enabled VMs.
 ## Prerequisites
 
 - SSH/SCP access to target Cinder-enabled VM
+- SSH private key for the target VM, passed to the script as `<ssh_key_path>`
 - User must have sudo privileges on target VM
 - pf9-cinder must be installed at `/opt/pf9/pf9-cindervolume-base/` on target VM
 - Storage backend REST API access (if applicable)
@@ -40,21 +41,23 @@ psr-drivers/
 
 **Deployment:**
 ```bash
-./deploy.sh <user@host> <driver_name>
+./deploy.sh <user@host> <driver_name> <ssh_key_path>
 ```
 
 **Example:**
 ```bash
-./deploy.sh root@192.168.1.50 pf9_hitachi
+./deploy.sh root@192.168.1.50 pf9_hitachi ~/.ssh/id_rsa
 ```
 
 **The script will:**
-1. Validate SSH access
-2. Display deployment plan with all steps
-3. Request explicit confirmation before proceeding
-4. Copy all driver files via SCP
-5. Restart Cinder service
-6. Verify installation
+1. Validate the SSH key and SSH access
+2. Locate the remote `lib/python*/site-packages` folder and check that `cinder/volume/drivers` exists in it
+3. Display deployment plan with all steps
+4. Request explicit confirmation before proceeding
+5. Create `cinder/volume/drivers/<driver_name>` with sudo if missing
+6. Copy all driver files via SCP to a temporary folder on the VM, move them into the driver folder with sudo, and set the owner to `pf9:pf9group`
+7. Restart Cinder service
+8. Verify installation
 
 **Example interactive output:**
 ```
@@ -65,6 +68,7 @@ psr-drivers/
 Target VM: root@192.168.1.50
 pf9-cinder location: /opt/pf9/pf9-cindervolume-base
 Driver name: pf9_hitachi
+Driver path: /opt/pf9/pf9-cindervolume-base/lib/python3.12/site-packages/cinder/volume/drivers/pf9_hitachi
 
 DISCLAIMER:
   This script will restart the pf9-cindervolume-base service.
@@ -74,8 +78,10 @@ DISCLAIMER:
 This deployment will perform the following steps:
 
   STEP 1: Copy driver files via SCP
+          → Create /opt/pf9/pf9-cindervolume-base/lib/python3.12/site-packages/cinder/volume/drivers/pf9_hitachi if missing
           → Copy file1.py
           → Copy file2.py
+          → Set owner pf9:pf9group
   STEP 2: Restart pf9-cindervolume-base service
           → systemctl restart pf9-cindervolume-base
   STEP 3: Verify installation
@@ -223,13 +229,13 @@ driver = <DriverClass>()
 ## Script Usage Reference
 
 ```bash
-./deploy.sh <user@host> <driver_name> [service_name]
+./deploy.sh <user@host> <driver_name> <ssh_key_path>
 ```
 
 **Arguments:**
 - `user@host`: SSH connection string (required)
 - `driver_name`: Directory name in `cinder/volume/drivers/` (required)
-- `service_name`: Cinder service name to restart (optional, defaults to `pf9-cinder-volume-base`)
+- `ssh_key_path`: SSH private key used for every ssh/scp call (required); a quoted `~/...` is expanded to `$HOME`
 
 **Environment:**
 - Script must run from repository root directory
