@@ -1219,6 +1219,13 @@ A failover with no mode suffix and no group type extra spec is an emergency
 failover. A mode suffix on ``default`` is rejected with
 ``InvalidReplicationTarget``.
 
+The ``<backend_id>`` must be the ``backend_id`` of the ``replication_device``
+option, and ``default`` must match exactly, with no change in case and no
+spaces. Any other ``secondary_backend_id``, such as an unknown backend ID or
+an unknown mode suffix, is rejected with ``InvalidReplicationTarget`` before
+the driver sends anything to a storage system. Cinder then sets the group and
+its volumes to ``error``.
+
 Configuration options
 ~~~~~~~~~~~~~~~~~~~~~
 

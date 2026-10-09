@@ -3964,11 +3964,71 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             patches['_get_ldevs'].return_value = (1, 2)
             common.failover_replication(
                 self.ctxt, TEST_GROUP[0], volumes,
-                secondary_backend_id='remote:graceful')
+                secondary_backend_id=(
+                    common.rep_secondary_backend_id + ':graceful'))
         split.assert_called_once_with(
             common.rep_secondary.client, copy_group_name,
             common.driver_info['rep_type_async'])
         takeover.assert_not_called()
+
+    @ddt.data(
+        # '{id}' is the configured replication_device backend_id.
+        ('{id}', 'takeover'),
+        ('{id}:emergency', 'takeover'),
+        ('{id}:Emergency', 'takeover'),
+        (':emergency', 'takeover'),
+        ('{id}:graceful', 'split'),
+        (':graceful', 'split'),
+    )
+    @ddt.unpack
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_accepts_the_configured_target(
+            self, target, sent, get_group_type_specs):
+        common = self._common()
+        with self._failover_patches(common) as patches, \
+            mock.patch.object(
+                common.rep_secondary.client,
+                'takeover_remote_copy_grp') as takeover, \
+            mock.patch.object(
+                common.rep_primary.client,
+                'split_remote_copy_grp') as split:
+            patches['_get_ldevs'].return_value = (1, 2)
+            common.failover_replication(
+                self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]],
+                secondary_backend_id=target.format(
+                    id=common.rep_secondary_backend_id))
+        calls = {'takeover': takeover, 'split': split}
+        calls.pop(sent).assert_called_once()
+        for other in calls.values():
+            other.assert_not_called()
+
+    @ddt.data(
+        # '{id}' is the configured replication_device backend_id.
+        'bogus', 'Default', 'default ', ' default', 'DEFAULT', 'graceful',
+        'emergency', 'remote:graceful', '{id}:gracefull', '{id} ', '',
+    )
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_unknown_target_rejected_before_any_call(
+            self, target, get_group_type_specs):
+        common = self._common()
+        calls = self._failback_calls(common)
+        with mock.patch.object(
+                common.rep_secondary.client,
+                'takeover_remote_copy_grp') as takeover:
+            exc = self.assertRaises(
+                exception.InvalidReplicationTarget,
+                common.failover_replication,
+                self.ctxt, TEST_GROUP[0], [TEST_VOLUME[0]],
+                secondary_backend_id=target.format(
+                    id=common.rep_secondary_backend_id))
+        self.assertIn(
+            self._message_text(hbsd_utils.HBSDMsg.INVALID_DESTINATION) %
+            {'direction': 'over'}, str(exc))
+        takeover.assert_not_called()
+        common._copy_group_svol_side.assert_not_called()
+        self.assertEqual([], calls.mock_calls)
 
     _FAILBACK_STEPS = (
         ('dr_resync', 'swap resync on the DR array'),
@@ -4299,6 +4359,28 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             str(exc))
         self.assertIn('DR storage system: %s,' % dr_text, str(exc))
         self.assertIn('source storage system: %s)' % source_text, str(exc))
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_failback_joins_halves_by_pair_name(
+            self, get_group_type_specs):
+        common = self._common()
+        dr = {'copyGroupName': 'CG', 'copyPairs': [
+            {'copyPairName': 'HBSD-LDEV-%d-%d' % (pvol, svol),
+             'pvolLdevId': None, 'svolLdevId': svol, 'svolStatus': 'SSWS'}
+            for pvol, svol in ((4, 40), (5, 50))]}
+        source = {'copyGroupName': 'CG', 'copyPairs': [
+            {'copyPairName': 'HBSD-LDEV-%d-%d' % (pvol, svol),
+             'pvolLdevId': pvol, 'svolLdevId': None, 'pvolStatus': 'PSUS'}
+            for pvol, svol in ((4, 40), (5, 50))]}
+        calls = self._failback_calls(common, dr=dr, source=source)
+        model_update, _ = self._fail_back(
+            common, [TEST_VOLUME[4], TEST_VOLUME[5]])
+        self.assertEqual(
+            self._expected_actions(self._ALL_STEPS), self._actions(calls))
+        self.assertEqual(
+            {'replication_status': fields.ReplicationStatus.ENABLED},
+            model_update)
 
     @ddt.data(
         ({'pvolStatus': 'PAIR', 'svolStatus': 'PAIR'}, '4/4 ? PAIR/PAIR'),
