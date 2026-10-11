@@ -50,7 +50,11 @@ features:
     backend whose storage system holds it. Attaching needs the copy group
     taken over, which leaves the secondary volume in SSWS, or the pair
     deleted; while the pair still replicates, the attach fails with
-    MSGID0766.
+    MSGID0766. Adopted volumes can be added to and removed from a replicated
+    group on that backend without the peer storage system: adding checks
+    that each secondary volume is in the copy group, and removing leaves the
+    pair and the volume's copy group binding in place. A request that adds
+    or removes adopted volumes together with other volumes is rejected.
   - |
     Hitachi driver: a group snapshot of a replicated group is created as one
     crash-consistent Thin Image group on the storage system that holds the
@@ -60,8 +64,15 @@ features:
     created for it are deleted.
   - |
     Hitachi driver: ``failover_replication`` accepts a mode suffix on
-    ``secondary_backend_id``. ``<backend_id>:graceful`` splits the copy group
-    from the primary storage system, for use while it is reachable.
+    ``secondary_backend_id``. ``<backend_id>:graceful``, for use while both
+    storage systems are reachable and from the backend of either, splits the
+    copy group from the storage system that holds its primary side with
+    write access to the secondary volumes, then takes the copy group over
+    from the storage system that holds its secondary side, so every
+    secondary volume ends in ``SSWS`` and can be attached. When the takeover
+    fails and no pair was taken over, the pairs are resynchronized back to
+    ``PAIR``; a failed split or takeover fails with MSGID0805, which names
+    the step.
     ``<backend_id>:emergency`` takes the copy group over from the storage
     system that holds its secondary side, without the primary storage system.
     With no suffix the mode comes from the group type extra spec
@@ -102,3 +113,16 @@ fixes:
     Hitachi driver: Fixed ``update_group`` raising ``TypeError``, which hid
     the original error, when the update failed and no volumes were being
     removed.
+  - |
+    Hitachi driver: after a group fails over, attaching one of its volumes
+    maps the volume's secondary volume once it is in ``SSWS``, and
+    detaching unmaps the secondary volume and, while the primary storage
+    system answers, the primary volume too. Deleting, extending, retyping
+    or migrating such a volume, taking a snapshot of it or reverting it to a
+    snapshot fails with MSGID0766 until the group fails back.
+  - |
+    Hitachi driver: a backend whose primary storage system is unreachable
+    now starts as long as its secondary storage system is reachable, so an
+    emergency group failover still works after the volume service restarts.
+    Graceful failover and failback fail cleanly until the primary storage
+    system is reachable.

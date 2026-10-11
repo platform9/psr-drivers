@@ -908,7 +908,7 @@ class HBSDMsg(enum.Enum):
         'msg_id': 805,
         'loglevel': base_logging.ERROR,
         'msg': 'Failed to fail over the group replication. (group: '
-               '%(group)s, copy group: %(copy_group)s)',
+               '%(group)s, copy group: %(copy_group)s, step: %(step)s)',
         'suffix': ERROR_SUFFIX,
     }
     GROUP_REPLICATION_FAILBACK_FAILED = {

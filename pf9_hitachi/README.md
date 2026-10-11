@@ -77,8 +77,11 @@ Beyond the eight entry points:
 | Group-name binding by prefix `HBSD-CG:<name>` (any case) for adopting an existing array copy group | `_resolve_copy_group_name()` |
 | Journal lifecycle — created with a copy group's first pair, deleted once the copy group is gone (`disable_replication()` or group delete) | `create_journals()` / `_group_repl_delete_journals()` |
 | S side found per copy group — adoption, failover and target listing find which array holds each copy group's S side; a volume with only an S-VOL is found on the array whose LDEV carries its label | `_copy_group_svol_side()` / `_resolve_sldev_owner()` |
-| Graceful vs emergency failover (`split` vs `takeover ... forceSplit`) | `_failover_mode()` |
+| Graceful vs emergency failover (`split` with writable S-VOLs then `takeover ... forceSplit`, vs `takeover ... forceSplit` alone) | `_failover_mode()` / `_group_repl_split_writable()` |
 | Attach and detach of an adopted S-VOL on the array holding it; attach needs its copy group taken over (SSWS) or its pair gone | `_local_adopted_svol()` / `_check_adopted_svol_writable()` |
+| After a group failover, attach maps the member's S-VOL (SSWS only) and detach unmaps the S-VOL and, if the primary answers, the P-VOL; delete, extend, retype, migrate, snapshot and revert are refused until failback | `_group_failed_over()` / `_check_failed_over_svol_writable()` / `_terminate_failed_over()` / `_refuse_failed_over()` |
+| Startup with the primary array unreachable, for an emergency group failover; graceful failover and failback refuse until it answers | `do_setup()` / `failover_replication()` |
+| Adopted S-VOLs added to or removed from a replicated group without the peer — nothing paired or deleted, binding kept on removal; a request mixing them with other volumes is rejected | `_group_repl_update_adopted()` |
 
 ---
 
@@ -248,7 +251,7 @@ from its own array, so it still works when the source array is down.
 | `secondary_backend_id` | Behaviour |
 |------------------------|-----------|
 | `<backend_id>` | Mode from `hbsd:group_replication_failover_mode`, else **emergency** |
-| `<backend_id>:graceful` | `split_remote_copy_grp` — primary reachable, no data loss |
+| `<backend_id>:graceful` | `split_remote_copy_grp` with `svolAccessMode: rw` on the array holding the P side (from either backend), then `takeover ... {"mode": "forceSplit"}` to `SSWS` — both arrays reachable, no data loss; a failed takeover that reached no pair is resynced back to `PAIR` |
 | `<backend_id>:emergency` | `takeover ... {"mode": "forceSplit"}` — primary unreachable |
 | `default` (Cinder's failback sentinel) | `resync_remote_copy_grp(swap=True, is_secondary=True)` |
 
