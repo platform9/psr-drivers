@@ -1066,8 +1066,16 @@ class RestApiClient():
             return self._get_object(url, remote_auth=session, **kwargs)
 
     @utils.synchronized_on_copy_group()
-    def split_remote_copy_grp(self, remote_client, copy_group_name, rep_type):
+    def split_remote_copy_grp(self, remote_client, copy_group_name, rep_type,
+                              svol_access_mode=None):
+        """Split a copy group; svol_access_mode='rw' keeps S-VOLs writable.
+
+        A UR S-VOL is read-only after a split unless write access is set as
+        part of the split itself.
+        """
         body = {"parameters": {"replicationType": rep_type}}
+        if svol_access_mode is not None:
+            body["parameters"]["svolAccessMode"] = svol_access_mode
         url = '%(url)s/remote-mirror-copygroups/%(id)s/actions/%(action)s' % {
             'url': self.object_url,
             'id': self._remote_copygroup_id(remote_client, copy_group_name),

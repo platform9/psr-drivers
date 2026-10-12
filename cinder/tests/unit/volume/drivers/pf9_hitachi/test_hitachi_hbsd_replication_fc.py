@@ -3946,30 +3946,345 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             [fields.ReplicationStatus.FAILED_OVER],
             [update['replication_status'] for update in volumes_update])
 
+    def _graceful_calls(self, common, s_half=None):
+        """One mock recording, in order, a graceful failover's array calls.
+
+        The S side is the peer. Pair reads answer PSUS on the primary and
+        SSWS on the S side unless a test sets them.
+        """
+        calls = mock.Mock()
+        calls.p_read.return_value = GET_REMOTE_MIRROR_COPYPAIR_RESULT_PSUS
+        calls.s_read.return_value = GET_REMOTE_MIRROR_COPYPAIR_RESULT_SSWS
+        calls.s_half.return_value = s_half or self._copy_grp_half(
+            (1, 2, 'S', 'SSUS'))
+        self.mock_object(common.rep_primary.client,
+                         'split_remote_copy_grp', calls.split)
+        self.mock_object(common.rep_primary.client,
+                         'get_remote_copypair', calls.p_read)
+        self.mock_object(common.rep_primary.client,
+                         'resync_remote_copy_grp', calls.resync)
+        self.mock_object(common.rep_secondary.client,
+                         'takeover_remote_copy_grp', calls.takeover)
+        self.mock_object(common.rep_secondary.client,
+                         'get_remote_copypair', calls.s_read)
+        self.mock_object(common.rep_secondary.client,
+                         'get_remote_copy_grp', calls.s_half)
+        self.mock_object(common, '_get_ldevs', return_value=(1, 2))
+        self.mock_object(common, '_copy_group_svol_side',
+                         return_value=(common.rep_secondary, None))
+        return calls
+
+    def _fail_over_gracefully(self, common, volumes=None):
+        return common.failover_replication(
+            self.ctxt, TEST_GROUP[0], volumes or [TEST_VOLUME[0]],
+            secondary_backend_id=':graceful')
+
     @mock.patch.object(group_types, 'get_group_type_specs',
                        return_value='<is> True')
-    def test_failover_replication_graceful_splits_from_primary(
+    def test_failover_replication_graceful_splits_writable_then_takes_over(
             self, get_group_type_specs):
         common = self._common()
-        volumes = [TEST_VOLUME[0]]
+        calls = self._graceful_calls(common)
         copy_group_name = common._create_group_copy_group_name(
             TEST_GROUP[0].id)
-        with self._failover_patches(common) as patches, \
-            mock.patch.object(
-                common.rep_secondary.client,
-                'takeover_remote_copy_grp') as takeover, \
-            mock.patch.object(
-                common.rep_primary.client,
-                'split_remote_copy_grp') as split:
-            patches['_get_ldevs'].return_value = (1, 2)
-            common.failover_replication(
-                self.ctxt, TEST_GROUP[0], volumes,
-                secondary_backend_id=(
-                    common.rep_secondary_backend_id + ':graceful'))
-        split.assert_called_once_with(
+        model_update, volumes_update = self._fail_over_gracefully(common)
+        self.assertEqual(['split', 'p_read', 'takeover', 's_read'],
+                         [name for name, _, _ in calls.mock_calls])
+        calls.split.assert_called_once_with(
+            common.rep_secondary.client, copy_group_name,
+            common.driver_info['rep_type_async'], svol_access_mode='rw')
+        calls.takeover.assert_called_once_with(None, copy_group_name)
+        self.assertEqual(
+            {'replication_status': fields.ReplicationStatus.FAILED_OVER},
+            model_update)
+        self.assertEqual(
+            [fields.ReplicationStatus.FAILED_OVER],
+            [update['replication_status'] for update in volumes_update])
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_graceful_member_without_ldevs_errors(
+            self, get_group_type_specs):
+        """The other member is still split, taken over and waited for."""
+        common = self._common()
+        calls = self._graceful_calls(common)
+        common._get_ldevs.side_effect = [(None, None), (1, 2)]
+        model_update, volumes_update = self._fail_over_gracefully(
+            common, [TEST_VOLUME[0], TEST_VOLUME[1]])
+        self.assertEqual(1, calls.p_read.call_count)
+        self.assertEqual(1, calls.s_read.call_count)
+        self.assertEqual(
+            {'replication_status': fields.ReplicationStatus.ERROR},
+            model_update)
+        self.assertEqual(
+            [fields.ReplicationStatus.ERROR,
+             fields.ReplicationStatus.FAILED_OVER],
+            [update['replication_status'] for update in volumes_update])
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_graceful_failed_split_sends_no_takeover(
+            self, get_group_type_specs):
+        common = self._common()
+        calls = self._graceful_calls(common)
+        calls.split.side_effect = exception.VolumeDriverException(data='no')
+        self.assertRaises(exception.UnableToFailOver,
+                          self._fail_over_gracefully, common)
+        calls.takeover.assert_not_called()
+        calls.resync.assert_not_called()
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_graceful_unfinished_split_sends_no_takeover(
+            self, get_group_type_specs):
+        common = self._common()
+        calls = self._graceful_calls(common)
+        calls.p_read.return_value = GET_REMOTE_MIRROR_COPYPAIR_RESULT_SPLIT
+        self.assertRaises(exception.UnableToFailOver,
+                          self._fail_over_gracefully, common)
+        calls.takeover.assert_not_called()
+        calls.resync.assert_not_called()
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_graceful_failed_takeover_rolls_back_split(
+            self, get_group_type_specs):
+        common = self._common()
+        calls = self._graceful_calls(common)
+        calls.takeover.side_effect = exception.VolumeDriverException(
+            data='no')
+        calls.p_read.side_effect = [GET_REMOTE_MIRROR_COPYPAIR_RESULT_PSUS,
+                                    GET_REMOTE_MIRROR_COPYPAIR_RESULT]
+        copy_group_name = common._create_group_copy_group_name(
+            TEST_GROUP[0].id)
+        error = self.assertRaises(exception.UnableToFailOver,
+                                  self._fail_over_gracefully, common)
+        calls.resync.assert_called_once_with(
             common.rep_secondary.client, copy_group_name,
             common.driver_info['rep_type_async'])
-        takeover.assert_not_called()
+        self.assertEqual(2, calls.p_read.call_count)
+        self.assertIn('rolled back', str(error))
+
+    @ddt.data(
+        ('SSWS', None),
+        ('SSUS', exception.VolumeDriverException(data='unreadable')),
+    )
+    @ddt.unpack
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_graceful_failed_takeover_leaves_pairs(
+            self, s_status, read_error, get_group_type_specs):
+        """A pair the takeover may have reached is never resynced."""
+        common = self._common()
+        calls = self._graceful_calls(common, s_half=self._copy_grp_half(
+            (1, 2, 'S', 'SSUS'), (3, 4, 'S', s_status)))
+        calls.s_half.side_effect = read_error
+        calls.takeover.side_effect = exception.VolumeDriverException(
+            data='no')
+        error = self.assertRaises(exception.UnableToFailOver,
+                                  self._fail_over_gracefully, common)
+        calls.resync.assert_not_called()
+        self.assertIn('left as found', str(error))
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_graceful_failed_rollback_is_reported(
+            self, get_group_type_specs):
+        common = self._common()
+        calls = self._graceful_calls(common)
+        calls.takeover.side_effect = exception.VolumeDriverException(
+            data='no')
+        calls.resync.side_effect = exception.VolumeDriverException(data='no')
+        error = self.assertRaises(exception.UnableToFailOver,
+                                  self._fail_over_gracefully, common)
+        self.assertIn('rollback failed', str(error))
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_graceful_member_not_taken_over_errors(
+            self, get_group_type_specs):
+        """Once the takeover is sent nothing is rolled back."""
+        common = self._common()
+        calls = self._graceful_calls(common)
+        calls.s_read.return_value = dict(
+            GET_REMOTE_MIRROR_COPYPAIR_RESULT_SSWS, svolStatus='SMPL')
+        model_update, volumes_update = self._fail_over_gracefully(common)
+        calls.resync.assert_not_called()
+        self.assertEqual(
+            {'replication_status': fields.ReplicationStatus.ERROR},
+            model_update)
+        self.assertEqual(
+            [fields.ReplicationStatus.ERROR],
+            [update['replication_status'] for update in volumes_update])
+
+    def _local_s_side_array(self, common, statuses):
+        """Fake arrays where rep_primary holds the S side of the copy group.
+
+        statuses maps each S-VOL to its svolStatus; the peer's split and
+        resync and the local takeover move them. The local array refuses a
+        split or resync, as an array without the group's P side does.
+        """
+        calls = mock.Mock()
+
+        def read(remote_client, copy_group_name, is_secondary=False,
+                 **kwargs):
+            return self._svol_copy_grp(copy_group_name, [
+                self._local_svol_pair(7, svol, status)
+                for svol, status in statuses.items()])
+
+        def move_to(status):
+            def action(*args, **kwargs):
+                for svol in statuses:
+                    statuses[svol] = status
+            return action
+        calls.s_read.side_effect = read
+        calls.peer_split.side_effect = move_to('SSUS')
+        calls.takeover.side_effect = move_to('SSWS')
+        calls.peer_resync.side_effect = move_to('PAIR')
+        calls.local_split.side_effect = exception.VolumeDriverException(
+            data='no P side here')
+        calls.local_resync.side_effect = exception.VolumeDriverException(
+            data='no P side here')
+        calls.pair_read.side_effect = AssertionError('copy-pair read')
+        for site, name, mock_name in (
+                (common.rep_primary, 'get_remote_copy_grp', 's_read'),
+                (common.rep_primary, 'get_remote_copypair', 'pair_read'),
+                (common.rep_primary, 'split_remote_copy_grp', 'local_split'),
+                (common.rep_primary, 'resync_remote_copy_grp',
+                 'local_resync'),
+                (common.rep_primary, 'takeover_remote_copy_grp', 'takeover'),
+                (common.rep_secondary, 'split_remote_copy_grp', 'peer_split'),
+                (common.rep_secondary, 'resync_remote_copy_grp',
+                 'peer_resync')):
+            self.mock_object(site.client, name, getattr(calls, mock_name))
+        return calls
+
+    def _two_local_svols(self):
+        return [
+            self._svol_only_volume(
+                40, volume_id='00000000-0000-0000-0000-000000000040'),
+            self._svol_only_volume(
+                41, volume_id='00000000-0000-0000-0000-000000000041')]
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_local_s_side_graceful_splits_on_the_peer(
+            self, get_group_type_specs):
+        common = self._common()
+        calls = self._local_s_side_array(common, {40: 'PAIR', 41: 'PAIR'})
+        copy_group_name = common._create_group_copy_group_name(
+            TEST_GROUP[0].id)
+        model_update, volumes_update = self._fail_over_gracefully(
+            common, self._two_local_svols())
+        calls.peer_split.assert_called_once_with(
+            common.rep_primary.client, copy_group_name,
+            common.driver_info['rep_type_async'], svol_access_mode='rw')
+        calls.local_split.assert_not_called()
+        calls.takeover.assert_called_once_with(None, copy_group_name)
+        self.assertEqual(
+            ['peer_split', 'takeover'],
+            [name for name, _, _ in calls.mock_calls if name != 's_read'])
+        self.assertEqual(
+            {'replication_status': fields.ReplicationStatus.FAILED_OVER},
+            model_update)
+        self.assertEqual(
+            [fields.ReplicationStatus.FAILED_OVER] * 2,
+            [update['replication_status'] for update in volumes_update])
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_local_s_side_member_without_ldevs_errors(
+            self, get_group_type_specs):
+        common = self._common()
+        calls = self._local_s_side_array(common, {40: 'PAIR'})
+        unknown = fake_volume.fake_volume_obj(
+            CTXT, id='00000000-0000-0000-0000-000000000042',
+            provider_location=None)
+        model_update, volumes_update = self._fail_over_gracefully(
+            common, [unknown, self._two_local_svols()[0]])
+        calls.takeover.assert_called_once()
+        self.assertEqual(
+            [fields.ReplicationStatus.ERROR,
+             fields.ReplicationStatus.FAILED_OVER],
+            [update['replication_status'] for update in volumes_update])
+        self.assertEqual(
+            {'replication_status': fields.ReplicationStatus.ERROR},
+            model_update)
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_local_s_side_graceful_needs_the_peer(
+            self, get_group_type_specs):
+        common = self._common()
+        calls = self._local_s_side_array(common, {40: 'PAIR'})
+        common.rep_secondary = None
+        error = self.assertRaises(
+            exception.UnableToFailOver, self._fail_over_gracefully,
+            common, self._two_local_svols()[:1])
+        calls.local_split.assert_not_called()
+        calls.takeover.assert_not_called()
+        self.assertIn('split', str(error))
+
+    @ddt.data('split raises', 'not suspended')
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_local_s_side_failed_split_sends_no_takeover(
+            self, failure, get_group_type_specs):
+        common = self._common()
+        statuses = {40: 'PAIR', 41: 'PAIR'}
+        calls = self._local_s_side_array(common, statuses)
+        if failure == 'split raises':
+            calls.peer_split.side_effect = exception.VolumeDriverException(
+                data='no')
+        else:
+            calls.peer_split.side_effect = (
+                lambda *args, **kwargs: statuses.update(
+                    {40: 'SSUS', 41: 'PSUE'}))
+        self.assertRaises(exception.UnableToFailOver,
+                          self._fail_over_gracefully,
+                          common, self._two_local_svols())
+        calls.takeover.assert_not_called()
+        calls.peer_resync.assert_not_called()
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_local_s_side_failed_takeover_rolls_back(
+            self, get_group_type_specs):
+        common = self._common()
+        statuses = {40: 'PAIR', 41: 'PAIR'}
+        calls = self._local_s_side_array(common, statuses)
+        calls.takeover.side_effect = exception.VolumeDriverException(
+            data='no')
+        copy_group_name = common._create_group_copy_group_name(
+            TEST_GROUP[0].id)
+        error = self.assertRaises(exception.UnableToFailOver,
+                                  self._fail_over_gracefully,
+                                  common, self._two_local_svols())
+        calls.peer_resync.assert_called_once_with(
+            common.rep_primary.client, copy_group_name,
+            common.driver_info['rep_type_async'])
+        calls.local_resync.assert_not_called()
+        self.assertEqual({40: 'PAIR', 41: 'PAIR'}, statuses)
+        self.assertIn('rolled back', str(error))
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_local_s_side_failed_takeover_leaves_pairs(
+            self, get_group_type_specs):
+        common = self._common()
+        statuses = {40: 'PAIR', 41: 'PAIR'}
+        calls = self._local_s_side_array(common, statuses)
+
+        def partial_takeover(*args, **kwargs):
+            statuses[41] = 'SSWS'
+            raise exception.VolumeDriverException(data='lost reply')
+        calls.takeover.side_effect = partial_takeover
+        error = self.assertRaises(exception.UnableToFailOver,
+                                  self._fail_over_gracefully,
+                                  common, self._two_local_svols())
+        calls.peer_resync.assert_not_called()
+        calls.local_resync.assert_not_called()
+        self.assertIn('left as found', str(error))
 
     @ddt.data(
         # '{id}' is the configured replication_device backend_id.
@@ -3977,8 +4292,8 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         ('{id}:emergency', 'takeover'),
         ('{id}:Emergency', 'takeover'),
         (':emergency', 'takeover'),
-        ('{id}:graceful', 'split'),
-        (':graceful', 'split'),
+        ('{id}:graceful', 'split takeover'),
+        (':graceful', 'split takeover'),
     )
     @ddt.unpack
     @mock.patch.object(group_types, 'get_group_type_specs',
@@ -3999,7 +4314,8 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                 secondary_backend_id=target.format(
                     id=common.rep_secondary_backend_id))
         calls = {'takeover': takeover, 'split': split}
-        calls.pop(sent).assert_called_once()
+        for name in sent.split():
+            calls.pop(name).assert_called_once()
         for other in calls.values():
             other.assert_not_called()
 
@@ -4692,25 +5008,41 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             common.rep_secondary.client,
             **{name: mock.DEFAULT for name in names})
 
+    def _local_svol_side_reads(self, common, copy_group_name, copy_pairs):
+        """Answer rep_primary's REST reads as the array holding the S side.
+
+        Only the copy group is readable: any copy-pair read fails the test.
+        """
+        grp = self._svol_copy_grp(copy_group_name, copy_pairs)
+
+        def get_object(url, **kwargs):
+            if '/remote-mirror-copygroups/' in url:
+                return grp
+            self.fail('unexpected read: %s' % url)
+        return mock.patch.object(
+            common.rep_primary.client, '_get_object', side_effect=get_object)
+
+    @staticmethod
+    def _local_svol_pair(pvol, svol, status):
+        """One pair as the S side reports it: no P-VOL id, only its name."""
+        return {'copyPairName': 'HBSD-LDEV-%d-%d' % (pvol, svol),
+                'pvolLdevId': None, 'svolLdevId': svol, 'svolStatus': status}
+
     @mock.patch.object(group_types, 'get_group_type_specs',
                        return_value='<is> True')
-    def test_failover_replication_takes_over_a_local_svol_side_locally(
+    def test_failover_replication_waits_for_a_local_svol_by_its_svol_id(
             self, get_group_type_specs):
         """rep_secondary is down for the whole failover."""
         common = self._common()
         volume = self._svol_only_volume(40)
         copy_group_name = common._create_group_copy_group_name(
             TEST_GROUP[0].id)
-        ssws = dict(GET_REMOTE_MIRROR_COPYPAIR_RESULT_SSWS, svolLdevId=40)
-        with mock.patch.object(
-                common.rep_primary.client, 'get_remote_copy_grp',
-                return_value=self._svol_copy_grp(copy_group_name)), \
+        with self._local_svol_side_reads(
+                common, copy_group_name,
+                [self._local_svol_pair(7, 40, 'SSWS')]) as reads, \
                 mock.patch.object(
                     common.rep_primary.client,
                     'takeover_remote_copy_grp') as takeover, \
-                mock.patch.object(
-                    common.rep_primary.client, 'get_remote_copypair',
-                    return_value=ssws) as poll, \
                 self._peer_unreachable(
                     common, 'get_remote_copy_grp', 'get_remote_copypair',
                     'takeover_remote_copy_grp') as peer:
@@ -4722,14 +5054,59 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         for method in peer.values():
             method.assert_not_called()
         takeover.assert_called_once_with(None, copy_group_name)
-        poll.assert_called_once_with(
-            None, copy_group_name, None, 40, is_secondary=True)
+        s_side = 'NotSpecified,%s,%sS,NotSpecified' % (
+            copy_group_name, copy_group_name)
+        for args, _ in reads.call_args_list:
+            self.assertTrue(args[0].endswith(s_side), args[0])
         self.assertEqual(
             {'replication_status': fields.ReplicationStatus.FAILED_OVER},
             model_update)
         self.assertEqual(
             fields.ReplicationStatus.FAILED_OVER,
             volumes_update[0]['replication_status'])
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_unpaired_local_svol_errors(
+            self, get_group_type_specs):
+        """The other member is still waited for and failed over."""
+        common = self._common()
+        present = self._svol_only_volume(
+            40, volume_id='00000000-0000-0000-0000-000000000040')
+        missing = self._svol_only_volume(
+            41, volume_id='00000000-0000-0000-0000-000000000041')
+        copy_group_name = common._create_group_copy_group_name(
+            TEST_GROUP[0].id)
+        with self._local_svol_side_reads(
+                common, copy_group_name,
+                [self._local_svol_pair(7, 40, 'SSWS')]), \
+                mock.patch.object(
+                    common.rep_primary.client, 'takeover_remote_copy_grp'):
+            model_update, volumes_update = common.failover_replication(
+                self.ctxt, TEST_GROUP[0], [missing, present])
+        error = fields.ReplicationStatus.ERROR
+        self.assertEqual({'replication_status': error}, model_update)
+        self.assertEqual(
+            [{'id': missing.id, 'replication_status': error},
+             {'id': present.id,
+              'replication_status': fields.ReplicationStatus.FAILED_OVER}],
+            volumes_update)
+
+    def test_ssws_wait_with_a_known_pvol_polls_the_copy_pair(self):
+        common = self._common()
+        ssws = dict(GET_REMOTE_MIRROR_COPYPAIR_RESULT_SSWS, svolLdevId=40)
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copypair',
+                return_value=ssws) as poll, \
+                mock.patch.object(
+                    common.rep_primary.client,
+                    'get_remote_copy_grp') as group_read:
+            common._wait_pair_status_change(
+                'HBSD-CG', 7, 40, hbsd_utils.REP_TYPE_ASYNC,
+                hbsd_replication._WAIT_SSWS, instance=common.rep_primary)
+        poll.assert_called_once_with(
+            None, 'HBSD-CG', 7, 40, is_secondary=True)
+        group_read.assert_not_called()
 
     @mock.patch.object(group_types, 'get_group_type_specs',
                        return_value='<is> True')
@@ -5340,6 +5717,370 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             [{'id': volume.id, 'replication_status': error}],
             volumes_update)
 
+    def _adopted_update_calls(self, common, copy_pairs=None):
+        """Mock the local S-side read; any pair or LDEV work fails the test.
+
+        The copy group is CGBOUND, as _bound_volume binds it.
+        """
+        calls = mock.Mock()
+        calls.read.return_value = self._svol_copy_grp('CGBOUND', copy_pairs)
+        for name in ('add_volume', 'delete_volume', 'copy_grp_exists',
+                     'delete_ldev', 'delete_pair'):
+            getattr(calls, name).side_effect = AssertionError(name)
+        self.mock_object(common.rep_primary.client, 'get_remote_copy_grp',
+                         calls.read)
+        self.mock_object(common.rep_primary.client,
+                         'delete_remote_copypair', calls.delete_pair)
+        self.mock_object(common.rep_primary, 'delete_ldev', calls.delete_ldev)
+        self.mock_object(common, '_group_repl_add_volume', calls.add_volume)
+        self.mock_object(common, '_group_repl_delete_volume',
+                         calls.delete_volume)
+        self.mock_object(common, '_group_repl_copy_grp_exists',
+                         calls.copy_grp_exists)
+        return calls
+
+    def _bound_svols(self, *sldevs):
+        return [self._bound_volume(
+            sldev, volume_id='00000000-0000-0000-0000-0000000000%d' % sldev)
+            for sldev in sldevs]
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_update_group_adds_adopted_members_without_the_peer(
+            self, get_group_type_specs):
+        common = self._common()
+        calls = self._adopted_update_calls(
+            common, [{'svolLdevId': 40}, {'svolLdevId': 41}])
+        common.rep_secondary = None
+        volumes = self._bound_svols(40, 41)
+        model_update, add_update, remove_update = common.update_group(
+            TEST_GROUP[0], add_volumes=volumes)
+        enabled = fields.ReplicationStatus.ENABLED
+        self.assertEqual({'status': fields.GroupStatus.AVAILABLE},
+                         model_update)
+        self.assertEqual(
+            [{'id': volume.id, 'replication_status': enabled}
+             for volume in volumes], add_update)
+        self.assertEqual([], remove_update)
+        self.assertEqual('CGBOUND', calls.read.call_args[0][1])
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_update_group_adopted_member_missing_from_its_copy_group_errors(
+            self, get_group_type_specs):
+        common = self._common()
+        self._adopted_update_calls(common, [{'svolLdevId': 40}])
+        common.rep_secondary = None
+        model_update, add_update, _ = common.update_group(
+            TEST_GROUP[0], add_volumes=self._bound_svols(40, 41))
+        self.assertEqual({'status': fields.GroupStatus.ERROR}, model_update)
+        self.assertEqual(
+            [fields.ReplicationStatus.ENABLED,
+             fields.ReplicationStatus.ERROR],
+            [update['replication_status'] for update in add_update])
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_update_group_adopted_members_error_if_copy_group_unreadable(
+            self, get_group_type_specs):
+        common = self._common()
+        calls = self._adopted_update_calls(common)
+        calls.read.side_effect = exception.VolumeDriverException(data='x')
+        common.rep_secondary = None
+        model_update, add_update, _ = common.update_group(
+            TEST_GROUP[0], add_volumes=self._bound_svols(40, 41))
+        self.assertEqual({'status': fields.GroupStatus.ERROR}, model_update)
+        self.assertEqual(
+            [fields.ReplicationStatus.ERROR] * 2,
+            [update['replication_status'] for update in add_update])
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_update_group_removes_adopted_members_leaving_the_array_alone(
+            self, get_group_type_specs):
+        """The binding stays, or the volume could no longer be attached."""
+        common = self._common()
+        calls = self._adopted_update_calls(common)
+        common.rep_secondary = None
+        volume = self._bound_svols(40)[0]
+        model_update, add_update, remove_update = common.update_group(
+            TEST_GROUP[0], remove_volumes=[volume])
+        calls.read.assert_not_called()
+        self.assertEqual({'status': fields.GroupStatus.AVAILABLE},
+                         model_update)
+        self.assertEqual([], add_update)
+        self.assertEqual(
+            [{'id': volume.id,
+              'replication_status': fields.ReplicationStatus.DISABLED}],
+            remove_update)
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_update_group_adds_and_removes_adopted_members_together(
+            self, get_group_type_specs):
+        common = self._common()
+        self._adopted_update_calls(common, [{'svolLdevId': 40}])
+        common.rep_secondary = None
+        added, removed = self._bound_svols(40, 41)
+        model_update, add_update, remove_update = common.update_group(
+            TEST_GROUP[0], add_volumes=[added], remove_volumes=[removed])
+        self.assertEqual({'status': fields.GroupStatus.AVAILABLE},
+                         model_update)
+        self.assertEqual(
+            [fields.ReplicationStatus.ENABLED],
+            [update['replication_status'] for update in add_update])
+        self.assertEqual(
+            [fields.ReplicationStatus.DISABLED],
+            [update['replication_status'] for update in remove_update])
+
+    @ddt.data('add', 'remove')
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_update_group_rejects_adopted_mixed_with_ordinary_volumes(
+            self, ordinary_side, get_group_type_specs):
+        common = self._common()
+        calls = self._adopted_update_calls(common, [{'svolLdevId': 40}])
+        calls.copy_grp_exists.side_effect = None
+        calls.copy_grp_exists.return_value = False
+        calls.add_volume.side_effect = None
+        calls.add_volume.return_value = {
+            'id': TEST_VOLUME[0].id,
+            'replication_status': fields.ReplicationStatus.ENABLED}
+        calls.delete_volume.side_effect = None
+        calls.delete_volume.return_value = {
+            'id': TEST_VOLUME[0].id,
+            'replication_status': fields.ReplicationStatus.DISABLED}
+        adopted = self._bound_svols(40)
+        if ordinary_side == 'add':
+            kwargs = {'add_volumes': adopted + [TEST_VOLUME[0]]}
+        else:
+            kwargs = {'add_volumes': adopted,
+                      'remove_volumes': [TEST_VOLUME[0]]}
+        self.assertRaises(exception.VolumeDriverException,
+                          common.update_group, TEST_GROUP[0], **kwargs)
+        calls.read.assert_not_called()
+        calls.add_volume.assert_not_called()
+        calls.delete_volume.assert_not_called()
+
+    def _setup_sites(self, common, primary_error=None, secondary_error=None):
+        self.mock_object(common, '_check_param')
+        self.mock_object(common, '_setup_replication')
+        self.mock_object(common.rep_primary, 'do_setup',
+                         side_effect=primary_error)
+        self.mock_object(common.rep_secondary, 'do_setup',
+                         side_effect=secondary_error)
+
+    def test_do_setup_comes_up_without_an_unreachable_primary(self):
+        common = self._common()
+        secondary = common.rep_secondary
+        self._setup_sites(common, primary_error=Exception('unreachable'))
+        common.do_setup(CTXT)
+        self.assertIsNone(common.rep_primary)
+        self.assertIs(secondary, common.rep_secondary)
+
+    def test_do_setup_raises_when_neither_site_initializes(self):
+        common = self._common()
+        self._setup_sites(
+            common, primary_error=exception.VolumeDriverException(data='p'),
+            secondary_error=exception.VolumeDriverException(data='s'))
+        self.assertRaises(exception.VolumeDriverException,
+                          common.do_setup, CTXT)
+
+    @staticmethod
+    def _paired_member(
+            replication_status=fields.ReplicationStatus.FAILED_OVER):
+        """A replicated group member bound to CGBOUND: P-VOL 7, S-VOL 40."""
+        volume = fake_volume.fake_volume_obj(
+            CTXT, id='00000000-0000-0000-0000-000000000077',
+            provider_location=json.dumps(
+                {'pldev': 7, 'sldev': 40,
+                 'remote-copy': hbsd_utils.REP_TYPE_ASYNC}),
+            replication_status=replication_status,
+            group_id=TEST_GROUP[0].id,
+            volume_metadata=[{'key': hbsd_replication._MD_COPY_GROUP,
+                              'value': 'CGBOUND'}])
+        volume.group = TEST_GROUP[0]
+        return volume
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_emergency_without_the_primary(
+            self, get_group_type_specs):
+        common = self._common()
+        common.rep_primary = None
+        volume = self._paired_member(fields.ReplicationStatus.ENABLED)
+        ssws = dict(GET_REMOTE_MIRROR_COPYPAIR_RESULT_SSWS,
+                    pvolLdevId=7, svolLdevId=40)
+        with mock.patch.object(
+                common.rep_secondary.client,
+                'takeover_remote_copy_grp') as takeover, \
+                mock.patch.object(
+                    common.rep_secondary.client, 'get_remote_copypair',
+                    return_value=ssws) as poll:
+            model_update, volumes_update = common.failover_replication(
+                self.ctxt, TEST_GROUP[0], [volume])
+        takeover.assert_called_once_with(None, 'CGBOUND')
+        poll.assert_called_once_with(
+            None, 'CGBOUND', 7, 40, is_secondary=True)
+        self.assertEqual(
+            {'replication_status': fields.ReplicationStatus.FAILED_OVER},
+            model_update)
+        self.assertEqual(
+            [fields.ReplicationStatus.FAILED_OVER],
+            [update['replication_status'] for update in volumes_update])
+
+    @ddt.data(':graceful', hbsd_replication._REP_FAILBACK)
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_failover_replication_needing_the_primary_fails_cleanly(
+            self, target, get_group_type_specs):
+        common = self._common()
+        common.rep_primary = None
+        names = ('takeover_remote_copy_grp', 'split_remote_copy_grp',
+                 'resync_remote_copy_grp')
+        with mock.patch.multiple(
+                common.rep_secondary.client,
+                **{name: mock.DEFAULT for name in names}) as calls:
+            self.assertRaises(
+                exception.UnableToFailOver, common.failover_replication,
+                self.ctxt, TEST_GROUP[0],
+                [self._paired_member(fields.ReplicationStatus.ENABLED)],
+                secondary_backend_id=target)
+        for call in calls.values():
+            call.assert_not_called()
+
+    def test_update_volume_stats_without_the_primary_is_a_driver_error(self):
+        common = self._common()
+        common.rep_primary = None
+        self.assertRaises(exception.VolumeDriverException,
+                          common.update_volume_stats)
+
+    def _failed_over_s_side(self, common, svol_status='SSWS'):
+        return mock.patch.object(
+            common.rep_secondary.client, 'get_remote_copy_grp',
+            return_value=self._svol_copy_grp(
+                'CGBOUND', [{'svolLdevId': 40, 'svolStatus': svol_status}]))
+
+    @ddt.data(True, False)
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_initialize_connection_maps_a_failed_over_member_s_vol(
+            self, primary_up, get_group_type_specs):
+        common = self._common()
+        volume = self._paired_member()
+        primary = common.rep_primary
+        if not primary_up:
+            common.rep_primary = None
+        with self._failed_over_s_side(common) as s_read, \
+                mock.patch.object(
+                    common.rep_secondary, 'initialize_connection',
+                    return_value={'data': 'S'}) as s_map, \
+                mock.patch.object(primary, 'initialize_connection') as p_map:
+            conn_info = common.initialize_connection(volume, DEFAULT_CONNECTOR)
+        s_read.assert_called_once_with(None, 'CGBOUND', is_secondary=True)
+        s_map.assert_called_once_with(volume, DEFAULT_CONNECTOR)
+        p_map.assert_not_called()
+        self.assertEqual({'data': 'S'}, conn_info)
+
+    @ddt.data('PAIR', None)
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_initialize_connection_refuses_a_s_vol_not_taken_over(
+            self, svol_status, get_group_type_specs):
+        common = self._common()
+        with self._failed_over_s_side(common, svol_status) as s_read, \
+                mock.patch.object(
+                    common.rep_secondary, 'initialize_connection') as s_map:
+            if svol_status is None:
+                s_read.side_effect = exception.VolumeDriverException(
+                    data='unreadable')
+            error = self.assertRaises(
+                exception.VolumeDriverException,
+                common.initialize_connection, self._paired_member(),
+                DEFAULT_CONNECTOR)
+        s_map.assert_not_called()
+        self.assertIn('remote replication pair', str(error))
+
+    @ddt.data('up', 'down', 'raises')
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_terminate_connection_unmaps_both_sides_of_a_failed_over_member(
+            self, primary_state, get_group_type_specs):
+        """A member attached before a planned failover is mapped by P-VOL."""
+        common = self._common()
+        volume = self._paired_member()
+        primary = common.rep_primary
+        if primary_state == 'down':
+            common.rep_primary = None
+        with mock.patch.object(
+                common.rep_secondary, 'terminate_connection',
+                return_value={'data': 'S'}) as s_unmap, \
+                mock.patch.object(
+                    primary, 'terminate_connection',
+                    side_effect=(exception.VolumeDriverException(data='x')
+                                 if primary_state == 'raises'
+                                 else None)) as p_unmap:
+            conn_info = common.terminate_connection(volume, DEFAULT_CONNECTOR)
+        s_unmap.assert_called_once_with(volume, DEFAULT_CONNECTOR)
+        if primary_state == 'down':
+            p_unmap.assert_not_called()
+        else:
+            p_unmap.assert_called_once_with(volume, DEFAULT_CONNECTOR)
+        self.assertEqual({'data': 'S'}, conn_info)
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_initialize_connection_of_a_replicating_member_stays_on_p_vol(
+            self, get_group_type_specs):
+        common = self._common()
+        volume = self._paired_member(fields.ReplicationStatus.ENABLED)
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp',
+                return_value={}), \
+                mock.patch.object(
+                    common.rep_primary, 'initialize_connection',
+                    return_value={'data': 'P'}) as p_map, \
+                mock.patch.object(
+                    common.rep_secondary, 'initialize_connection') as s_map:
+            conn_info = common.initialize_connection(volume, DEFAULT_CONNECTOR)
+        s_map.assert_not_called()
+        p_map.assert_called_once()
+        self.assertEqual({'data': 'P'}, conn_info)
+
+    @ddt.data('delete_volume', 'extend_volume', 'create_snapshot', 'retype',
+              'migrate_volume', 'revert_to_snapshot')
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_operations_on_a_failed_over_member_are_refused(
+            self, operation, get_group_type_specs):
+        common = self._common()
+        volume = self._paired_member()
+        snapshot = self._snapshot_of(volume)
+        args = {
+            'delete_volume': (volume,),
+            'extend_volume': (volume, 256),
+            'create_snapshot': (snapshot,),
+            'retype': (self.ctxt, volume, mock.Mock(), {}, 'host'),
+            'migrate_volume': (volume, 'host'),
+            'revert_to_snapshot': (volume, snapshot),
+        }[operation]
+        self.mock_object(common, '_verify_ldev',
+                         side_effect=AssertionError('reached the array'))
+        error = self.assertRaises(exception.VolumeDriverException,
+                                  getattr(common, operation), *args)
+        self.assertIn('remote replication pair', str(error))
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_operations_on_a_replicating_member_are_not_refused(
+            self, get_group_type_specs):
+        common = self._common()
+        volume = self._paired_member(fields.ReplicationStatus.ENABLED)
+        verify = self.mock_object(common, '_verify_ldev',
+                                  side_effect=StopIteration)
+        self.assertRaises(StopIteration, common.extend_volume, volume, 256)
+        verify.assert_called_once()
+
     def test_ssws_wait_polls_the_site_it_is_given(self):
         common = self._common()
         common.rep_secondary = None
@@ -5354,6 +6095,31 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         params = common._get_wait_pair_status_change_params(
             hbsd_replication._WAIT_SSWS)
         self.assertIs(common.rep_secondary, params['instance'])
+
+    @ddt.data((hbsd_replication._WAIT_PSUS, ['PSUS', 'SSUS']),
+              (hbsd_replication._WAIT_PAIR, ['PAIR', 'PFUL']))
+    @ddt.unpack
+    def test_wait_given_a_site_polls_its_s_side_without_the_peer(
+            self, wait_type, expected):
+        common = self._common()
+        common.rep_secondary = None
+        params = common._get_wait_pair_status_change_params(
+            wait_type, common.rep_primary)
+        self.assertIs(common.rep_primary, params['instance'])
+        self.assertIsNone(params['remote_client'])
+        self.assertTrue(params['is_secondary'])
+        self.assertEqual(['svolStatus'], params['status_keys'])
+        self.assertEqual(expected, params['expected_status'])
+
+    @ddt.data(hbsd_replication._WAIT_PSUS, hbsd_replication._WAIT_PAIR)
+    def test_wait_without_a_site_polls_the_p_side_through_the_peer(
+            self, wait_type):
+        common = self._common()
+        params = common._get_wait_pair_status_change_params(wait_type)
+        self.assertIs(common.rep_primary, params['instance'])
+        self.assertIs(common.rep_secondary.client, params['remote_client'])
+        self.assertFalse(params['is_secondary'])
+        self.assertEqual(['pvolStatus', 'svolStatus'], params['status_keys'])
 
     @ddt.data(True, False)
     def test_sldev_owner_is_the_site_carrying_its_label(self, local):
@@ -6839,6 +7605,24 @@ class HBSDGroupReplicationRestApiTest(test.TestCase):
         self.assertTrue(url.endswith('/actions/takeover/invoke'))
         self.assertIn('/remote-mirror-copygroups/', url)
         self.assertIn(self._secondary_id(), url)
+
+    def _split_body(self, **kwargs):
+        remote = mock.Mock(storage_id='654321')
+        self._call(hbsd_rest_api.RestApiClient.split_remote_copy_grp,
+                   remote, GROUP_REPL_COPY_GROUP, 'UR', **kwargs)
+        args, call_kwargs = self.client._invoke.call_args
+        self.assertTrue(args[0].endswith('/actions/split/invoke'))
+        return call_kwargs['body']
+
+    def test_split_remote_copy_grp_sends_svol_access_mode_when_given(self):
+        self.assertEqual(
+            {'parameters': {'replicationType': 'UR',
+                            'svolAccessMode': 'rw'}},
+            self._split_body(svol_access_mode='rw'))
+
+    def test_split_remote_copy_grp_sends_no_svol_access_mode_by_default(self):
+        self.assertEqual({'parameters': {'replicationType': 'UR'}},
+                         self._split_body())
 
     def test_get_remote_copy_grp_without_remote_client(self):
         self.client._get_object.return_value = {

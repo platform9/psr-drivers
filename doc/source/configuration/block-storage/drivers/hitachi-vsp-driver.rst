@@ -1202,8 +1202,16 @@ a mode suffix:
        ``hbsd:group_replication_failover_mode`` to ``graceful``, otherwise
        emergency.
    * - ``<backend_id>:graceful``
-     - Splits the copy group from the primary storage system. Use it while
-       the primary storage system is reachable.
+     - Splits the copy group from the storage system that holds its primary
+       side, with write access to the secondary volumes, waits for every
+       pair to suspend, then takes the copy group over from the storage
+       system that holds its secondary side, so every secondary volume ends
+       in ``SSWS``. It works from the backend of either storage system, and
+       needs both reachable. If the split fails, no
+       takeover is sent. If the takeover fails and no pair was taken over,
+       the pairs are resynchronized back to ``PAIR``; otherwise they are left
+       as they are. Either way the failover fails with MSGID0805, which names
+       the step.
    * - ``<backend_id>:emergency``
      - Takes over the copy group from the storage system that holds its
        secondary side, without the primary storage system. Use it when the
@@ -1225,6 +1233,20 @@ spaces. Any other ``secondary_backend_id``, such as an unknown backend ID or
 an unknown mode suffix, is rejected with ``InvalidReplicationTarget`` before
 the driver sends anything to a storage system. Cinder then sets the group and
 its volumes to ``error``.
+
+After a group fails over, its volumes are served from their secondary
+volumes. Attaching a volume maps its secondary volume, after checking that
+the secondary volume is in ``SSWS``, and fails with MSGID0766 otherwise.
+Detaching it unmaps the secondary volume and, while the primary storage
+system answers, the primary volume as well, so a volume attached before a
+planned failover is detached cleanly. Deleting, extending, retyping and
+migrating such a volume, taking a snapshot of it and reverting it to a
+snapshot fail with MSGID0766 until the group fails back.
+
+The backend starts while the primary storage system is unreachable, as long
+as the secondary storage system is reachable, so that the group can still be
+failed over in emergency mode. Graceful failover and failback need the
+primary storage system and fail until it is reachable.
 
 Configuration options
 ~~~~~~~~~~~~~~~~~~~~~
