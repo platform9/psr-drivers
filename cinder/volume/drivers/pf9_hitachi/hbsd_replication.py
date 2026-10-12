@@ -409,6 +409,19 @@ def _volume_in_group_replication_or_bound(volume):
             _volume_copy_group_binding(volume) is not None)
 
 
+def _sldev_from_group_replication(volume):
+    """Whether group replication adopted or created volume's sldev-only LDEV.
+
+    One created during a host-level failover has none of these marks.
+    """
+    try:
+        metadata = volume.metadata or {}
+    except Exception:
+        metadata = {}
+    return (bool(metadata.get(_MD_SVOL)) or
+            _volume_in_group_replication_or_bound(volume))
+
+
 def _parse_failover_target(secondary_backend_id):
     if not secondary_backend_id:
         return secondary_backend_id, None
@@ -1169,9 +1182,7 @@ class HBSDREPLICATION(rest.HBSDREST):
                     {'storage': instance.storage_id[-6:],
                      'journal': journal_id, 'ldev': ldev})
             except exception.VolumeDriverException:
-                # Leaks a journal and a journal LDEV on the array, so this
-                # has to be visible without debug logging enabled.
-                LOG.warning(
+                LOG.debug(
                     'A journal and/or its LDEV were not deleted. '
                     '(storage: %(storage)s, journal: %(journal)s)',
                     {'storage': instance.storage_id[-6:],
@@ -1791,7 +1802,8 @@ class HBSDREPLICATION(rest.HBSDREST):
         self._refuse_failed_over(volume, 'delete a volume')
         self._require_rep_primary()
         if (not self._active_backend_id and
-                _get_ldev_site(volume) == _SECONDARY):
+                _get_ldev_site(volume) == _SECONDARY and
+                _sldev_from_group_replication(volume)):
             self._delete_svol_of(volume)
             return
         self._verify_ldev(volume, 'delete a volume')
@@ -2330,11 +2342,11 @@ class HBSDREPLICATION(rest.HBSDREST):
         return self._get_active_backend().create_group()
 
     def delete_group(self, group, volumes):
-        LOG.info('Group replication: delete_group %(group)s. (volumes: '
-                 '%(n)d, group replication: %(gr)s)',
-                 {'group': group.id, 'n': len(volumes),
-                  'gr': group.is_replicated})
         if group.is_replicated:
+            LOG.info('Group replication: delete_group %(group)s. (volumes: '
+                     '%(n)d, group replication: %(gr)s)',
+                     {'group': group.id, 'n': len(volumes),
+                      'gr': group.is_replicated})
             return self._group_repl_delete_group(group, volumes)
         if self.conf.hitachi_mirror_storage_id:
             self._require_rep_primary()
@@ -2374,12 +2386,12 @@ class HBSDREPLICATION(rest.HBSDREST):
             return model_update, volumes_model_update
 
     def update_group(self, group, add_volumes=None, remove_volumes=None):
-        LOG.info('Group replication: update_group %(group)s. (add: %(a)d, '
-                 'remove: %(r)d, group replication: %(gr)s)',
-                 {'group': group.id, 'a': len(add_volumes or []),
-                  'r': len(remove_volumes or []),
-                  'gr': group.is_replicated})
         if group.is_replicated:
+            LOG.info('Group replication: update_group %(group)s. (add: %(a)d, '
+                    'remove: %(r)d, group replication: %(gr)s)',
+                    {'group': group.id, 'a': len(add_volumes or []),
+                    'r': len(remove_volumes or []),
+                    'gr': group.is_replicated})
             return self._group_repl_update_group(
                 group, add_volumes, remove_volumes)
         if self.conf.hitachi_mirror_storage_id:
@@ -2407,11 +2419,11 @@ class HBSDREPLICATION(rest.HBSDREST):
             return self._get_active_backend().update_group(group, add_volumes)
 
     def create_group_snapshot(self, context, group_snapshot, snapshots):
-        LOG.info('Group replication: create_group_snapshot %(gs)s. '
-                 '(snapshots: %(n)d, group replication: %(gr)s)',
-                 {'gs': group_snapshot.id, 'n': len(snapshots),
-                  'gr': _group_snapshot_is_replicated(group_snapshot)})
         if _group_snapshot_is_replicated(group_snapshot):
+            LOG.info('Group replication: create_group_snapshot %(gs)s. '
+                    '(snapshots: %(n)d, group replication: %(gr)s)',
+                    {'gs': group_snapshot.id, 'n': len(snapshots),
+                    'gr': _group_snapshot_is_replicated(group_snapshot)})
             return self._group_repl_create_group_snapshot(
                 context, group_snapshot, snapshots)
         if self.conf.hitachi_mirror_storage_id:
@@ -2430,11 +2442,11 @@ class HBSDREPLICATION(rest.HBSDREST):
             return rtn
 
     def delete_group_snapshot(self, group_snapshot, snapshots):
-        LOG.info('Group replication: delete_group_snapshot %(gs)s. '
-                 '(snapshots: %(n)d, group replication: %(gr)s)',
-                 {'gs': group_snapshot.id, 'n': len(snapshots),
-                  'gr': _group_snapshot_is_replicated(group_snapshot)})
         if _group_snapshot_is_replicated(group_snapshot):
+            LOG.info('Group replication: delete_group_snapshot %(gs)s. '
+                    '(snapshots: %(n)d, group replication: %(gr)s)',
+                    {'gs': group_snapshot.id, 'n': len(snapshots),
+                    'gr': _group_snapshot_is_replicated(group_snapshot)})
             return self._group_repl_delete_group_snapshot(
                 group_snapshot, snapshots)
         if self.conf.hitachi_mirror_storage_id:
@@ -2888,12 +2900,15 @@ class HBSDREPLICATION(rest.HBSDREST):
                 else:
                     new_ldev = self._copy_svol_on(site, volume, src)
                 new_ldevs.append((site, new_ldev))
+                # The mark keeps the volume deletable once it leaves the
+                # group, since delete_volume refuses unmarked sldev-only ones.
                 volumes_model_update.append({
                     'id': volume.id,
                     'provider_location': _pack_rep_provider_location(
                         sldev=new_ldev),
                     'replication_status':
-                        fields.ReplicationStatus.DISABLED})
+                        fields.ReplicationStatus.DISABLED,
+                    **_metadata_model_update(volume, **{_MD_SVOL: new_ldev})})
         except Exception:
             with excutils.save_and_reraise_exception():
                 for site, new_ldev in new_ldevs:
