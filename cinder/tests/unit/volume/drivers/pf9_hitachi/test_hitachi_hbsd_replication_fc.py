@@ -3360,9 +3360,11 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
     def _svol_only_volume(self, sldev,
                           volume_id='00000000-0000-0000-0000-000000000099'):
         """An adopted S-VOL: provider_location has sldev but no pldev."""
-        return fake_volume.fake_volume_obj(
+        volume = fake_volume.fake_volume_obj(
             CTXT, id=volume_id,
             provider_location=json.dumps({'sldev': sldev}))
+        volume.metadata = {hbsd_replication._MD_SVOL: str(sldev)}
+        return volume
 
     @staticmethod
     def _svol_copy_grp(copy_group_name, copy_pairs=None):
@@ -6170,6 +6172,40 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             site, _ = common._resolve_sldev_owner(volume)
         self.assertIs(common.rep_primary, site)
 
+    def test_delete_volume_refuses_an_unmarked_sldev_only_volume(self):
+        """A host-level failover leaves these; delete runs on the primary."""
+        common = self._common()
+        volume = fake_volume.fake_volume_obj(
+            CTXT, id='00000000-0000-0000-0000-000000000099',
+            provider_location=json.dumps({'sldev': 9}))
+        with mock.patch.object(
+                common, '_resolve_sldev_owner') as resolve, \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev') as local_delete, \
+                self._delete_patches(common) as peer:
+            exc = self.assertRaises(
+                exception.VolumeDriverException, common.delete_volume,
+                volume)
+        self.assertIn('exists in the other site', str(exc))
+        resolve.assert_not_called()
+        local_delete.assert_not_called()
+        for method in peer.values():
+            method.assert_not_called()
+
+    def test_delete_volume_deletes_a_bound_sldev_only_volume(self):
+        common = self._common()
+        volume = fake_volume.fake_volume_obj(
+            CTXT, id='00000000-0000-0000-0000-000000000099',
+            provider_location=json.dumps({'sldev': 9}))
+        volume.metadata = {
+            hbsd_replication._MD_COPY_GROUP: GROUP_REPL_COPY_GROUP}
+        with self._label_stub(common.rep_primary, self._label_of(volume)), \
+                self._label_stub(common.rep_secondary, None), \
+                mock.patch.object(
+                    common.rep_primary, 'delete_ldev') as local_delete:
+            common.delete_volume(volume)
+        local_delete.assert_called_once_with(9, mock.ANY)
+
     def test_delete_volume_busy_local_svol_raises_volume_is_busy(self):
         common = self._common()
         volume = self._svol_only_volume(9)
@@ -6363,7 +6399,8 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual(
             [{'id': volume.id,
               'provider_location': json.dumps({'sldev': 50}),
-              'replication_status': fields.ReplicationStatus.DISABLED}],
+              'replication_status': fields.ReplicationStatus.DISABLED,
+              'metadata': {hbsd_replication._MD_SVOL: '50'}}],
             volumes_update)
 
     def test_create_group_from_src_clones_a_peer_source_as_today(self):
