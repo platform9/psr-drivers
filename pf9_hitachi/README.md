@@ -329,7 +329,7 @@ tox -e pep8
 
 1. **Read:** [DEPLOYMENT.md](/psr-drivers/DEPLOYMENT.md) (installation details)
 2. **Deploy:** copy the modules over `cinder/volume/drivers/hitachi/` on the
-   host. `./deploy.sh <user@host> pf9_hitachi` does not do this yet: it
+   host. `./deploy.sh <user@host> pf9_hitachi <ssh_key_path>` does not do this yet: it
    installs to `drivers/pf9_hitachi/`, where the modules are never loaded.
 3. **Verify:** Check logs for errors
 4. **Test:** Create volumes with replication enabled
