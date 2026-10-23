@@ -2493,7 +2493,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual(1, get_volume_type_extra_specs.call_count)
         self.assertEqual(4, request.call_count)
         self.assertEqual(
-            self.driver.common.rep_secondary.backend_id,
+            self.driver.common.rep_secondary_backend_id,
             self.driver.common._active_backend_id)
         self.driver.common._active_backend_id = ''
         for args, kwargs in request.call_args_list:
@@ -2512,7 +2512,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
     def test_failover_host_failback(
             self, brick_get_connector_properties, request):
         self.driver.common._active_backend_id = \
-            self.driver.common.rep_secondary.backend_id
+            self.driver.common.rep_secondary_backend_id
         self.copypair_count = 0
 
         def _request_side_effect(
@@ -2654,7 +2654,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             active_backend_id=
             self.configuration.replication_device[0]['backend_id'])
         self.assertEqual(
-            self.driver.common.rep_secondary.backend_id,
+            self.driver.common.rep_secondary_backend_id,
             self.driver.common._active_backend_id)
         self.driver.common._active_backend_id = ''
 
@@ -2806,7 +2806,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
     def test_get_failback_volume_update_snapshot_error(
             self, brick_get_connector_properties, request):
         self.driver.common._active_backend_id = \
-            self.driver.common.rep_secondary.backend_id
+            self.driver.common.rep_secondary_backend_id
         self.copypair_count = 0
 
         def _request_side_effect(
@@ -2900,7 +2900,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
     def test_failback_copy_group_except(
             self, brick_get_connector_properties, request):
         self.driver.common._active_backend_id = \
-            self.driver.common.rep_secondary.backend_id
+            self.driver.common.rep_secondary_backend_id
         self.copypair_count = 0
 
         def _request_side_effect(
@@ -2972,7 +2972,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
     def test_failback_volume_raise_exception(
             self, brick_get_connector_properties, request):
         self.driver.common._active_backend_id = \
-            self.driver.common.rep_secondary.backend_id
+            self.driver.common.rep_secondary_backend_id
         self.copypair_count = 0
 
         def _request_side_effect(
@@ -3429,13 +3429,35 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     def test_create_group_copy_group_name(self):
         common = self._common()
-        name = common._create_group_copy_group_name(TEST_GROUP[0].id)
-        prefix = common.driver_info['target_prefix']
-        self.assertTrue(name.startswith(prefix))
         self.assertEqual(
-            prefix + TEST_GROUP[0].id.replace('-', '').upper()[
-                :hbsd_replication._MAX_GROUP_COPY_GROUP_NAME - len(prefix)],
-            name)
+            'HBSD-0yNkm9nGBSTDWDtLbt9iCW',
+            common._create_group_copy_group_name(TEST_GROUP[0].id))
+
+    def test_create_group_copy_group_name_keeps_the_whole_id(self):
+        common = self._common()
+        self.assertNotEqual(
+            common._create_group_copy_group_name(TEST_GROUP[0].id),
+            common._create_group_copy_group_name(TEST_GROUP[1].id))
+
+    @ddt.data('00000000-0000-0000-0000-000000000000',
+              'ffffffff-ffff-ffff-ffff-ffffffffffff',
+              '7c1f4e2a-9b3d-4f6e-8a21-5d0c3b9e7f14')
+    def test_group_names_are_alphanumeric_after_the_prefix(self, object_id):
+        common = self._common()
+        copy_group = common._create_group_copy_group_name(object_id)
+        snapshot_group = common._create_group_snapshot_group_name(object_id)
+        self.assertRegex(copy_group, r'^HBSD-[0-9A-Za-z]{22}$')
+        self.assertRegex(snapshot_group, r'^HBSD-C[0-9A-Za-z]{22}$')
+        self.assertLessEqual(len(copy_group),
+                             hbsd_replication._MAX_GROUP_COPY_GROUP_NAME)
+        self.assertLessEqual(len(snapshot_group),
+                             hbsd_rest._MAX_COPY_GROUP_NAME)
+
+    def test_create_group_snapshot_group_name(self):
+        common = self._common()
+        self.assertEqual(
+            'HBSD-C1SZdAEgtHBhpHKq1PpjZIm',
+            common._create_group_snapshot_group_name(TEST_GROUP_SNAP[0].id))
 
     def test_create_group_copy_group_name_leaves_room_for_journal(self):
         common = self._common()
@@ -5517,7 +5539,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     def test_svol_side_of_a_failed_over_backend_is_the_peer(self):
         common = self._common()
-        common._active_backend_id = common.rep_secondary.backend_id
+        common._active_backend_id = common.rep_secondary_backend_id
         with mock.patch.object(
                 common.rep_primary.client, 'get_remote_copy_grp') as local, \
                 mock.patch.object(
@@ -5858,11 +5880,32 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         else:
             kwargs = {'add_volumes': adopted,
                       'remove_volumes': [TEST_VOLUME[0]]}
-        self.assertRaises(exception.VolumeDriverException,
-                          common.update_group, TEST_GROUP[0], **kwargs)
+        exc = self.assertRaises(exception.VolumeDriverException,
+                                common.update_group, TEST_GROUP[0], **kwargs)
+        self.assertIn('cannot mix adopted secondary volumes', str(exc))
         calls.read.assert_not_called()
         calls.add_volume.assert_not_called()
         calls.delete_volume.assert_not_called()
+
+    def test_group_resync_failure_logs_and_errors_each_member(self):
+        common = self._common()
+        with mock.patch.object(
+                common.rep_primary.client, 'resync_remote_copy_grp',
+                side_effect=exception.VolumeDriverException(data='x')), \
+                mock.patch.object(hbsd_utils, 'LOG') as log:
+            updates = common._group_repl_resync_members(
+                'CG', TEST_VOLUME[:2])
+        self.assertEqual(
+            [{'id': volume.id,
+              'replication_status': fields.ReplicationStatus.ERROR}
+             for volume in TEST_VOLUME[:2]],
+            updates)
+        msgs = [call[0][2]['msg'] for call in log.log.call_args_list]
+        self.assertEqual(2, len(msgs))
+        for volume, msg in zip(TEST_VOLUME[:2], msgs):
+            self.assertIn('Failed to resync the group replication', msg)
+            self.assertIn(volume.id, msg)
+            self.assertIn('CG', msg)
 
     def _setup_sites(self, common, primary_error=None, secondary_error=None):
         self.mock_object(common, '_check_param')
@@ -5957,6 +6000,10 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertRaises(exception.VolumeDriverException,
                           common.update_volume_stats)
 
+    def _check_pair_on_attach(self):
+        self.override_config('hitachi_replication_check_pair_on_attach', True,
+                             group=conf.SHARED_CONF_GROUP)
+
     def _failed_over_s_side(self, common, svol_status='SSWS'):
         return mock.patch.object(
             common.rep_secondary.client, 'get_remote_copy_grp',
@@ -5968,6 +6015,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                        return_value='<is> True')
     def test_initialize_connection_maps_a_failed_over_member_s_vol(
             self, primary_up, get_group_type_specs):
+        self._check_pair_on_attach()
         common = self._common()
         volume = self._paired_member()
         primary = common.rep_primary
@@ -5989,6 +6037,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                        return_value='<is> True')
     def test_initialize_connection_refuses_a_s_vol_not_taken_over(
             self, svol_status, get_group_type_specs):
+        self._check_pair_on_attach()
         common = self._common()
         with self._failed_over_s_side(common, svol_status) as s_read, \
                 mock.patch.object(
@@ -6002,6 +6051,21 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                 DEFAULT_CONNECTOR)
         s_map.assert_not_called()
         self.assertIn('remote replication pair', str(error))
+
+    @mock.patch.object(group_types, 'get_group_type_specs',
+                       return_value='<is> True')
+    def test_attaching_a_failed_over_member_reads_no_copy_group_by_default(
+            self, get_group_type_specs):
+        common = self._common()
+        with self._failed_over_s_side(common, 'PAIR') as s_read, \
+                mock.patch.object(
+                    common.rep_secondary, 'initialize_connection',
+                    return_value={'data': 'S'}) as s_map:
+            conn_info = common.initialize_connection(
+                self._paired_member(), DEFAULT_CONNECTOR)
+        s_read.assert_not_called()
+        s_map.assert_called_once()
+        self.assertEqual({'data': 'S'}, conn_info)
 
     @ddt.data('up', 'down', 'raises')
     @mock.patch.object(group_types, 'get_group_type_specs',
@@ -6625,6 +6689,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         self.assertEqual(json.dumps({'sldev': 9}), volume.provider_location)
 
     def test_attaching_a_taken_over_local_svol_maps_it_here(self):
+        self._check_pair_on_attach()
         common = self._common()
         volume = self._bound_volume(sldev=9)
         here, peer = self._adopted_here(common, volume, paired=True)
@@ -6635,6 +6700,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
         attach.assert_called_once()
 
     def test_attaching_a_still_paired_local_svol_raises(self):
+        self._check_pair_on_attach()
         common = self._common()
         volume = self._bound_volume(sldev=9)
         here, peer = self._adopted_here(common, volume, paired=True)
@@ -6646,6 +6712,18 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
                 common.initialize_connection, volume, DEFAULT_CONNECTOR)
         self.assertIn('is in a remote replication pair', str(exc))
         attach.assert_not_called()
+
+    def test_attaching_a_paired_local_svol_reads_no_copy_group_by_default(
+            self):
+        common = self._common()
+        volume = self._bound_volume(sldev=9)
+        here, peer = self._adopted_here(common, volume, paired=True)
+        with here, peer, self._local_pair(common, 'PAIR') as read, \
+                mock.patch.object(
+                    common.rep_primary, 'initialize_connection') as attach:
+            common.initialize_connection(volume, DEFAULT_CONNECTOR)
+        read.assert_not_called()
+        attach.assert_called_once()
 
     def test_attaching_an_svol_on_the_peer_raises_other_site_error(self):
         common = self._common()
@@ -6671,6 +6749,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
 
     def _attach_bound_pair(self, common, reply):
         """Attach _bound_pair_volume with reply as the source's own half."""
+        self._check_pair_on_attach()
         volume = self._bound_pair_volume()
         with mock.patch.object(
                 common.rep_primary.client, 'get_remote_copy_grp',
@@ -6733,6 +6812,17 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             common, exception.VolumeDriverException(data='down'))
         self.assertIsInstance(result, exception.VolumeDriverException)
         attach.assert_not_called()
+
+    def test_attaching_a_pair_volume_reads_no_copy_group_by_default(self):
+        common = self._common()
+        with mock.patch.object(
+                common.rep_primary.client, 'get_remote_copy_grp') as read, \
+                mock.patch.object(
+                    common.rep_primary, 'initialize_connection') as attach:
+            common.initialize_connection(
+                self._bound_pair_volume(), DEFAULT_CONNECTOR)
+        read.assert_not_called()
+        attach.assert_called_once()
 
     def test_attaching_an_unbound_pair_volume_reads_no_copy_group(self):
         common = self._common()
@@ -7065,7 +7155,7 @@ class HBSDREPLICATIONFCDriverTest(test.TestCase):
             self, found):
         """A failed-over backend reads the peer's S side."""
         common = self._common()
-        common._active_backend_id = common.rep_secondary.backend_id
+        common._active_backend_id = common.rep_secondary_backend_id
         copy_group_name = common._create_group_copy_group_name(
             TEST_GROUP[0].id)
         answer = ({'return_value': self._svol_copy_grp(copy_group_name)}
@@ -7471,13 +7561,14 @@ class HBSDGroupReplicationHelperTest(test.TestCase):
             hbsd_replication._typed_for_group_replication(
                 {old_key: '<is> True'}))
 
-    @ddt.data('<is> True', '  <is> True  ')
+    @ddt.data('<is> True', '  <is> True  ', '<is> true', '<is> yes', '<is> 1')
     def test_typed_for_group_replication_true(self, spec):
         self.assertTrue(
             hbsd_replication._typed_for_group_replication(
                 {hbsd_replication._GROUP_REPL_VOLUME_SPEC: spec}))
 
-    @ddt.data('True', 'true', '<is> true')
+    @ddt.data('True', 'true', '<is>True', '<is> false', '<is> no', '<is>',
+              '<is> True x')
     def test_typed_for_group_replication_false_for_near_miss_values(
             self, spec):
         self.assertFalse(

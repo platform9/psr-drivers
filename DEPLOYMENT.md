@@ -245,6 +245,17 @@ driver = <DriverClass>()
 Should return a JSON response with `sessionId`.
 
 ---
+## Upgrading pf9_hitachi
+
+- Before deploying over a build that named copy groups `HBSD-` plus 23 hex
+  digits, follow "Copy group names and upgrades" in
+  [pf9_hitachi/README.md](pf9_hitachi/README.md): check the members' metadata,
+  and do not add volumes to those groups afterwards (with PSR, no VMs or volumes
+  added to their ProtectionGroups).
+- For PSR, set `hitachi_replication_check_pair_on_attach = True` in each Hitachi
+  backend section, as "What PSR expects" in the same README explains.
+
+---
 ## Next Steps
 
 1. **Create volume type:**

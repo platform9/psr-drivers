@@ -1189,6 +1189,8 @@ class RestApiClient():
         } + '/invoke'
         self._invoke(url, body=body, job_nowait=True)
 
+    # remote_client is unused, but synchronized_on_copy_group takes the copy
+    # group name from the argument after it.
     @utils.synchronized_on_copy_group()
     def takeover_remote_copy_grp(self, remote_client, copy_group_name):
         """Promote every S-VOL of a copy group in one operation.

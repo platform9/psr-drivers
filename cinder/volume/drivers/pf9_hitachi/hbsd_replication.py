@@ -18,7 +18,9 @@
 from collections import defaultdict
 import contextlib
 import json
+import string
 import time
+import uuid
 
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -33,6 +35,7 @@ from cinder.volume.drivers.hitachi import hbsd_rest as rest
 from cinder.volume.drivers.hitachi import hbsd_utils as utils
 from cinder.volume import group_types
 from cinder.volume import manager
+from cinder.volume import volume_utils
 from cinder.zonemanager import utils as fczm_utils
 
 _ASYNC_STRING = 'async'
@@ -69,6 +72,9 @@ _JOURNAL_VOLUME_LABEL = '%s-JNL'
 _MAX_GROUP_COPY_GROUP_NAME = min(
     rest._MAX_COPY_GROUP_NAME,
     rest._MAX_LDEV_LABEL - len(_JOURNAL_VOLUME_LABEL % ''))
+_BASE62_DIGITS = (
+    string.digits + string.ascii_uppercase + string.ascii_lowercase)
+_BASE62_UUID_LEN = 22
 _PAIR_REPLICATING = ('PAIR', 'PFUL', 'COPY')
 _PAIR_SUSPENDED = ('PSUS', 'SSUS', 'PSUE', 'PFUS')
 # Where a group failback can continue from, as (DR array, source array)
@@ -168,6 +174,13 @@ COMMON_REPLICATION_OPTS = [
         default=5, min=0, max=60,
         help='Delay in minutes before a volume pair is split after path '
         'failure occurs'),
+    cfg.BoolOpt(
+        'hitachi_replication_check_pair_on_attach',
+        default=False,
+        help='Whether or not to read the copy group of a volume in a '
+        'replicated group, or bound to a copy group, before attaching it, '
+        'and fail the attach unless the volume is writable. Reading a copy '
+        'group can take tens of seconds'),
 ]
 
 _REPLICATION_DEVICE_KEY_NAMES = [
@@ -385,15 +398,12 @@ def _volume_in_group_replication(volume):
 def _typed_for_group_replication(extra_specs):
     """Whether the volume type marks its volumes for group replication.
 
-    Only the literal '<is> True' enables it, as volume_utils.is_group_a_type
-    requires of group types, though surrounding whitespace is trimmed here.
+    Read as Cinder reads replication_enabled, which the scheduler matches too.
     """
     if not extra_specs:
         return False
-    spec = extra_specs.get(_GROUP_REPL_VOLUME_SPEC)
-    if not spec:
-        return False
-    return spec.strip() == '<is> True'
+    return volume_utils.is_boolean_str(
+        extra_specs.get(_GROUP_REPL_VOLUME_SPEC))
 
 
 def _volume_copy_group_binding(volume):
@@ -577,6 +587,19 @@ def _pvol_of(obj):
     if not isinstance(loc, dict) or 'pldev' not in loc:
         return None
     return int(loc['pldev'])
+
+
+def _base62_uuid(uuid_str):
+    """The whole UUID in 22 alphanumeric characters, so names never collide.
+
+    Base64's alphabet without its symbols; 62**22 still exceeds 2**128.
+    """
+    value = uuid.UUID(uuid_str).int
+    digits = []
+    for _ in range(_BASE62_UUID_LEN):
+        value, digit = divmod(value, len(_BASE62_DIGITS))
+        digits.append(_BASE62_DIGITS[digit])
+    return ''.join(reversed(digits))
 
 
 def _as_local_ldev(volume, ldev):
@@ -794,8 +817,7 @@ class HBSDREPLICATION(rest.HBSDREST):
                 MSG.INVALID_PARAMETER,
                 param=('replication_device[backend_id]'))
             self.raise_error(msg)
-        self.rep_secondary.backend_id = rep_dev.pop('backend_id')
-        self.rep_secondary_backend_id = self.rep_secondary.backend_id
+        self.rep_secondary_backend_id = rep_dev.pop('backend_id')
 
         names = (_REPLICATION_DEVICE_KEY_NAMES +
                  _REPLICATION_DEVICE_STANDARD_KEY_NAMES)
@@ -936,6 +958,7 @@ class HBSDREPLICATION(rest.HBSDREST):
                       'peer.', copy_group_name, exc_info=True)
         else:
             if grp is None:
+                # rep_primary holds no S side, so the peer must.
                 return self.rep_secondary, None
             return self.rep_primary, grp
         if self.rep_secondary:
@@ -1135,14 +1158,12 @@ class HBSDREPLICATION(rest.HBSDREST):
 
     def _create_group_copy_group_name(self, group_id):
         """Derive one copy group name per Cinder group."""
-        prefix = self.driver_info['target_prefix']
-        return prefix + group_id.replace(
-            '-', '').upper()[:_MAX_GROUP_COPY_GROUP_NAME - len(prefix)]
+        return self.driver_info['target_prefix'] + _base62_uuid(group_id)
 
     def _create_group_snapshot_group_name(self, group_snapshot_id):
         """Derive one Thin Image group name per Cinder group snapshot."""
         return (self.driver_info['target_prefix'] + 'C' +
-                group_snapshot_id.replace('-', ''))[:rest._MAX_COPY_GROUP_NAME]
+                _base62_uuid(group_snapshot_id))
 
     def _modify_journal(self, instance, journal_id):
         """Modify the journal information."""
@@ -1564,8 +1585,10 @@ class HBSDREPLICATION(rest.HBSDREST):
             self.raise_error(msg)
 
     def _check_failed_over_svol_writable(self, volume, operation):
-        """Raise unless a failed-over volume's S-VOL reads SSWS."""
+        """With the attach check on, raise unless the S-VOL reads SSWS."""
         self._require_rep_secondary()
+        if not self.conf.hitachi_replication_check_pair_on_attach:
+            return
         svol = _svol_of(volume)
         copy_group_name = self._resolve_copy_group_name(
             volume.group, [volume])
@@ -1601,10 +1624,12 @@ class HBSDREPLICATION(rest.HBSDREST):
 
     def _check_adopted_svol_writable(self, volume, ldev, ldev_info,
                                      operation):
-        """Raise unless hosts can write to the adopted S-VOL ldev.
+        """With the attach check on, raise unless hosts can write the S-VOL.
 
         While its pair exists, only a taken-over (SSWS) S-VOL accepts writes.
         """
+        if not self.conf.hitachi_replication_check_pair_on_attach:
+            return
         if not self._has_rep_pair(
                 ldev, instance=self.rep_primary, ldev_info=ldev_info):
             return
@@ -1621,12 +1646,13 @@ class HBSDREPLICATION(rest.HBSDREST):
         self.raise_error(msg)
 
     def _check_bound_pvol_writable(self, volume, operation):
-        """Raise while a paired copy group member's pldev is a standby S-VOL.
+        """With the attach check on, raise while the pldev is a standby S-VOL.
 
         A failback leaves it S between its swaps; a pair that cannot be found
         or whose role cannot be told does not block.
         """
-        if (self._active_backend_id or
+        if (not self.conf.hitachi_replication_check_pair_on_attach or
+                self._active_backend_id or
                 not isinstance(volume, cinder_volume.Volume) or
                 _get_ldev_site(volume) != _PRIMARY_SECONDARY):
             return
@@ -2388,10 +2414,10 @@ class HBSDREPLICATION(rest.HBSDREST):
     def update_group(self, group, add_volumes=None, remove_volumes=None):
         if group.is_replicated:
             LOG.info('Group replication: update_group %(group)s. (add: %(a)d, '
-                    'remove: %(r)d, group replication: %(gr)s)',
-                    {'group': group.id, 'a': len(add_volumes or []),
-                    'r': len(remove_volumes or []),
-                    'gr': group.is_replicated})
+                     'remove: %(r)d, group replication: %(gr)s)',
+                     {'group': group.id, 'a': len(add_volumes or []),
+                      'r': len(remove_volumes or []),
+                      'gr': group.is_replicated})
             return self._group_repl_update_group(
                 group, add_volumes, remove_volumes)
         if self.conf.hitachi_mirror_storage_id:
@@ -2421,9 +2447,9 @@ class HBSDREPLICATION(rest.HBSDREST):
     def create_group_snapshot(self, context, group_snapshot, snapshots):
         if _group_snapshot_is_replicated(group_snapshot):
             LOG.info('Group replication: create_group_snapshot %(gs)s. '
-                    '(snapshots: %(n)d, group replication: %(gr)s)',
-                    {'gs': group_snapshot.id, 'n': len(snapshots),
-                    'gr': _group_snapshot_is_replicated(group_snapshot)})
+                     '(snapshots: %(n)d, group replication: %(gr)s)',
+                     {'gs': group_snapshot.id, 'n': len(snapshots),
+                      'gr': _group_snapshot_is_replicated(group_snapshot)})
             return self._group_repl_create_group_snapshot(
                 context, group_snapshot, snapshots)
         if self.conf.hitachi_mirror_storage_id:
@@ -2444,9 +2470,9 @@ class HBSDREPLICATION(rest.HBSDREST):
     def delete_group_snapshot(self, group_snapshot, snapshots):
         if _group_snapshot_is_replicated(group_snapshot):
             LOG.info('Group replication: delete_group_snapshot %(gs)s. '
-                    '(snapshots: %(n)d, group replication: %(gr)s)',
-                    {'gs': group_snapshot.id, 'n': len(snapshots),
-                    'gr': _group_snapshot_is_replicated(group_snapshot)})
+                     '(snapshots: %(n)d, group replication: %(gr)s)',
+                     {'gs': group_snapshot.id, 'n': len(snapshots),
+                      'gr': _group_snapshot_is_replicated(group_snapshot)})
             return self._group_repl_delete_group_snapshot(
                 group_snapshot, snapshots)
         if self.conf.hitachi_mirror_storage_id:
@@ -2496,6 +2522,7 @@ class HBSDREPLICATION(rest.HBSDREST):
         pairs = grp.get('copyPairs') or []
         if not pairs:
             return None
+        # A copy group's first pair makes the journals; the rest share them.
         journal_ids = (pairs[0].get('pvolJournalId'),
                        pairs[0].get('svolJournalId'))
         if any(journal_id is None for journal_id in journal_ids):
@@ -3265,8 +3292,8 @@ class HBSDREPLICATION(rest.HBSDREST):
         if not self._group_repl_adopted_members(members):
             msg = utils.output_log(
                 MSG.INVALID_PARAMETER,
-                param='group %s: adopted secondary volumes and other volumes '
-                      'cannot be added or removed in one request' % group.id)
+                param='group %s: a request cannot mix adopted secondary '
+                      'volumes with other volumes' % group.id)
             self.raise_error(msg)
         copy_group_name = self._resolve_copy_group_name(group, members)
         add_volumes_update = (
