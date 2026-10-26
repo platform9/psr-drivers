@@ -1155,7 +1155,8 @@ that can do group replication; on any other backend the create fails with
 Allowed values
 ^^^^^^^^^^^^^^
 
-The extra spec must be exactly ``<is> True``, or absent.
+The driver reads the extra spec as Cinder reads ``replication_enabled``:
+``<is>`` followed by a true value, such as ``<is> True``, enables it.
 
 .. list-table::
    :header-rows: 1
@@ -1164,7 +1165,7 @@ The extra spec must be exactly ``<is> True``, or absent.
      - Scheduler
      - Driver
      - Result
-   * - ``<is> True``
+   * - ``<is> True``, ``<is> true``
      - matches
      - group-replicated
      - Works
@@ -1180,10 +1181,6 @@ The extra spec must be exactly ``<is> True``, or absent.
      - requires a backend reporting ``False``; none does
      - not group-replicated
      - Unschedulable on every backend
-   * - ``<is> true``
-     - matches
-     - **not** group-replicated
-     - Scheduled, but paired at create time, so it can never join a copy group
 
 Failover and failback
 <<<<<<<<<<<<<<<<<<<<<
@@ -1235,10 +1232,12 @@ the driver sends anything to a storage system. Cinder then sets the group and
 its volumes to ``error``.
 
 After a group fails over, its volumes are served from their secondary
-volumes. Attaching a volume maps its secondary volume, after checking that
-the secondary volume is in ``SSWS``, and fails with MSGID0766 otherwise.
-Detaching it unmaps the secondary volume and, while the primary storage
-system answers, the primary volume as well, so a volume attached before a
+volumes. Attaching a volume maps its secondary volume. With
+``hitachi_replication_check_pair_on_attach`` set to ``True``, the attach
+first reads the copy group, which can take tens of seconds, and fails with
+MSGID0766 unless the secondary volume is in ``SSWS``. Detaching it unmaps
+the secondary volume and, while the primary storage system answers, the
+primary volume as well, so a volume attached before a
 planned failover is detached cleanly. Deleting, extending, retyping and
 migrating such a volume, taking a snapshot of it and reverting it to a
 snapshot fail with MSGID0766 until the group fails back.

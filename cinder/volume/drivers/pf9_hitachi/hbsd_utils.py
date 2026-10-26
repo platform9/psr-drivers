@@ -949,7 +949,7 @@ class HBSDMsg(enum.Enum):
     GROUP_REPLICATION_RESYNC_FAILED = {
         'msg_id': 811,
         'loglevel': base_logging.ERROR,
-        'msg': 'Failed to restart the group replication. (volume: '
+        'msg': 'Failed to resync the group replication. (volume: '
                '%(volume)s, copy group: %(copy_group)s)',
         'suffix': ERROR_SUFFIX,
     }

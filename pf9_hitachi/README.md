@@ -78,8 +78,8 @@ Beyond the eight entry points:
 | Journal lifecycle — created with a copy group's first pair, deleted once the copy group is gone (`disable_replication()` or group delete) | `create_journals()` / `_group_repl_delete_journals()` |
 | S side found per copy group — adoption, failover and target listing find which array holds each copy group's S side; a volume with only an S-VOL is found on the array whose LDEV carries its label | `_copy_group_svol_side()` / `_resolve_sldev_owner()` |
 | Graceful vs emergency failover (`split` with writable S-VOLs then `takeover ... forceSplit`, vs `takeover ... forceSplit` alone) | `_failover_mode()` / `_group_repl_split_writable()` |
-| Attach and detach of an adopted S-VOL on the array holding it; attach needs its copy group taken over (SSWS) or its pair gone | `_local_adopted_svol()` / `_check_adopted_svol_writable()` |
-| After a group failover, attach maps the member's S-VOL (SSWS only) and detach unmaps the S-VOL and, if the primary answers, the P-VOL; delete, extend, retype, migrate, snapshot and revert are refused until failback | `_group_failed_over()` / `_check_failed_over_svol_writable()` / `_terminate_failed_over()` / `_refuse_failed_over()` |
+| Attach and detach of an adopted S-VOL on the array holding it; with `hitachi_replication_check_pair_on_attach` set, attach needs its copy group taken over (`SSWS`) or its pair gone | `_local_adopted_svol()` / `_check_adopted_svol_writable()` |
+| After a group failover, attach maps the member's S-VOL (with `hitachi_replication_check_pair_on_attach` set, only once it is `SSWS`) and detach unmaps the S-VOL and, if the primary answers, the P-VOL; delete, extend, retype, migrate, snapshot and revert are refused until failback | `_group_failed_over()` / `_check_failed_over_svol_writable()` / `_terminate_failed_over()` / `_refuse_failed_over()` |
 | Startup with the primary array unreachable, for an emergency group failover; graceful failover and failback refuse until it answers | `do_setup()` / `failover_replication()` |
 | Adopted S-VOLs added to or removed from a replicated group without the peer — nothing paired or deleted, binding kept on removal; a request mixing them with other volumes is rejected | `_group_repl_update_adopted()` |
 
@@ -154,6 +154,7 @@ volume's label. One backend can therefore hold copy groups in both directions.
 | `hitachi_replication_journal_transfer_speed` | `256` | Mbps; one of `3`, `10`, `100`, `256` |
 | `hitachi_replication_journal_creation_speed` | `L` | Initial-copy speed; `L`, `M`, `H` |
 | `hitachi_replication_journal_path_failure_tolerance` | `5` | Minutes before a pair splits on path failure |
+| `hitachi_replication_check_pair_on_attach` | `False` | Before attaching a volume of a replicated group, or one bound to a copy group, read its copy group and fail with `MSGID0766` unless the volume is writable. Off by default because reading a copy group can take tens of seconds |
 
 ### Group type specs
 
@@ -195,20 +196,19 @@ carrying this spec waits for the copy group.
 
 #### Allowed values
 
-The spec must be exactly `<is> True`, or absent. The scheduler and the driver
-both read the value, and they do not parse it the same way. The scheduler goes
-through `extra_specs_ops.match`, where `<is>` compares with
-`strutils.bool_from_string`. The driver accepts only the literal `<is> True`,
-as `volume_utils.is_group_a_type` requires of group types, though it trims
-surrounding whitespace first.
+The driver reads the spec as Cinder reads `replication_enabled`
+(`volume_utils.is_boolean_str`): `<is>` followed by a true value, such as
+`<is> True`, enables it. The scheduler's `<is>` also compares with
+`strutils.bool_from_string`, so both accept the same values. Group type specs
+are different: Cinder's `volume_utils.is_group_a_type` accepts only the literal
+`<is> True`.
 
 | Value | Scheduler | Driver | Result |
 |---|---|---|---|
-| `<is> True` | matches | group-replicated | Works |
+| `<is> True`, `<is> true` | matches | group-replicated | Works |
 | absent | not evaluated | not group-replicated | Pairs at create (intended) |
 | `True`, `true` | no match (compared as a plain string) | not group-replicated | Unschedulable: `No valid backend` |
 | `<is> False`, `<is> false` | requires a backend reporting `False`; none does | not group-replicated | Unschedulable everywhere |
-| `<is> true` | matches | **not** group-replicated | Scheduled, but pairs at create and can never join a copy group |
 
 #### One name, three meanings
 
@@ -235,13 +235,71 @@ the per-volume replication path. A PSR deployment therefore configures:
 |---|---|---|
 | Volume type | `replication_enabled=<is> True` **and** `group_replication_enabled=<is> True` | same |
 | Group type | `consistent_group_replication_enabled=<is> True` | same |
+| Backend section (`cinder.conf`) | `hitachi_replication_check_pair_on_attach = True` | same |
 
 A volume created directly into a replicated group is never paired at create.
 For any other volume the volume-type spec is the only way to stop that: without
 it the volume pairs at create and cannot later join a copy group.
 
+Set `hitachi_replication_check_pair_on_attach` for PSR. With it, attaching a
+failed-over member whose S-VOL is not yet `SSWS`, an adopted S-VOL whose pair
+still replicates, or a member between the swaps of a failback fails with
+`MSGID0766`; without it, the attach succeeds and the host gets a volume it cannot
+write. The cost is a copy-group read, which can take tens of seconds, on every
+attach of a failed-over member, of an adopted S-VOL whose pair exists, and of a
+member bound to its copy group at the source site, in normal operation as well
+as during failover and failback. If that read fails, the attach fails, except
+that a member attached at the source site whose copy group the array reports as
+not existing still attaches.
+
+An adopted S-VOL is checked through its `replication_copy_group` metadata, and
+adopting with `manage_existing` does not set it. PSR passes it when it imports
+volumes of a ProtectionGroup whose array copy group it has recorded. An adopted
+S-VOL managed without it is refused while its pair exists, even when it is
+`SSWS`.
+
 A DR backend learns that it holds a copy group's S side by reading the group
 from its own array, so it still works when the source array is down.
+
+### Copy group names and upgrades
+
+A group's copy group is named `HBSD-` followed by the group UUID in 22 base62
+characters (`0-9A-Za-z`), for example `HBSD-0yNkm9nGBSTDWDtLbt9iCW`. A group
+snapshot's Thin Image group is `HBSD-C` plus the same encoding of the group
+snapshot UUID. Builds of this driver before base62 naming named copy groups
+`HBSD-` plus the first 23 hex digits of the group UUID, uppercased, for example
+`HBSD-5DEEC893AE92460E816A66F`.
+
+A group whose copy group has a hex name keeps working as long as its members
+stay the same: each member records its copy group in the
+`replication_copy_group` volume metadata, and that record wins over the derived
+name. Groups named `HBSD-CG:<name>`, and groups that have no copy group yet, are
+not affected.
+
+Adding volumes to a group whose copy group has a hex name does not work.
+`update_group` resolves the copy group only from the volumes in the request, and
+volumes being added carry no `replication_copy_group` yet, so an add-only
+request derives the base62 name from the group UUID and creates a second copy
+group. The group's next failover, `disable_replication` or
+`enable_replication` then fails with `GROUP_REPLICATION_BINDING_CONFLICT`. To
+recover, remove the added volumes from the group: their removal resolves to
+their own copy group and deletes their pairs and S-VOLs. That copy group's
+journals stay on both arrays, because removing members never deletes journals;
+delete them on the arrays by hand.
+
+Before upgrading a deployment that has replicated groups:
+
+1. Check that every member of each replicated group carries
+   `replication_copy_group` in its volume metadata. If a member that has a pair
+   lacks it, set that metadata key on the member to the group's copy group
+   name, as the array lists it. Without it, operations on that member after the
+   upgrade look for the base62 name and miss the copy group.
+2. After the upgrade, do not add volumes to a group whose copy group has a hex
+   name. With PSR this includes adding VMs or volumes to its ProtectionGroup,
+   because PSR adds them to the Cinder group. Growing such a group means
+   rebuilding its replication, which deletes every member's S-VOL and renames
+   the copy group; plan it as its own change, and check that the
+   ProtectionGroup's `arrayCopyGroup` shows the new name before the next DR run.
 
 ### Failover semantics
 

@@ -28,10 +28,11 @@ features:
     The key is unscoped, so the scheduler matches it against the
     ``group_replication_enabled`` pool capability, which the driver reports
     only on a backend configured for replication. A volume of this type cannot
-    be placed on a backend that cannot do group replication. The value must be
-    exactly ``<is> True``: ``True`` and ``true`` make the type unschedulable,
-    ``<is> False`` makes it unschedulable on every backend, and ``<is> true``
-    is scheduled but not treated as group-replicated.
+    be placed on a backend that cannot do group replication. The driver reads
+    the value as Cinder reads ``replication_enabled``, so ``<is> True`` or
+    another ``<is>`` true value enables it; ``True`` and ``true`` make the
+    type unschedulable, and ``<is> False`` makes it unschedulable on every
+    backend.
   - |
     Hitachi driver: for each copy group, the driver asks the storage systems
     which one holds the secondary side, starting with its own, which answers
@@ -47,14 +48,16 @@ features:
     group snapshot that contains one, taking a group snapshot of adopted
     volumes and creating a group from them all act on the storage system that
     holds each volume. An adopted volume can be attached and detached on the
-    backend whose storage system holds it. Attaching needs the copy group
-    taken over, which leaves the secondary volume in SSWS, or the pair
-    deleted; while the pair still replicates, the attach fails with
-    MSGID0766. Adopted volumes can be added to and removed from a replicated
-    group on that backend without the peer storage system: adding checks
-    that each secondary volume is in the copy group, and removing leaves the
-    pair and the volume's copy group binding in place. A request that adds
-    or removes adopted volumes together with other volumes is rejected.
+    backend whose storage system holds it. With
+    ``hitachi_replication_check_pair_on_attach`` set to ``True``, attaching
+    needs the copy group taken over, which leaves the secondary volume in
+    SSWS, or the pair deleted; while the pair still replicates, the attach
+    fails with MSGID0766. Adopted volumes can be added to and removed from a
+    replicated group on that backend without the peer storage system: adding
+    checks that each secondary volume is in the copy group, and removing
+    leaves the pair and the volume's copy group binding in place. A request
+    that adds or removes adopted volumes together with other volumes is
+    rejected.
   - |
     Hitachi driver: a group snapshot of a replicated group is created as one
     crash-consistent Thin Image group on the storage system that holds the
@@ -97,11 +100,17 @@ features:
     both storage systems. A mode suffix on ``default`` is rejected with
     ``InvalidReplicationTarget``.
   - |
-    Hitachi driver: attaching a volume paired into a group's copy group fails
-    with MSGID0766 while its LDEV on the backend's own storage system is the
-    secondary side of its pair and not taken over (``SSWS``), as it is
-    between the swaps of a group failback. A pair the driver cannot find, or
-    whose role it cannot tell, does not block the attach.
+    Hitachi driver: added the ``hitachi_replication_check_pair_on_attach``
+    option, ``False`` by default. When it is ``True``, attaching a volume of
+    a replicated group, or one bound to a copy group, first reads the
+    volume's copy group, which can take tens of seconds, and fails with
+    MSGID0766 unless the volume is writable. When it is ``False``, the attach
+    goes ahead and the host cannot write to such a volume until it becomes
+    writable. A volume paired into a group's copy group is not writable while
+    its LDEV on the backend's own storage system is the secondary side of its
+    pair and not taken over (``SSWS``), as it is between the swaps of a group
+    failback. A pair the driver cannot find, or whose role it cannot tell,
+    does not block the attach.
 fixes:
   - |
     Hitachi driver: Fixed a timed-out wait for a replication pair status
@@ -115,9 +124,11 @@ fixes:
     removed.
   - |
     Hitachi driver: after a group fails over, attaching one of its volumes
-    maps the volume's secondary volume once it is in ``SSWS``, and
-    detaching unmaps the secondary volume and, while the primary storage
-    system answers, the primary volume too. Deleting, extending, retyping
+    maps the volume's secondary volume; with
+    ``hitachi_replication_check_pair_on_attach`` set to ``True``, only once
+    that secondary volume is in ``SSWS``. Detaching unmaps the secondary
+    volume and, while the primary storage system answers, the primary volume
+    too. Deleting, extending, retyping
     or migrating such a volume, taking a snapshot of it or reverting it to a
     snapshot fails with MSGID0766 until the group fails back.
   - |
